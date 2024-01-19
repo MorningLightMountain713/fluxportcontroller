@@ -1,0 +1,41 @@
+services:
+  miniupnpd:
+    image: "megachips/miniupnpd:entrypoint"
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - upnp
+    stop_signal: SIGINT
+    deploy:
+      labels:
+        ContainerType: "FluxportTest"
+  fluxnode:
+    image: "megachips/fluxport_controller:latest"
+    init: true
+    environment:
+      - START_DELAY=0
+    networks:
+      - upnp
+    deploy:
+      mode: replicated
+      replicas: 8
+      labels:
+        ContainerType: "FluxportTest"
+  observer:
+    image: "megachips/fluxport_controller:latest"
+    container_name: observer
+    init: true
+    environment:
+      - MODE=OBSERVE
+      - NODE_COUNT=8
+      - TEST_COUNT=20
+    networks:
+      - upnp
+    ports:
+      - "127.0.0.1:33333:33333"
+    deploy:
+      labels:
+        ContainerType: "FluxportTest"
+
+networks:
+  upnp: {}

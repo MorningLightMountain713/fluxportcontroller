@@ -1,0 +1,43 @@
+{
+  "name": "@megachips/fluxport-controller",
+  "version": "0.0.8",
+  "main": "build/src/index",
+  "files": [
+    "/src",
+    "/build",
+    "/tsconfig.json"
+  ],
+  "author": "David White <https://github.com/MorningLightMountain713>",
+  "homepage": "https://github.com/MorningLightMountain713/fluxport-controller",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "http://github.com/MorningLightMountain713/fluxport-controller.git"
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "unittest": "node --import tsx --test test/unit/messages.spec.ts",
+    "inttest": "docker container prune --filter 'label=ContainerType=FluxportTest' -f && docker compose up --attach observer",
+    "start": "node --import tsx test_docker_entrypoint.ts"
+  },
+  "bin": {
+    "fpc": "test_docker_entrypoint.ts"
+  },
+  "keywords": [
+    "nat",
+    "upnp",
+    "flux"
+  ],
+  "devDependencies": {
+    "@types/node": "^20.11.5",
+    "tsx": "^4.7.0",
+    "typescript": "^4.5.5"
+  },
+  "dependencies": {
+    "@megachips/nat-upnp": "^1.1.1",
+    "axios": "^1.6.2",
+    "fast-xml-parser": "^4.3.3",
+    "winston": "^3.11.0"
+  }
+}
