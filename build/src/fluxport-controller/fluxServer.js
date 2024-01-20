@@ -37,12 +37,13 @@ class FluxServer extends events_1.EventEmitter {
         else {
             this.interfaces.push(...Object.keys(availableInterfaces).reduce((arr, key) => arr.concat(availableInterfaces[key]?.filter((item) => !item.internal && item.family == "IPv4") ?? []), []));
         }
-        log_1.default.debug(this.interfaces);
+        log_1.default.debug((0, util_1.inspect)(this.interfaces, { showHidden: false, depth: null, colors: true }));
     }
     start() {
         // for (const intf of this.interfaces) {
         //   this.sockets.push(this.runSocketServer(intf));
         // }
+        this.closed = false;
         this.sockets.push(this.runSocketServer(this.interfaces[0]));
     }
     runSocketServer(iface) {
@@ -56,9 +57,17 @@ class FluxServer extends events_1.EventEmitter {
         this.sockets.splice(this.sockets.indexOf(socket), 1);
     }
     stop() {
-        this.closed = true;
-        this.sockets.forEach((socket) => socket.close());
-        this.sockets.length = 0;
+        // idempotent
+        if (!this.closed) {
+            try {
+                this.sockets.forEach((socket) => socket.close());
+            }
+            catch {
+                // pass
+            }
+            this.sockets.length = 0;
+            this.closed = true;
+        }
     }
     preparePayload(msg, addSeparator = true) {
         const sep = addSeparator ? this.MESSAGE_SEPARATOR : "";

@@ -1,11 +1,9 @@
 {
   "name": "@megachips/fluxport-controller",
-  "version": "0.0.8",
+  "version": "0.0.11",
   "main": "build/src/index",
   "files": [
-    "/src",
-    "/build",
-    "/tsconfig.json"
+    "/build"
   ],
   "author": "David White <https://github.com/MorningLightMountain713>",
   "homepage": "https://github.com/MorningLightMountain713/fluxport-controller",
@@ -22,7 +20,7 @@
     "start": "node --import tsx test_docker_entrypoint.ts"
   },
   "bin": {
-    "fpc": "test_docker_entrypoint.ts"
+    "fpc": "test_entrypoint.ts"
   },
   "keywords": [
     "nat",

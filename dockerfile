@@ -5,10 +5,10 @@ ENV NODE_COUNT 0
 
 WORKDIR /app
 
-COPY package.json test_docker_entrypoint.ts ./
+COPY package.json test_entrypoint.ts ./
 
 ADD src ./src
 
 RUN npm install npm@10.3.0 && npm install
 
-CMD ["node", "--import", "tsx", "test_docker_entrypoint.ts"]
+CMD ["node", "--import", "tsx", "test_entrypoint.ts"]

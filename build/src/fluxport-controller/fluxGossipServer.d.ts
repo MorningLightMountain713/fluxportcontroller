@@ -3,9 +3,9 @@
 /// <reference types="node" />
 /// <reference types="node" />
 /// <reference types="node" />
-import { Socket } from "dgram";
-import { AddressInfo } from "net";
-import os from "os";
+import { Socket } from "node:dgram";
+import { AddressInfo } from "node:net";
+import os from "node:os";
 import { FluxServer, ServerOptions, Message } from "./fluxServer";
 import { Client as UpnpClient } from "@megachips/nat-upnp";
 export declare class FluxGossipServer extends FluxServer {
@@ -39,18 +39,20 @@ export declare class FluxGossipServer extends FluxServer {
     observerAckedPorts: Set<fluxPorts> | null;
     observerTestId: number;
     observerTestCount: number | null;
+    observerLastTestFailed: boolean;
     upnpClient: UpnpClient;
+    startedAt: number;
     constructor(outPoint: OutPoint, options?: GossipServerOptions);
     get ["portsAvailable"](): fluxPorts[];
-    getMyIp(): Promise<string>;
-    start(): void;
+    getMyPublicIp(): Promise<string>;
+    start(): Promise<boolean>;
     stop(): void;
     runAdminWebserver(port: number): void;
     runSocketServer(iface: os.NetworkInterfaceInfo): Socket;
     resetState(resetMsgLog?: boolean): void;
     portConfirm(localAddress: string, sendPortSelectAck?: boolean): void;
     createMessageFlows(): Record<string, Record<string, string[]>>;
-    writeAdminResults(testId: number, testFailed?: boolean): void;
+    writeAdminResults(testId: number): void;
     writeDataToJsonFile(data: any): void;
     fluxportInUse(ip: string, port: number): Promise<boolean>;
     fluxnodePriorPort(): Promise<number | null>;
@@ -162,6 +164,8 @@ interface AdminDiscoverReplyMessage extends Message {
 interface FluxGossipServerEvents {
     portConfirmed: (port: number) => void;
     upnpError: (message: string) => void;
+    startError: () => void;
+    routerIpConfirmed: (ip: string) => void;
 }
 export declare interface FluxGossipServer {
     on<U extends keyof FluxGossipServerEvents>(event: U, listener: FluxGossipServerEvents[U]): this;
@@ -226,4 +230,11 @@ export declare interface FluxGossipServer {
      * The PORT_SELECT_NAK message received
      */
     portSelectNakHandler(socket: Socket, localAddress: string, msg: PortSelectMessage): Promise<void>;
+    /**
+     * Runs a upnp method and handles Errors. Will emit upnp error
+     * upon error
+     * @param upnpCall
+     * A method from UpnpClient
+     */
+    runUpnpRequest(upnpCall: () => Promise<any>): Promise<any>;
 }

@@ -1,8 +1,9 @@
-import dgram, { Socket } from "dgram";
-import { AddressInfo } from "net";
-import os from "os";
+import dgram, { Socket } from "node:dgram";
+import { AddressInfo } from "node:net";
+import os from "node:os";
 import nodeTimersPromises from "node:timers/promises";
-import { createServer, IncomingMessage, ServerResponse } from "http";
+import { createServer, IncomingMessage, ServerResponse } from "node:http";
+import { lookup } from "node:dns/promises";
 
 import axios, { AxiosResponse } from "axios";
 import { FluxServer, ServerOptions, Message, ServerError } from "./fluxServer";
@@ -149,7 +150,9 @@ export class FluxGossipServer extends FluxServer {
     const usedPorts = Object.values(this.networkState)
       .filter(
         (host) =>
-          (host.nodeState === SELECTING || host.nodeState === READY) &&
+          (host.nodeState === SELECTING ||
+            host.nodeState === READY ||
+            host.nodeState === UNKNOWN) &&
           typeof host.port === "number"
       )
       .map((host) => host.port);
@@ -160,7 +163,7 @@ export class FluxGossipServer extends FluxServer {
     let addressApi: string | undefined;
     let data: string = "";
 
-    if ((this.outPoint.txhash = "testtx")) {
+    if (this.outPoint.txhash == "testtx") {
       return "10.10.10.10";
     }
 
@@ -190,35 +193,45 @@ export class FluxGossipServer extends FluxServer {
       this.startedAt = now;
     }
 
+    logger.info(`My ip is: ${this.myIp}`);
+
     // this now means the gossipserver is reliant on UPnP working as we're using the
-    // interface provided by UPnP
+    // interface provided by UPnP for multicast
 
     // use generics for this and type properly
     const gatewayResponse = await this.runUpnpRequest(
       this.upnpClient.getGateway
     );
 
-    // this returns empty array or mappings (both truthy) or undefined on error
-    const mappings = await this.runUpnpRequest(this.upnpClient.getMappings);
-
-    // both of these calls worked, that's all we need
-    if (gatewayResponse && mappings) {
-      const { gateway, localAddress } = gatewayResponse;
-      const gatewayIp = new URL(gateway.url).hostname;
-      this.emit("routerIpConfirmed", gatewayIp);
-
-      // we only run on the interface that we are able to communicate with the
-      // upnp gateway
-      const upnpInterface = this.interfaces.find(
-        (int) => int.address === localAddress
-      );
-      // interface is guaranteed here
-      this.sockets.push(this.runSocketServer(upnpInterface!));
-      return true;
-    } else {
+    if (!gatewayResponse) {
       this.emit("startError");
       return false;
     }
+
+    // this returns empty array or mappings (both truthy) or undefined on error
+    const mappings = await this.runUpnpRequest(this.upnpClient.getMappings);
+
+    if (!mappings) {
+      this.emit("startError");
+      return false;
+    }
+
+    const { gateway, localAddress } = gatewayResponse;
+    // from testing, this is an IP. However, resolve just in case
+    const gatewayFqdn = new URL(gateway.description).hostname;
+    const gatewayIp = await lookup(gatewayFqdn);
+
+    this.emit("routerIpConfirmed", gatewayIp.address);
+
+    // we only run on the interface that we are able to communicate with the
+    // upnp gateway
+    const upnpInterface = this.interfaces.find(
+      (int) => int.address === localAddress
+    );
+
+    // interface is guaranteed here
+    this.sockets.push(this.runSocketServer(upnpInterface!));
+    return true;
   }
 
   stop(): void {
@@ -502,21 +515,30 @@ export class FluxGossipServer extends FluxServer {
 
     while (!selectedPort && portsAvailable.length) {
       if (priorPort && portsAvailable.includes(priorPort as fluxPorts)) {
-        selectedPort = priorPort as fluxPorts;
+        const priorIndex = this.portsAvailable.indexOf(priorPort as fluxPorts);
+        selectedPort = portsAvailable.splice(priorIndex, 1)[0];
         logger.info(
           `Prior port ${selectedPort} found and available, selecting`
         );
       } else {
-        // this is based on the FluxGossip network state (all multicast participants)
-        selectedPort = portsAvailable.splice(thisNodesIndex, 1)[0];
-        logger.info(`Selecting port ${selectedPort}`);
-        // we only try the tiebreak thing once, then just rawdog ports
+        // check router port mappings
+        selectedPort = this.getPortFromNode(localAddress);
+
+        if (selectedPort) {
+          logger.info(
+            `Port ${selectedPort} found in router mapping table for our IP, selecting`
+          );
+        } else {
+          // this is based on the FluxGossip network state (all multicast participants)
+          selectedPort = portsAvailable.splice(thisNodesIndex, 1)[0];
+          logger.info(`Selecting next available port: ${selectedPort}`);
+        }
+        // we only try the tiebreak thing once, then just rawdog ports after that
         thisNodesIndex = 0;
       }
 
       // checks what ip's are mapped to what ports via upnp (call above)
       const collisionIp = this.portToNodeMap.get(selectedPort);
-      logger.info(`Collision IP check: ${collisionIp}`);
 
       // the port we want has a upnp mapping, check if it's actually on a live node
       if (collisionIp && collisionIp !== localAddress) {
@@ -527,22 +549,19 @@ export class FluxGossipServer extends FluxServer {
           logger.warn(
             `Fluxnode responded at http://${collisionIp}:${selectedPort}/flux/uptime, marking port as used`
           );
-          // FYI, port has already been remove above from portsAvailable
-
-          // this shouldn't happen IRL as if the port is in use, it should have
-          // been picked up when we computed portsAvailable.
-
-          // adding this as a precautionary measure, should probably contact node or something
+          // This can happen when running a blend of old fluxnodes and new autoUPnP nodes
+          // adding this as a precautionary measure
           if (!(collisionIp in this.networkState)) {
             this.networkState[collisionIp] = {
               port: selectedPort,
               nodeState: UNKNOWN
             };
           }
-          selectedPort = null;
-          continue;
         }
-        // the port wasn't in use, so we wrax it. (will break from loop here)
+        // previously, we were going to usurp the port. If the node didn't respond. However, if a
+        // mapping exists, we are unable to remove it from another node, which, for
+        // what are now obvious reasons, makes sense.
+        selectedPort = null;
       }
     }
 
@@ -680,6 +699,13 @@ export class FluxGossipServer extends FluxServer {
     return res;
   }
 
+  getPortFromNode(nodeIp: string): fluxPorts | null {
+    for (let [key, value] of this.portToNodeMap.entries()) {
+      if (value === nodeIp) return key as fluxPorts;
+    }
+    return null;
+  }
+
   async updatePortToNodeMap(): Promise<void> {
     const allMappings = await this.runUpnpRequest(this.upnpClient.getMappings);
 
@@ -689,11 +715,7 @@ export class FluxGossipServer extends FluxServer {
       // we only care about Flux tcp maps
       if (mapping.protocol !== "tcp") continue;
 
-      // think about this... is it correct? We are saying that if a port has
-      // been used in our networkState, we don't put it in the nodeMap. Maybe
-      // portToNodeMap name needs to change, as it's really nodes that have a UPnP
-      // mapping that we don't have network state for via direct comms?!?
-      if (this.portsAvailable.includes(mapping.public.port as fluxPorts)) {
+      if (this.allFluxports.includes(mapping.public.port as fluxPorts)) {
         this.portToNodeMap.set(mapping.public.port, mapping.private.host);
       }
     }
@@ -1285,4 +1307,26 @@ export declare interface FluxGossipServer {
    * A method from UpnpClient
    */
   runUpnpRequest(upnpCall: () => Promise<any>): Promise<any>;
+  /**
+   * This function does the heavy lifting. Based on the following assumptions:
+   *  * Once a portmapping is set - another node cannot remove it, only the node that,
+   *    set it can, or it expires.
+   *  * If this node's txhash is found in the zelnode list, it must have rebooted / restarted
+   *    etc, so we favor this port first.
+   *  * If txhash is not found, we then look for a port mapping for this host for a fluxport
+   *    on the router. If found, we then favor this port.
+   *  * Finally, if none of the above happens, we then resort to the gossip server algo to
+   *    figure out what port we want.
+   *
+   * Gossip server algo:
+   *  * After getting a DISCOVER_REPLY, the network state is updated, and any ports that are
+   *    in use are filtered, and the portsAvailable property generated. Any DISCOVERING nodes
+   *    are sorted from lowest ip to highest, whatever this nodes index is in that list, is the
+   *    index used to determine the selected port in the portsAvailable property.
+   * @param socket
+   * The socket used for this request
+   * @param localAddress
+   * The local address of the socket (same adress as what is used for UPnP)
+   */
+  portSelect(socket: Socket, localAddress: string): Promise<void>;
 }

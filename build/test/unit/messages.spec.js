@@ -14,7 +14,7 @@ const axios_1 = __importDefault(require("axios"));
     (0, node_test_1.it)("should UPDATE STATE when a D message is received that has ALREADY been handled", async (t) => {
         const testDiscover = { type: "DISCOVER", id: "test", host: "1.1.1.1" };
         strict_1.default.deepEqual(server.networkState, {});
-        t.mock.timers.enable(["setTimeout"]);
+        t.mock.timers.enable({ apis: ["setTimeout"] });
         t.mock.method(server, "discoverHandler");
         t.mock.method(server, "sendDiscoverReply");
         strict_1.default.strictEqual(server.discoverHandler.mock.calls.length, 0);
@@ -32,7 +32,7 @@ const axios_1 = __importDefault(require("axios"));
         const testDiscover = { type: "DISCOVER", id: "test", host: "1.1.1.1" };
         server.unhandledMessages.add("test");
         strict_1.default.deepEqual(server.networkState, {});
-        t.mock.timers.enable(["setTimeout"]);
+        t.mock.timers.enable({ apis: ["setTimeout"] });
         t.mock.method(server, "discoverHandler");
         server.sendDiscoverReply = t.mock.fn();
         strict_1.default.strictEqual(server.discoverHandler.mock.calls.length, 0);
@@ -174,7 +174,7 @@ const axios_1 = __importDefault(require("axios"));
         };
         server.unhandledMessages.add("test");
         strict_1.default.deepEqual(server.networkState, {});
-        t.mock.timers.enable(["setTimeout"]);
+        t.mock.timers.enable({ apis: ["setTimeout"] });
         t.mock.method(server, "portSelectHandler");
         server.sendPortSelectAck = t.mock.fn();
         server.sendPortSelectNak = t.mock.fn();
@@ -203,7 +203,7 @@ const axios_1 = __importDefault(require("axios"));
             "1.1.1.1": { port: 16187, nodeState: "SELECTING" }
         };
         strict_1.default.deepEqual(server.networkState, {});
-        t.mock.timers.enable(["setTimeout"]);
+        t.mock.timers.enable({ apis: ["setTimeout"] });
         t.mock.method(server, "portSelectHandler");
         server.sendPortSelectAck = t.mock.fn();
         server.sendPortSelectNak = t.mock.fn();
@@ -231,7 +231,7 @@ const axios_1 = __importDefault(require("axios"));
         };
         server.unhandledMessages.add("test");
         server.networkState = expectedState;
-        t.mock.timers.enable(["setTimeout"]);
+        t.mock.timers.enable({ apis: ["setTimeout"] });
         t.mock.method(server, "portSelectHandler");
         server.sendPortSelectAck = t.mock.fn();
         server.sendPortSelectNak = t.mock.fn();
@@ -302,7 +302,7 @@ const axios_1 = __importDefault(require("axios"));
             port: 16187
         };
         // mock timer must be before any setTimeout calls
-        t.mock.timers.enable(["setTimeout"]);
+        t.mock.timers.enable({ apis: ["setTimeout"] });
         server.unhandledMessages.add("test");
         server.portSelectTimeout = setTimeout(() => { }, 3000);
         server.pendingSelectId = "test";
@@ -424,7 +424,7 @@ const axios_1 = __importDefault(require("axios"));
     (0, node_test_1.it)("SELECTS 16197 when no prior port and no other mappings or state", async (t) => {
         const localAddress = "1.1.1.1";
         const socket = {};
-        t.mock.timers.enable(["setTimeout"]);
+        t.mock.timers.enable({ apis: ["setTimeout"] });
         server.state.nodeState = "DISCOVERING";
         server.updatePortToNodeMap = t.mock.fn();
         server.fluxnodePriorPort = t.mock.fn(async () => null);
@@ -448,7 +448,7 @@ const axios_1 = __importDefault(require("axios"));
             "2.2.2.2": { port: 16197, nodeState: "SELECTING" }
         };
         server.state.nodeState = "DISCOVERING";
-        t.mock.timers.enable(["setTimeout"]);
+        t.mock.timers.enable({ apis: ["setTimeout"] });
         server.updatePortToNodeMap = t.mock.fn();
         server.fluxnodePriorPort = t.mock.fn(async () => null);
         server.sendPortSelect = t.mock.fn(() => "test_id");
@@ -467,7 +467,7 @@ const axios_1 = __importDefault(require("axios"));
     (0, node_test_1.it)("SELECTS previously used port 16137 when node is live and it is available", async (t) => {
         const localAddress = "1.1.1.1";
         const socket = {};
-        t.mock.timers.enable(["setTimeout"]);
+        t.mock.timers.enable({ apis: ["setTimeout"] });
         server.state.nodeState = "DISCOVERING";
         server.updatePortToNodeMap = t.mock.fn();
         server.fluxnodePriorPort = t.mock.fn(async () => 16137);
@@ -492,7 +492,7 @@ const axios_1 = __importDefault(require("axios"));
         };
         server.state.nodeState = "DISCOVERING";
         server.portToNodeMap = new Map([[16137, "2.2.2.2"]]);
-        t.mock.timers.enable(["setTimeout"]);
+        t.mock.timers.enable({ apis: ["setTimeout"] });
         server.updatePortToNodeMap = t.mock.fn();
         server.fluxnodePriorPort = t.mock.fn(async () => 16137);
         server.sendPortSelect = t.mock.fn(() => "test_id");
@@ -519,7 +519,7 @@ const axios_1 = __importDefault(require("axios"));
         const localAddress = "1.1.1.1";
         const socket = {};
         server.portToNodeMap = new Map([[16137, "2.2.2.2"]]);
-        t.mock.timers.enable(["setTimeout"]);
+        t.mock.timers.enable({ apis: ["setTimeout"] });
         server.updatePortToNodeMap = t.mock.fn();
         server.fluxnodePriorPort = t.mock.fn(async () => 16137);
         server.sendPortSelect = t.mock.fn(() => "test_id");
@@ -544,7 +544,7 @@ const axios_1 = __importDefault(require("axios"));
     (0, node_test_1.it)("RESTARTS when no port is available", async (t) => {
         const localAddress = "1.1.1.1";
         const socket = {};
-        t.mock.timers.enable({ apis: ["setTimeout"] });
+        t.mock.timers.enable({ apis: { apis: ["setTimeout"] } });
         const testNetworkState = {
             "1.1.1.1": { port: 16197, nodeState: "READY" },
             "2.2.2.2": { port: 16187, nodeState: "READY" },

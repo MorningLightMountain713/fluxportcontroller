@@ -19,7 +19,7 @@ describe("handler tests", () => {
 
     assert.deepEqual(server.networkState, {});
 
-    t.mock.timers.enable(["setTimeout"]);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
 
     t.mock.method(server, "discoverHandler");
     t.mock.method(server, "sendDiscoverReply");
@@ -57,7 +57,7 @@ describe("handler tests", () => {
     server.unhandledMessages.add("test");
     assert.deepEqual(server.networkState, {});
 
-    t.mock.timers.enable(["setTimeout"]);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
 
     t.mock.method(server, "discoverHandler");
     server.sendDiscoverReply = t.mock.fn();
@@ -276,7 +276,7 @@ describe("handler tests", () => {
 
     assert.deepEqual(server.networkState, {});
 
-    t.mock.timers.enable(["setTimeout"]);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
     t.mock.method(server, "portSelectHandler");
     server.sendPortSelectAck = t.mock.fn();
     server.sendPortSelectNak = t.mock.fn();
@@ -310,7 +310,7 @@ describe("handler tests", () => {
 
     assert.deepEqual(server.networkState, {});
 
-    t.mock.timers.enable(["setTimeout"]);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
     t.mock.method(server, "portSelectHandler");
     server.sendPortSelectAck = t.mock.fn();
     server.sendPortSelectNak = t.mock.fn();
@@ -344,7 +344,7 @@ describe("handler tests", () => {
     server.unhandledMessages.add("test");
     server.networkState = expectedState;
 
-    t.mock.timers.enable(["setTimeout"]);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
     t.mock.method(server, "portSelectHandler");
     server.sendPortSelectAck = t.mock.fn();
     server.sendPortSelectNak = t.mock.fn();
@@ -449,7 +449,7 @@ describe("handler tests", () => {
     };
 
     // mock timer must be before any setTimeout calls
-    t.mock.timers.enable(["setTimeout"]);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
     server.unhandledMessages.add("test");
 
     server.portSelectTimeout = setTimeout(() => {}, 3000);
@@ -632,7 +632,7 @@ describe("Port select tests", () => {
     const localAddress = "1.1.1.1";
     const socket = {} as Socket;
 
-    t.mock.timers.enable(["setTimeout"]);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
 
     server.state.nodeState = "DISCOVERING";
     server.updatePortToNodeMap = t.mock.fn();
@@ -668,7 +668,7 @@ describe("Port select tests", () => {
     };
     server.state.nodeState = "DISCOVERING";
 
-    t.mock.timers.enable(["setTimeout"]);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
 
     server.updatePortToNodeMap = t.mock.fn();
     server.fluxnodePriorPort = t.mock.fn(async () => null);
@@ -698,7 +698,7 @@ describe("Port select tests", () => {
     const localAddress = "1.1.1.1";
     const socket = {} as Socket;
 
-    t.mock.timers.enable(["setTimeout"]);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
 
     server.state.nodeState = "DISCOVERING";
     server.updatePortToNodeMap = t.mock.fn();
@@ -736,7 +736,7 @@ describe("Port select tests", () => {
     server.state.nodeState = "DISCOVERING";
     server.portToNodeMap = new Map([[16137, "2.2.2.2"]]);
 
-    t.mock.timers.enable(["setTimeout"]);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
 
     server.updatePortToNodeMap = t.mock.fn();
     server.fluxnodePriorPort = t.mock.fn(async () => 16137);
@@ -772,13 +772,13 @@ describe("Port select tests", () => {
     assert.ok(server.portSelectTimeout);
   });
 
-  it("SELECTS previous used port when node is live and mapping exists but port not it use", async (t) => {
+  it("SELECTS next free port when node is live and mapping exists and port not it use", async (t) => {
     const localAddress = "1.1.1.1";
     const socket = {} as Socket;
 
     server.portToNodeMap = new Map([[16137, "2.2.2.2"]]);
 
-    t.mock.timers.enable(["setTimeout"]);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
 
     server.updatePortToNodeMap = t.mock.fn();
     server.fluxnodePriorPort = t.mock.fn(async () => 16137);
@@ -808,7 +808,7 @@ describe("Port select tests", () => {
     assert.strictEqual((server.fluxportInUse as any).mock.calls.length, 1);
 
     assert.strictEqual(server.state.nodeState, "SELECTING");
-    assert.strictEqual(server.state.port, 16137);
+    assert.strictEqual(server.state.port, 16197);
     assert.strictEqual(server.pendingSelectId, "test_id");
     assert.ok(server.portSelectTimeout);
   });
@@ -826,8 +826,8 @@ describe("Port select tests", () => {
       "4.4.4.4": { port: 16167, nodeState: "READY" as NodeState },
       "5.5.5.5": { port: 16157, nodeState: "READY" as NodeState },
       "6.6.6.6": { port: 16147, nodeState: "READY" as NodeState },
-      "7.7.7.7": { port: 16137, nodeState: "READY" as NodeState },
-      "8.8.8.8": { port: 16127, nodeState: "READY" as NodeState }
+      "7.7.7.7": { port: 16137, nodeState: "UNKNOWN" as NodeState },
+      "8.8.8.8": { port: 16127, nodeState: "UNKNOWN" as NodeState }
     };
 
     server.networkState = testNetworkState;

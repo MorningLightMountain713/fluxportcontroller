@@ -4,9 +4,10 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.FluxGossipServer = void 0;
-const dgram_1 = __importDefault(require("dgram"));
+const node_dgram_1 = __importDefault(require("node:dgram"));
 const promises_1 = __importDefault(require("node:timers/promises"));
-const http_1 = require("http");
+const node_http_1 = require("node:http");
+const promises_2 = require("node:dns/promises");
 const axios_1 = __importDefault(require("axios"));
 const fluxServer_1 = require("./fluxServer");
 // import { Client } from "@runonflux/nat-upnp";
@@ -73,7 +74,9 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
     observerAckedPorts = null;
     observerTestId = 0;
     observerTestCount = null;
+    observerLastTestFailed = false;
     upnpClient;
+    startedAt = 0;
     constructor(outPoint, options = {}) {
         super();
         this.outPoint = outPoint;
@@ -127,11 +130,11 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
             .map((host) => host.port);
         return this.allFluxports.filter((port) => !usedPorts.includes(port));
     }
-    async getMyIp() {
+    async getMyPublicIp() {
         let addressApi;
         let data = "";
-        if ((this.outPoint.txhash = "testtx")) {
-            return "5.5.5.5";
+        if (this.outPoint.txhash == "testtx") {
+            return "10.10.10.10";
         }
         while (!data) {
             addressApi = this.addressApis.shift();
@@ -146,20 +149,46 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
         }
         return data.trim();
     }
-    start() {
+    async start() {
         // Can't use UPnP public IP as that isn't guaranteed to be actual public IP.
         // we need the IP to be able to filter the deterministic node list for our
         // prior port and our siblings
-        this.getMyIp().then((ip) => {
-            this.myIp = ip;
-            for (const intf of this.interfaces) {
-                this.sockets.push(this.runSocketServer(intf));
-            }
-        });
+        const now = Date.now();
+        if (!this.myIp || this.startedAt + 900 < now) {
+            this.myIp = await this.getMyPublicIp();
+            this.startedAt = now;
+        }
+        log_1.default.info(`My ip is: ${this.myIp}`);
+        // this now means the gossipserver is reliant on UPnP working as we're using the
+        // interface provided by UPnP for multicast
+        // use generics for this and type properly
+        const gatewayResponse = await this.runUpnpRequest(this.upnpClient.getGateway);
+        if (!gatewayResponse) {
+            this.emit("startError");
+            return false;
+        }
+        // this returns empty array or mappings (both truthy) or undefined on error
+        const mappings = await this.runUpnpRequest(this.upnpClient.getMappings);
+        if (!mappings) {
+            this.emit("startError");
+            return false;
+        }
+        const { gateway, localAddress } = gatewayResponse;
+        // from testing, this is an IP. However, resolve just in case
+        const gatewayFqdn = new URL(gateway.description).hostname;
+        const gatewayIp = await (0, promises_2.lookup)(gatewayFqdn);
+        this.emit("routerIpConfirmed", gatewayIp.address);
+        // we only run on the interface that we are able to communicate with the
+        // upnp gateway
+        const upnpInterface = this.interfaces.find((int) => int.address === localAddress);
+        // interface is guaranteed here
+        this.sockets.push(this.runSocketServer(upnpInterface));
+        return true;
     }
     stop() {
-        super.stop();
+        // this is idempotent now
         this.upnpClient.close();
+        super.stop();
     }
     runAdminWebserver(port) {
         const requestListener = (req, res) => {
@@ -181,7 +210,7 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
             const results = JSON.parse((0, fs_1.readFileSync)("results.json").toString());
             res.end(JSON.stringify(results));
         };
-        const server = (0, http_1.createServer)(requestListener);
+        const server = (0, node_http_1.createServer)(requestListener);
         // all interfaces
         server.listen(port, () => {
             log_1.default.info(`Admin server is running on http://0.0.0.0:${port}`);
@@ -190,7 +219,7 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
     runSocketServer(iface) {
         this.localAddresses.push(iface.address);
         this.networkState[iface.address] = this.state;
-        const socket = dgram_1.default.createSocket("udp4");
+        const socket = node_dgram_1.default.createSocket("udp4");
         const sendDisover = this.mode === "PRODUCTION";
         const bindAddress = this.mode === "OBSERVE" ? undefined : this.multicastGroup;
         socket.on("message", (data, remote) => this.messageHandler(socket, iface.address, data, remote));
@@ -222,6 +251,7 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
             this.observerMsgHistory = {};
             this.observerNetworkStates = {};
             this.observerAckedPorts = new Set();
+            this.observerLastTestFailed = false;
         }
     }
     portConfirm(localAddress, sendPortSelectAck = false) {
@@ -256,18 +286,18 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
         }
         return aggregatedMsgTypes;
     }
-    writeAdminResults(testId, testFailed = false) {
+    writeAdminResults(testId) {
         // aggregate data. Then write it. Then reset
         // observerMsgHistory
         // observerNetworkStates
         // observerNodeCount
         // observerAckedPorts
         let msg;
-        if (testFailed) {
+        if (this.observerLastTestFailed) {
             // write full report
             msg = {
                 [testId]: {
-                    resultType: "Fail",
+                    resultType: "Fail: Timeout before ACKs",
                     result: {
                         msgHistory: this.observerMsgHistory,
                         networkStates: this.observerNetworkStates
@@ -282,7 +312,7 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
                 const msgFlows = this.createMessageFlows();
                 msg = {
                     [testId]: {
-                        resultType: "PORT_SELECT_NAK found",
+                        resultType: "Pass: PORT_SELECT_NAK found",
                         result: msgFlows
                     }
                 };
@@ -290,7 +320,7 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
             else {
                 msg = {
                     [testId]: {
-                        resultType: "Success"
+                        resultType: "Pass: Success"
                     }
                 };
             }
@@ -388,21 +418,26 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
         while (!selectedPort && portsAvailable.length) {
             if (priorPort && portsAvailable.includes(priorPort)) {
                 selectedPort = priorPort;
+                log_1.default.info(`Prior port ${selectedPort} found and available, selecting`);
             }
             else {
                 // this is based on the FluxGossip network state (all multicast participants)
                 selectedPort = portsAvailable.splice(thisNodesIndex, 1)[0];
+                log_1.default.info(`Selecting port ${selectedPort}`);
                 // we only try the tiebreak thing once, then just rawdog ports
                 thisNodesIndex = 0;
             }
             // checks what ip's are mapped to what ports via upnp (call above)
             const collisionIp = this.portToNodeMap.get(selectedPort);
+            log_1.default.info(`Collision IP check: ${collisionIp}`);
             // the port we want has a upnp mapping, check if it's actually on a live node
             if (collisionIp && collisionIp !== localAddress) {
+                log_1.default.warn(`Our selected port already has a mapping for ${collisionIp}, checking if node live`);
                 if (await this.fluxportInUse(collisionIp, selectedPort)) {
-                    // this shouldn't happen as if the port is in use, it should have been picked
-                    // up when we computed portsAvailable.
-                    portsAvailable.splice(portsAvailable.indexOf(selectedPort), 1);
+                    log_1.default.warn(`Fluxnode responded at http://${collisionIp}:${selectedPort}/flux/uptime, marking port as used`);
+                    // FYI, port has already been remove above from portsAvailable
+                    // this shouldn't happen IRL as if the port is in use, it should have
+                    // been picked up when we computed portsAvailable.
                     // adding this as a precautionary measure, should probably contact node or something
                     if (!(collisionIp in this.networkState)) {
                         this.networkState[collisionIp] = {
@@ -417,7 +452,6 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
             }
         }
         if (selectedPort) {
-            log_1.default.info(`My IP is: ${this.myIp}`);
             this.state.nodeState = SELECTING;
             this.state.port = selectedPort;
             this.pendingSelectId = this.sendPortSelect(localAddress, selectedPort);
@@ -480,10 +514,12 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
             // nodes, store results and rerun. This would only fire on failure
             this.adminTimeout = setTimeout(async () => {
                 this.adminTimeout = null;
-                this.writeAdminResults(this.observerTestId, true);
-                this.sendAdminReset(interfaceAddress);
-                this.observerTestId++;
-                await this.initiate(socket, interfaceAddress, sendDiscover);
+                this.observerLastTestFailed = true;
+                // this.writeAdminResults(this.observerTestId, true);
+                // this.sendAdminReset(interfaceAddress);
+                // this.observerTestId++;
+                // await this.initiate(socket, interfaceAddress, sendDiscover);
+                this.sendAdminDiscover(interfaceAddress);
             }, 60 * 1000);
             this.sendAdminStart(interfaceAddress);
         }
@@ -496,14 +532,13 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
         this.networkState = networkState;
         this.networkState[localAddress] = this.state;
     }
-    async updatePortToNodeMap() {
-        // Fix this function... it's super ugly
-        let allMappings;
+    async runUpnpRequest(upnpCall) {
+        let res;
         try {
-            allMappings = await this.upnpClient.getMappings();
+            res = await upnpCall.call(this.upnpClient);
         }
         catch (err1) {
-            log_1.default.warn(`Unable to get mappings: ${err1}. Will try again without SSDP if possible, otherwise skipping portToNodeMap update`);
+            log_1.default.warn(`Unable to run upnp request: ${err1}. Will try again without SSDP if possible`);
             let errMsg = "";
             if (this.upnpServiceUrl &&
                 err1 instanceof Error &&
@@ -511,10 +546,12 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
                 // skip SSDP (multicast) and use cached router url
                 this.upnpClient.url = this.upnpServiceUrl;
                 try {
-                    allMappings = await this.upnpClient.getMappings();
+                    res = await upnpCall();
                 }
                 catch (err2) {
-                    log_1.default.warn(`Unable to get mappings: ${err2}. Skipping portToNodeMap update`);
+                    // we tried, we failed, reset
+                    this.upnpClient.url = null;
+                    log_1.default.warn(`Unable to run upnp request: ${err2}.`);
                     errMsg = err2 instanceof Error ? err2.message : err2;
                 }
             }
@@ -523,6 +560,10 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
             }
             this.emit("upnpError", errMsg);
         }
+        return res;
+    }
+    async updatePortToNodeMap() {
+        const allMappings = await this.runUpnpRequest(this.upnpClient.getMappings);
         if (!allMappings)
             return;
         for (const mapping of allMappings) {
@@ -678,7 +719,7 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
             if (this.observerAckedPorts.size === this.observerNodeCount) {
                 log_1.default.info("Acked ports matches node count... sending admin discover in 5s...");
                 await this.sleep(5 * 1000);
-                log_1.default.info("SENDING ADMIN DISCOVER MESSAGE");
+                log_1.default.info("Sending admin discover message");
                 this.sendAdminDiscover(localAddress);
             }
         }
@@ -746,11 +787,12 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
             // if there were port NAKs... log the full schebang to file with run
             // number or something. (then restart) mount volume file in for logging
             // into observer container
-            log_1.default.info("All nodes are ready... writing results");
+            log_1.default.info("Writing results and resetting nodes...");
             this.writeAdminResults(this.observerTestId);
             this.sendAdminReset(localAddress);
             this.resetState();
             this.observerTestId++;
+            // no await?
             this.initiate(socket, localAddress, false);
             // logger.info("Message history:");
             // logger.info(inspect(this.observerMsgHistory, INSPECT_OPTIONS));
@@ -765,12 +807,12 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
         if (this.localAddresses.includes(remote.address)) {
             return;
         }
-        log_1.default.info("Message received from:", remote);
         const messages = this.decodeMessages(remote.address, socketData);
         for (const msg of messages) {
             // if (!(msg.type === "ADMIN_DISCOVER_REPLY")) {
             //   logger.info(inspect(msg, INSPECT_OPTIONS));
             // }
+            log_1.default.info(`Received type: ${msg.type} from: ${remote.address}:${remote.port}`);
             switch (this.mode) {
                 case "PRODUCTION":
                     break;
