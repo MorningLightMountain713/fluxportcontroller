@@ -3,9 +3,11 @@ import { AddressInfo } from "net";
 import os from "os";
 import { FluxServer, ServerOptions, Message } from "./fluxServer";
 
-import logger from "./log";
+import logController from "./log";
 
 import { inspect } from "util";
+
+const logger = logController.getLogger();
 
 const PING = "PING";
 const PONG = "PONG";

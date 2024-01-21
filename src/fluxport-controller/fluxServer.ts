@@ -4,7 +4,9 @@ import { AddressInfo } from "net";
 import os from "os";
 
 import { inspect } from "util";
-import logger from "./log";
+import logController from "./log";
+
+const logger = logController.getLogger();
 
 export class ServerError extends Error {
   constructor(msg: string) {
@@ -15,6 +17,7 @@ export class ServerError extends Error {
 }
 
 export class FluxServer extends EventEmitter {
+  // overridden in child classes
   MESSAGE_SEPARATOR = "!FluxServer!";
   private readonly buff: Map<string, string> = new Map();
 
@@ -53,9 +56,6 @@ export class FluxServer extends EventEmitter {
   }
 
   start(): void {
-    // for (const intf of this.interfaces) {
-    //   this.sockets.push(this.runSocketServer(intf));
-    // }
     this.closed = false;
     this.sockets.push(this.runSocketServer(this.interfaces[0]));
   }

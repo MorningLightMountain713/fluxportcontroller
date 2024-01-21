@@ -9,10 +9,13 @@ import axios, { AxiosResponse } from "axios";
 import { FluxServer, ServerOptions, Message, ServerError } from "./fluxServer";
 // import { Client } from "@runonflux/nat-upnp";
 import { Client as UpnpClient } from "@megachips/nat-upnp";
-import logger from "./log";
+import logController from "./log";
 
 import { inspect } from "util";
 import { readFileSync, writeFileSync } from "fs";
+
+// logController.addLoggerTransport("console");
+const logger = logController.getLogger();
 
 const AXIOS_TIMEOUT = 3000; // ms
 const ADDRESS_APIS = [
