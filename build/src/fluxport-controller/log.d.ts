@@ -6,10 +6,10 @@ declare class GossipServerLogger {
     getLogger(): winston.Logger;
     addLoggerTransport(type: LoggerType, options?: LoggerOptions): void;
 }
-declare const _default: GossipServerLogger;
-export default _default;
+export declare const logController: GossipServerLogger;
 type LoggerType = "file" | "console";
 export interface LoggerOptions {
     filePath?: string;
     logLevel?: string;
 }
+export {};

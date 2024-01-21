@@ -12,11 +12,11 @@ const axios_1 = __importDefault(require("axios"));
 const fluxServer_1 = require("./fluxServer");
 // import { Client } from "@runonflux/nat-upnp";
 const nat_upnp_1 = require("@megachips/nat-upnp");
-const log_1 = __importDefault(require("./log"));
+const log_1 = require("./log");
 const util_1 = require("util");
 const fs_1 = require("fs");
 // logController.addLoggerTransport("console");
-const logger = log_1.default.getLogger();
+const logger = log_1.logController.getLogger();
 const AXIOS_TIMEOUT = 3000; // ms
 const ADDRESS_APIS = [
     "https://ifconfig.me",

@@ -7,8 +7,8 @@ exports.FluxServer = exports.ServerError = void 0;
 const events_1 = require("events");
 const os_1 = __importDefault(require("os"));
 const util_1 = require("util");
-const log_1 = __importDefault(require("./log"));
-const logger = log_1.default.getLogger();
+const log_1 = require("./log");
+const logger = log_1.logController.getLogger();
 class ServerError extends Error {
     constructor(msg) {
         super(msg);

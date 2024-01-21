@@ -7,14 +7,12 @@ import { lookup } from "node:dns/promises";
 
 import axios, { AxiosResponse } from "axios";
 import { FluxServer, ServerOptions, Message, ServerError } from "./fluxServer";
-// import { Client } from "@runonflux/nat-upnp";
 import { Client as UpnpClient } from "@megachips/nat-upnp";
-import logController from "./log";
+import { logController } from "./log";
 
 import { inspect } from "util";
 import { readFileSync, writeFileSync } from "fs";
 
-// logController.addLoggerTransport("console");
 const logger = logController.getLogger();
 
 const AXIOS_TIMEOUT = 3000; // ms
@@ -166,6 +164,8 @@ export class FluxGossipServer extends FluxServer {
     let addressApi: string | undefined;
     let data: string = "";
 
+    // for testing, we are able to pass in "testtx" for the txhash, in
+    // this case - we know it's for testing / debug so we return a fake IP
     if (this.outPoint.txhash == "testtx") {
       return "10.10.10.10";
     }
@@ -243,24 +243,17 @@ export class FluxGossipServer extends FluxServer {
     super.stop();
   }
 
-  runAdminWebserver(port: number) {
+  /**
+   * This is for the observer to send results to someone running tests. Only
+   * run when mode is set to OBSERVER
+   * @param port
+   * The port to listen on
+   */
+  runAdminWebserver(port: number): void {
     const requestListener = (req: IncomingMessage, res: ServerResponse) => {
-      // if (
-      //   !this.observerMsgHistory ||
-      //   Object.keys(this.observerMsgHistory).length === 0
-      // ) {
-      //   res.writeHead(503);
-      //   res.end();
-      //   return;
-      // }
-
       res.writeHead(200, {
         "content-type": "application/json; charset=utf-8"
       });
-      // const msg = {
-      //   msgHistory: this.observerMsgHistory,
-      //   networkStates: this.observerNetworkStates
-      // };
       const results = JSON.parse(readFileSync("results.json").toString());
       res.end(JSON.stringify(results));
     };
@@ -279,6 +272,8 @@ export class FluxGossipServer extends FluxServer {
     const socket: FluxSocket = dgram.createSocket("udp4");
 
     const sendDisover = this.mode === "PRODUCTION";
+    // for an observer, we bind on all addresses so we can receive multicast,
+    // and also the unicast responses to ADMIN_DISCOVER
     const bindAddress =
       this.mode === "OBSERVE" ? undefined : this.multicastGroup;
 
@@ -299,204 +294,58 @@ export class FluxGossipServer extends FluxServer {
     return socket;
   }
 
-  resetState(resetMsgLog: boolean = true) {
-    if (this.mode !== "OBSERVE") {
-      this.discoverTimeout = null;
-      this.pendingDiscoverId = null;
-      this.portSelectTimeout = null;
-      this.pendingSelectId = null;
-      this.state = { port: null, nodeState: STARTING };
-      this.networkState = {};
-      // we call reset state if we get a PORT_SELECT_NAK. The nak handler resets
-      // the state and reinitiates. However, in this case, we don't want to wipe
-      // the state as is we are in DEVELOPMENT mode, we want all the msgLogs for
-      // the observer
-      if (resetMsgLog) {
-        this.msgLog = [];
-      }
-    } else {
-      this.observerMsgHistory = {};
-      this.observerNetworkStates = {};
-      this.observerAckedPorts = new Set();
-      this.observerLastTestFailed = false;
-    }
-  }
-
-  portConfirm(localAddress: string, sendPortSelectAck: boolean = false): void {
-    this.portSelectTimeout = null;
-    this.pendingSelectId = null;
-    this.state.nodeState = READY;
-
-    logger.info(`Port confirmed: ${this.state.port}`);
-
-    // this happens when the node hits the portSelectTimeout (i.e. there are
-    // no other nodes) This is a courtesy message for an observer, or starting node.
-    if (sendPortSelectAck) {
-      this.sendPortSelectAck(this.generateId(), localAddress, this.state.port!);
+  async initiate(
+    socket: FluxSocket,
+    interfaceAddress: string,
+    sendDiscover: boolean
+  ): Promise<void> {
+    if (this.restartTimeout) {
+      // should already be triggered
+      clearTimeout(this.restartTimeout);
+      this.restartTimeout = null;
     }
 
-    this.emit("portConfirmed", this.state.port!);
-
-    logger.info(inspect(this.networkState, INSPECT_OPTIONS));
-  }
-
-  createMessageFlows(): Record<string, Record<string, string[]>> {
-    const aggregatedMsgTypes: Record<string, Record<string, string[]>> = {};
-    for (const [node, msgHistory] of Object.entries(this.observerMsgHistory!)) {
-      // DRY
-      const inboundMsgTypes = msgHistory.reduce<string[]>((acc, next) => {
-        if (next.direction === "INBOUND") acc.push(next.type);
-        return acc;
-      }, []);
-      const outboundMsgTypes = msgHistory.reduce<string[]>((acc, next) => {
-        if (next.direction === "OUTBOUND") acc.push(next.type);
-        return acc;
-      }, []);
-
-      aggregatedMsgTypes[node] = { INBOUND: inboundMsgTypes };
-      aggregatedMsgTypes[node]["OUTBOUND"] = outboundMsgTypes;
+    if (!socket.fluxGroupJoined) {
+      socket.setMulticastTTL(1);
+      logger.info(`Joining multicast group: ${this.multicastGroup}`);
+      socket.addMembership(this.multicastGroup, interfaceAddress);
+      socket.fluxGroupJoined = true;
     }
-    return aggregatedMsgTypes;
-  }
 
-  writeAdminResults(testId: number) {
-    // aggregate data. Then write it. Then reset
-    // observerMsgHistory
-    // observerNetworkStates
-    // observerNodeCount
-    // observerAckedPorts
-    let msg: any;
+    // stop the stampede effect from nodes starting together
+    if (this.startDelay !== 0) {
+      await this.sleep(Math.random() * this.startDelay * 1000);
+    }
 
-    if (this.observerLastTestFailed) {
-      // write full report
-      msg = {
-        [testId]: {
-          resultType: "Fail: Timeout before ACKs",
-          result: {
-            msgHistory: this.observerMsgHistory,
-            networkStates: this.observerNetworkStates
-          }
-        }
-      };
-    } else {
-      // check for any NAKs. If so provide list of each nodes message types.
-      const nakFound = Object.values(this.observerMsgHistory!).find((msgArr) =>
-        msgArr.find((x) => x.type === "PORT_SELECT_NAK")
+    // this is for more DEVELOPMENT / PRODUCTION if in dev, don't send
+    // discover on first initiate, so it can be run from observer.
+    if (sendDiscover) {
+      this.state.nodeState = DISCOVERING;
+      this.pendingDiscoverId = this.sendDiscover(interfaceAddress);
+      this.discoverTimeout = setTimeout(
+        async () => await this.portSelect(socket, interfaceAddress),
+        this.responseTimeout * 1000
       );
-      if (nakFound) {
-        const msgFlows = this.createMessageFlows();
-        msg = {
-          [testId]: {
-            resultType: "Pass: PORT_SELECT_NAK found",
-            result: msgFlows
-          }
-        };
-      } else {
-        msg = {
-          [testId]: {
-            resultType: "Pass: Success"
-          }
-        };
+    }
+
+    if (this.mode === "OBSERVE") {
+      if (this.observerTestId >= this.observerTestCount!) {
+        logger.info("Test limit reached, END");
+        logger.info("Results available at: http://localhost:33333");
+        return;
       }
+
+      logger.info("Starting in 5 seconds...");
+      await this.sleep(5 * 1000);
+      // allow 60 seconds for network to converge... then reset
+      // nodes, store results and rerun. This would only fire on failure
+      this.adminTimeout = setTimeout(async () => {
+        this.adminTimeout = null;
+        this.observerLastTestFailed = true;
+        this.sendAdminDiscover(interfaceAddress);
+      }, 60 * 1000);
+      this.sendAdminStart(interfaceAddress);
     }
-    this.writeDataToJsonFile(msg);
-  }
-
-  writeDataToJsonFile(data: any) {
-    let previousResults = JSON.parse(readFileSync("results.json").toString());
-    if (!previousResults) {
-      previousResults = {};
-    }
-    const merged = { ...previousResults, ...data };
-
-    writeFileSync("results.json", JSON.stringify(merged));
-  }
-
-  async fluxportInUse(ip: string, port: number): Promise<boolean> {
-    // call that ip on that port for flux/uptime endpoint
-    const url = `http://${ip}:${port}/flux/uptime`;
-    let attempts = 0;
-    let res: AxiosResponse | null = null;
-
-    while (attempts < 3) {
-      attempts++;
-      try {
-        res = await axios.get(url, { timeout: 1000 });
-      } catch (err) {
-        logger.warn(
-          `No response on ${url}, ${3 - attempts} attempts remaining`
-        );
-        continue;
-      }
-    }
-
-    if (res && res.status === 200) {
-      // some other node is live on this port
-      return true;
-    }
-    return false;
-  }
-
-  async fluxnodePriorPort(): Promise<number | null> {
-    // this happens on development mode. Don't spam api.
-    if (this.outPoint.txhash == "testtx") {
-      return null;
-    }
-
-    logger.info("Checking for prior confirmed port via flux api");
-    const url = `https://api.runonflux.io/daemon/viewdeterministiczelnodelist?filter=${this.myIp}`;
-    let data: any = null;
-    while (!data) {
-      try {
-        ({ data } = await axios.get(url, { timeout: AXIOS_TIMEOUT }));
-      } catch (err) {
-        logger.warn(
-          `Error getting fluxnode deterministic list for my ip: ${this.myIp}, retrying`
-        );
-        await this.sleep(1 * 1000);
-      }
-      if (data?.status === "success") {
-        data = data.data;
-      } else {
-        data = null;
-      }
-    }
-
-    const thisNode = data.find(
-      (node: any) =>
-        node.txhash == this.outPoint.txhash &&
-        node.outidx == this.outPoint.outidx
-    );
-
-    if (thisNode) {
-      let [_, port] = thisNode.ip.split(":");
-      return +port || 16127;
-    }
-
-    return null;
-  }
-
-  sortDiscoveringHosts(): string[] {
-    const filter = (obj: Object, predicate: (v: State) => {}) =>
-      Object.fromEntries(
-        Object.entries(obj).filter(([key, value]) => predicate(value))
-      );
-
-    const filtered = filter(
-      this.networkState,
-      (host) => host.nodeState === ("DISCOVERING" as NodeState)
-    );
-
-    const sortedHosts = Object.keys(filtered).sort((a, b) => {
-      const numA = this.ipv4ToNumber(a);
-      const numB = this.ipv4ToNumber(b);
-      return numA - numB;
-    });
-    return sortedHosts;
-  }
-
-  ipv4ToNumber(ipv4: string): number {
-    return ipv4.split(".").reduce<number>((a, b) => (a << 8) | +b, 0) >>> 0;
   }
 
   async portSelect(socket: Socket, localAddress: string): Promise<void> {
@@ -561,7 +410,7 @@ export class FluxGossipServer extends FluxServer {
             };
           }
         }
-        // previously, we were going to usurp the port. If the node didn't respond. However, if a
+        // previously, we were going to usurp the port if the node didn't respond. However, if a
         // mapping exists, we are unable to remove it from another node, which, for
         // what are now obvious reasons, makes sense.
         selectedPort = null;
@@ -585,6 +434,110 @@ export class FluxGossipServer extends FluxServer {
     }
   }
 
+  portConfirm(localAddress: string, sendPortSelectAck: boolean = false): void {
+    this.portSelectTimeout = null;
+    this.pendingSelectId = null;
+    this.state.nodeState = READY;
+
+    logger.info(`Port confirmed: ${this.state.port}`);
+
+    // this happens when the node hits the portSelectTimeout (i.e. there are
+    // no other nodes) This is a courtesy message for an observer, or starting node.
+    if (sendPortSelectAck) {
+      this.sendPortSelectAck(this.generateId(), localAddress, this.state.port!);
+    }
+
+    this.emit("portConfirmed", this.state.port!);
+
+    logger.info(inspect(this.networkState, INSPECT_OPTIONS));
+  }
+
+  resetState(resetMsgLog: boolean = true): void {
+    if (this.mode !== "OBSERVE") {
+      this.discoverTimeout = null;
+      this.pendingDiscoverId = null;
+      this.portSelectTimeout = null;
+      this.pendingSelectId = null;
+      this.state = { port: null, nodeState: STARTING };
+      this.networkState = {};
+      // we call reset state if we get a PORT_SELECT_NAK. The nak handler resets
+      // the state and reinitiates. However, if we are in DEVELOPMENT mode, we don't
+      // want to wipe the state as, we want all the msgLogs for the observer
+      if (resetMsgLog) {
+        this.msgLog = [];
+      }
+    } else {
+      this.observerMsgHistory = {};
+      this.observerNetworkStates = {};
+      this.observerAckedPorts = new Set();
+      this.observerLastTestFailed = false;
+    }
+  }
+
+  async fluxnodePriorPort(): Promise<number | null> {
+    // this happens on development mode. Don't spam api.
+    if (this.outPoint.txhash == "testtx") {
+      return null;
+    }
+
+    logger.info("Checking for prior confirmed port via flux api");
+    const url = `https://api.runonflux.io/daemon/viewdeterministiczelnodelist?filter=${this.myIp}`;
+    let data: any = null;
+    while (!data) {
+      try {
+        ({ data } = await axios.get(url, { timeout: AXIOS_TIMEOUT }));
+      } catch (err) {
+        logger.warn(
+          `Error getting fluxnode deterministic list for my ip: ${this.myIp}, retrying`
+        );
+        await this.sleep(1 * 1000);
+      }
+      if (data?.status === "success") {
+        data = data.data;
+      } else {
+        data = null;
+      }
+    }
+
+    const thisNode = data.find(
+      (node: any) =>
+        node.txhash == this.outPoint.txhash &&
+        node.outidx == this.outPoint.outidx
+    );
+
+    if (thisNode) {
+      let [_, port] = thisNode.ip.split(":");
+      return +port || 16127;
+    }
+
+    return null;
+  }
+
+  async fluxportInUse(ip: string, port: number): Promise<boolean> {
+    // call that ip on that port for flux/uptime endpoint
+    const url = `http://${ip}:${port}/flux/uptime`;
+    let attempts = 0;
+    let res: AxiosResponse | null = null;
+
+    while (attempts < 3) {
+      attempts++;
+      try {
+        res = await axios.get(url, { timeout: 1000 });
+      } catch (err) {
+        logger.warn(
+          `No response on ${url}, ${3 - attempts} attempts remaining`
+        );
+        continue;
+      }
+    }
+
+    if (res && res.status === 200) {
+      // some other node is live on this port
+      return true;
+    }
+    return false;
+  }
+
   resetTimers(): void {
     if (this.restartTimeout) {
       clearTimeout(this.restartTimeout);
@@ -600,64 +553,6 @@ export class FluxGossipServer extends FluxServer {
     }
   }
 
-  async initiate(
-    socket: FluxSocket,
-    interfaceAddress: string,
-    sendDiscover: boolean
-  ): Promise<void> {
-    if (this.restartTimeout) {
-      // should already be triggered
-      clearTimeout(this.restartTimeout);
-      this.restartTimeout = null;
-    }
-
-    if (!socket.fluxGroupJoined) {
-      socket.setMulticastTTL(1);
-      logger.info(`Joining multicast group: ${this.multicastGroup}`);
-      socket.addMembership(this.multicastGroup, interfaceAddress);
-      socket.fluxGroupJoined = true;
-    }
-
-    // stop the stampede effect from nodes starting together
-    if (this.startDelay !== 0) {
-      await this.sleep(Math.random() * this.startDelay * 1000);
-    }
-
-    // this is for more DEVELOPMENT / PRODUCTION IF IN DEV, don't send
-    // discover on first initiate, so it can be run from observer.
-    if (sendDiscover) {
-      this.state.nodeState = DISCOVERING;
-      this.pendingDiscoverId = this.sendDiscover(interfaceAddress);
-      this.discoverTimeout = setTimeout(
-        async () => await this.portSelect(socket, interfaceAddress),
-        this.responseTimeout * 1000
-      );
-    }
-
-    if (this.mode === "OBSERVE") {
-      if (this.observerTestId >= this.observerTestCount!) {
-        logger.info("Test limit reached, END");
-        logger.info("Results available at: http://localhost:33333");
-        return;
-      }
-
-      logger.info("Starting in 5 seconds...");
-      await this.sleep(5 * 1000);
-      // allow 60 seconds for network to converge... then reset
-      // nodes, store results and rerun. This would only fire on failure
-      this.adminTimeout = setTimeout(async () => {
-        this.adminTimeout = null;
-        this.observerLastTestFailed = true;
-        // this.writeAdminResults(this.observerTestId, true);
-        // this.sendAdminReset(interfaceAddress);
-        // this.observerTestId++;
-        // await this.initiate(socket, interfaceAddress, sendDiscover);
-        this.sendAdminDiscover(interfaceAddress);
-      }, 60 * 1000);
-      this.sendAdminStart(interfaceAddress);
-    }
-  }
-
   // HELPERS //
 
   sleep(ms: number): Promise<void> {
@@ -669,6 +564,36 @@ export class FluxGossipServer extends FluxServer {
     this.networkState[localAddress] = this.state;
   }
 
+  /**
+   * Helper function to sort ip addresses. Nodes use this as a tiebreaker
+   * when more than one node is discovering
+   * @returns string[]
+   * Array of all hosts sorted from lowest to highest IP
+   */
+  sortDiscoveringHosts(): string[] {
+    const filter = (obj: Object, predicate: (v: State) => {}) =>
+      Object.fromEntries(
+        Object.entries(obj).filter(([key, value]) => predicate(value))
+      );
+
+    const filtered = filter(
+      this.networkState,
+      (host) => host.nodeState === ("DISCOVERING" as NodeState)
+    );
+
+    const sortedHosts = Object.keys(filtered).sort((a, b) => {
+      const numA = this.ipv4ToNumber(a);
+      const numB = this.ipv4ToNumber(b);
+      return numA - numB;
+    });
+    return sortedHosts;
+  }
+
+  ipv4ToNumber(ipv4: string): number {
+    return ipv4.split(".").reduce<number>((a, b) => (a << 8) | +b, 0) >>> 0;
+  }
+
+  // type this
   async runUpnpRequest(upnpCall: () => Promise<any>): Promise<any> {
     let res;
     try {
@@ -722,6 +647,78 @@ export class FluxGossipServer extends FluxServer {
         this.portToNodeMap.set(mapping.public.port, mapping.private.host);
       }
     }
+  }
+
+  // ADMIN (OBSERVER) FUNCTIONS //
+
+  // type this better, this function is just for the observer
+  createMessageFlows(): Record<string, Record<string, string[]>> {
+    const aggregatedMsgTypes: Record<string, Record<string, string[]>> = {};
+    for (const [node, msgHistory] of Object.entries(this.observerMsgHistory!)) {
+      // DRY
+      const inboundMsgTypes = msgHistory.reduce<string[]>((acc, next) => {
+        if (next.direction === "INBOUND") acc.push(next.type);
+        return acc;
+      }, []);
+      const outboundMsgTypes = msgHistory.reduce<string[]>((acc, next) => {
+        if (next.direction === "OUTBOUND") acc.push(next.type);
+        return acc;
+      }, []);
+
+      aggregatedMsgTypes[node] = { INBOUND: inboundMsgTypes };
+      aggregatedMsgTypes[node]["OUTBOUND"] = outboundMsgTypes;
+    }
+    return aggregatedMsgTypes;
+  }
+
+  // this function is just for the observer
+  writeAdminResults(testId: number): void {
+    // aggregate data. Then write it. Then reset
+    let msg: any;
+
+    if (this.observerLastTestFailed) {
+      // write full report
+      msg = {
+        [testId]: {
+          resultType: "Fail: Timeout before ACKs",
+          result: {
+            msgHistory: this.observerMsgHistory,
+            networkStates: this.observerNetworkStates
+          }
+        }
+      };
+    } else {
+      // check for any NAKs. If so provide list of each nodes message types.
+      const nakFound = Object.values(this.observerMsgHistory!).find((msgArr) =>
+        msgArr.find((x) => x.type === "PORT_SELECT_NAK")
+      );
+      if (nakFound) {
+        const msgFlows = this.createMessageFlows();
+        msg = {
+          [testId]: {
+            resultType: "Pass: PORT_SELECT_NAK found",
+            result: msgFlows
+          }
+        };
+      } else {
+        msg = {
+          [testId]: {
+            resultType: "Pass: Success"
+          }
+        };
+      }
+    }
+    this.writeDataToJsonFile(msg);
+  }
+
+  writeDataToJsonFile(data: any): void {
+    let previousResults = JSON.parse(readFileSync("results.json").toString());
+    if (!previousResults) {
+      previousResults = {};
+    }
+    const merged = { ...previousResults, ...data };
+
+    writeFileSync("results.json", JSON.stringify(merged));
   }
 
   // OUTBOUND MESSAGES //
@@ -836,6 +833,13 @@ export class FluxGossipServer extends FluxServer {
   }
 
   async discoverReplyHandler(
+    /**
+     * This only updates the state if the reply is for this node. Means that
+     * we could be missing out on newer info. It's hard to tell if it's actually
+     * newer without a timestamp. I've tried to avoid timestamps as there is no
+     * guarantee the clocks are accurate - and for multicast on lan we need ms
+     * resolution. Thought about NTP, but that gets ugly real quick.
+     */
     socket: Socket,
     localAddress: string,
     msg: DiscoverReplyMessage
@@ -848,16 +852,6 @@ export class FluxGossipServer extends FluxServer {
       this.pendingDiscoverId = null;
       this.updateState(localAddress, msg.networkState);
       this.portSelect(socket, localAddress);
-    } else {
-      // if the reply was for someone else, and there is NEW state that
-      // we don't have, update. (Don't modify any existing state)
-      // if we could timestamp the messages, then could use that, but how
-      // to sync the timestamps accurately? (don't think it's possible)
-      // for (const state in msg.networkState) {
-      //   if (!(state in this.networkState)) {
-      //     this.networkState[state] = msg.networkState[state];
-      //   }
-      // }
     }
   }
 
@@ -934,22 +928,21 @@ export class FluxGossipServer extends FluxServer {
     }
   }
 
-  async adminStartHandler(socket: Socket, localAddress: string) {
+  async adminStartHandler(socket: Socket, localAddress: string): Promise<void> {
     logger.info("admin Start received... starting");
     await this.initiate(socket, localAddress, true);
   }
 
-  adminResetHandler() {
+  adminResetHandler(): void {
     this.resetTimers();
     this.resetState();
     logger.info("admin Reset complete");
   }
 
-  async adminDiscoverHandler(localAddress: string, remote: AddressInfo) {
-    // send our state and nakCount unicast to msg.host
-    // also, if in DEVELOPMENT mode, should collect stats,
-    // of message count received from each node.
-    // also nak counter should only be set in dev mode.
+  async adminDiscoverHandler(
+    localAddress: string,
+    remote: AddressInfo
+  ): Promise<void> {
     await this.sleep(Math.random() * this.firstResponderDelay * 1000);
 
     this.sendAdminDiscoverReply(localAddress, remote.address);
@@ -976,24 +969,13 @@ export class FluxGossipServer extends FluxServer {
         this.adminTimeout = null;
       }
 
-      // while testcount < 1000 or something...
-      // check results see if they're good... if so log that they're good
-      // maybe something simple like ip to port then send ADMIN_RESTART.
-      // if there were port NAKs... log the full schebang to file with run
-      // number or something. (then restart) mount volume file in for logging
-      // into observer container
       logger.info("Writing results and resetting nodes...");
       this.writeAdminResults(this.observerTestId);
       this.sendAdminReset(localAddress);
       this.resetState();
       this.observerTestId++;
-      // no await?
+      // no await, I think it makes sense here
       this.initiate(socket, localAddress, false);
-
-      // logger.info("Message history:");
-      // logger.info(inspect(this.observerMsgHistory, INSPECT_OPTIONS));
-      // logger.info("All network states:");
-      // logger.info(inspect(this.observerNetworkStates, INSPECT_OPTIONS));
     }
   }
 
@@ -1012,9 +994,6 @@ export class FluxGossipServer extends FluxServer {
 
     const messages = this.decodeMessages(remote.address, socketData);
     for (const msg of messages) {
-      // if (!(msg.type === "ADMIN_DISCOVER_REPLY")) {
-      //   logger.info(inspect(msg, INSPECT_OPTIONS));
-      // }
       logger.info(
         `Received type: ${msg.type} from: ${remote.address}:${remote.port}`
       );
@@ -1023,7 +1002,7 @@ export class FluxGossipServer extends FluxServer {
           break;
         case "DEVELOPMENT":
           // need to clone the object here otherwise, all msgLogs all reference
-          // the same networkState
+          // the same networkState. Think this is only available in > node 18
           this.msgLog!.push({
             ...structuredClone(msg),
             ...{ direction: "INBOUND" }
@@ -1084,9 +1063,6 @@ export class FluxGossipServer extends FluxServer {
             msg as AdminDiscoverReplyMessage
           );
           break;
-        // case ADMIN_RESULTS:
-        //   await this.adminResultsHandler(localAddress, remote);
-        //   break;
         default:
           logger.warn(
             `Received an unknown message of type: ${msg.type}, ignoring`
@@ -1104,14 +1080,14 @@ export default FluxGossipServer;
  * ===================
  */
 
+type fluxPorts = 16197 | 16187 | 16177 | 16167 | 16157 | 16147 | 16137 | 16127;
+
 export type NodeState =
   | "UNKNOWN"
   | "STARTING"
   | "DISCOVERING"
   | "SELECTING"
   | "READY";
-
-type fluxPorts = 16197 | 16187 | 16177 | 16167 | 16157 | 16147 | 16137 | 16127;
 
 export type ServerMode = "DEVELOPMENT" | "PRODUCTION" | "OBSERVE";
 
@@ -1214,11 +1190,6 @@ interface FluxGossipServerEvents {
   upnpError: (message: string) => void;
   startError: () => void;
   routerIpConfirmed: (ip: string) => void;
-}
-
-interface ImportError {
-  code: string;
-  message: string;
 }
 
 export declare interface FluxGossipServer {

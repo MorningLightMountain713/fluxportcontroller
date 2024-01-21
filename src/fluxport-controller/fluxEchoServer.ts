@@ -3,7 +3,7 @@ import { AddressInfo } from "net";
 import os from "os";
 import { FluxServer, ServerOptions, Message } from "./fluxServer";
 
-import logController from "./log";
+import { logController } from "./log";
 
 import { inspect } from "util";
 

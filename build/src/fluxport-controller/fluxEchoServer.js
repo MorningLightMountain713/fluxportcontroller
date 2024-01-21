@@ -6,9 +6,9 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.FluxEchoServer = void 0;
 const dgram_1 = __importDefault(require("dgram"));
 const fluxServer_1 = require("./fluxServer");
-const log_1 = __importDefault(require("./log"));
+const log_1 = require("./log");
 const util_1 = require("util");
-const logger = log_1.default.getLogger();
+const logger = log_1.logController.getLogger();
 const PING = "PING";
 const PONG = "PONG";
 class FluxEchoServer extends fluxServer_1.FluxServer {

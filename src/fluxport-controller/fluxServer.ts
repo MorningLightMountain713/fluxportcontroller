@@ -4,7 +4,7 @@ import { AddressInfo } from "net";
 import os from "os";
 
 import { inspect } from "util";
-import logController from "./log";
+import { logController } from "./log";
 
 const logger = logController.getLogger();
 

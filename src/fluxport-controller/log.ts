@@ -37,7 +37,7 @@ class GossipServerLogger {
   }
 }
 
-export default new GossipServerLogger();
+export const logController = new GossipServerLogger();
 
 type LoggerType = "file" | "console";
 
