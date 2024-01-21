@@ -8,6 +8,7 @@ const dgram_1 = __importDefault(require("dgram"));
 const fluxServer_1 = require("./fluxServer");
 const log_1 = __importDefault(require("./log"));
 const util_1 = require("util");
+const logger = log_1.default.getLogger();
 const PING = "PING";
 const PONG = "PONG";
 class FluxEchoServer extends fluxServer_1.FluxServer {
@@ -30,7 +31,7 @@ class FluxEchoServer extends fluxServer_1.FluxServer {
         this.port = options.port || 16137;
         this.pingInterval = options.interval || 5;
         this.maxMissed = options.maxMissed || 3;
-        log_1.default.info(this.interfaces);
+        logger.info(this.interfaces);
     }
     addPeer(peerAddress) {
         this.peers[peerAddress] = {
@@ -55,7 +56,7 @@ class FluxEchoServer extends fluxServer_1.FluxServer {
     }
     initiate(socket, multicastGroup, interfaceAddress) {
         socket.setMulticastTTL(1);
-        log_1.default.info(`Joining multicast group: ${multicastGroup}`);
+        logger.info(`Joining multicast group: ${multicastGroup}`);
         socket.addMembership(multicastGroup, interfaceAddress);
         for (const [peerName, peerData] of Object.entries(this.peers)) {
             this.sendPing(socket, peerName);
@@ -70,7 +71,7 @@ class FluxEchoServer extends fluxServer_1.FluxServer {
         socket.on("message", (data, remote) => this.messageHandler(socket, iface.address, data, remote));
         socket.on("listening", () => this.initiate(socket, echoMulticastGroup, iface.address));
         socket.once("error", (err) => this.removeSocketServer(socket, err));
-        log_1.default.info(`Echo Server binding to ${this.port} on ${iface.address}`);
+        logger.info(`Echo Server binding to ${this.port} on ${iface.address}`);
         // this will receive on multicast address only, not iface.address
         // (if you specify iface.address on bind it will listen on both)
         socket.bind(this.port, echoMulticastGroup);
@@ -79,9 +80,9 @@ class FluxEchoServer extends fluxServer_1.FluxServer {
     messageHandler(socket, localAddress, socketData, remote) {
         if (this.closed)
             return;
-        log_1.default.info("Message received from:", remote);
+        logger.info("Message received from:", remote);
         const messages = this.decodeMessages(remote.address, socketData);
-        log_1.default.info((0, util_1.inspect)(messages, { showHidden: false, depth: null, colors: true }));
+        logger.info((0, util_1.inspect)(messages, { showHidden: false, depth: null, colors: true }));
         for (const msg of messages) {
             this.unhandledMessages.add(msg.id);
             switch (msg.type) {
@@ -92,7 +93,7 @@ class FluxEchoServer extends fluxServer_1.FluxServer {
                     this.pongHandler(msg, remote.address);
                     break;
                 default:
-                    log_1.default.info(`Received an unknown message of type: ${msg.type}, ignoring`);
+                    logger.info(`Received an unknown message of type: ${msg.type}, ignoring`);
             }
         }
     }
@@ -135,7 +136,7 @@ class FluxEchoServer extends fluxServer_1.FluxServer {
         this.sendPayloadToSocket(payload, socket, multicastGroup);
     }
     sendMessageToSocket(payload, socket, multicastGroup) {
-        log_1.default.info(`Sending message to ${multicastGroup}:${this.port}`);
+        logger.info(`Sending message to ${multicastGroup}:${this.port}`);
         socket.send(payload, 0, payload.length, this.port, multicastGroup);
     }
 }

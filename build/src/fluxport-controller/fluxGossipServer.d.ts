@@ -58,11 +58,11 @@ export declare class FluxGossipServer extends FluxServer {
     fluxnodePriorPort(): Promise<number | null>;
     sortDiscoveringHosts(): string[];
     ipv4ToNumber(ipv4: string): number;
-    portSelect(socket: Socket, localAddress: string): Promise<void>;
     resetTimers(): void;
     initiate(socket: FluxSocket, interfaceAddress: string, sendDiscover: boolean): Promise<void>;
     sleep(ms: number): Promise<void>;
     updateState(localAddress: string, networkState: NetworkState): void;
+    getPortFromNode(nodeIp: string): fluxPorts | null;
     updatePortToNodeMap(): Promise<void>;
     sendAdminDiscover(host: string): void;
     sendAdminDiscoverReply(srcHost: string, dstHost: string): void;
@@ -237,4 +237,26 @@ export declare interface FluxGossipServer {
      * A method from UpnpClient
      */
     runUpnpRequest(upnpCall: () => Promise<any>): Promise<any>;
+    /**
+     * This function does the heavy lifting. Based on the following assumptions:
+     *  * Once a portmapping is set - another node cannot remove it, only the node that,
+     *    set it can, or it expires.
+     *  * If this node's txhash is found in the zelnode list, it must have rebooted / restarted
+     *    etc, so we favor this port first.
+     *  * If txhash is not found, we then look for a port mapping for this host for a fluxport
+     *    on the router. If found, we then favor this port.
+     *  * Finally, if none of the above happens, we then resort to the gossip server algo to
+     *    figure out what port we want.
+     *
+     * Gossip server algo:
+     *  * After getting a DISCOVER_REPLY, the network state is updated, and any ports that are
+     *    in use are filtered, and the portsAvailable property generated. Any DISCOVERING nodes
+     *    are sorted from lowest ip to highest, whatever this nodes index is in that list, is the
+     *    index used to determine the selected port in the portsAvailable property.
+     * @param socket
+     * The socket used for this request
+     * @param localAddress
+     * The local address of the socket (same adress as what is used for UPnP)
+     */
+    portSelect(socket: Socket, localAddress: string): Promise<void>;
 }

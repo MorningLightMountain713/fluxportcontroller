@@ -15,6 +15,8 @@ const nat_upnp_1 = require("@megachips/nat-upnp");
 const log_1 = __importDefault(require("./log"));
 const util_1 = require("util");
 const fs_1 = require("fs");
+// logController.addLoggerTransport("console");
+const logger = log_1.default.getLogger();
 const AXIOS_TIMEOUT = 3000; // ms
 const ADDRESS_APIS = [
     "https://ifconfig.me",
@@ -118,14 +120,16 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
             default:
                 throw new fluxServer_1.ServerError(`Unknown server mode: ${this.mode}`);
         }
-        log_1.default.debug(`Start delay: ${this.startDelay}`);
-        log_1.default.debug(`firstResponderDelay: ${this.firstResponderDelay}`);
-        log_1.default.debug(`responseTimeoutMultiplier: ${this.responseTimeoutMultiplier}`);
-        log_1.default.debug(`responseTimeout: ${this.responseTimeout}`);
+        logger.debug(`Start delay: ${this.startDelay}`);
+        logger.debug(`firstResponderDelay: ${this.firstResponderDelay}`);
+        logger.debug(`responseTimeoutMultiplier: ${this.responseTimeoutMultiplier}`);
+        logger.debug(`responseTimeout: ${this.responseTimeout}`);
     }
     get ["portsAvailable"]() {
         const usedPorts = Object.values(this.networkState)
-            .filter((host) => (host.nodeState === SELECTING || host.nodeState === READY) &&
+            .filter((host) => (host.nodeState === SELECTING ||
+            host.nodeState === READY ||
+            host.nodeState === UNKNOWN) &&
             typeof host.port === "number")
             .map((host) => host.port);
         return this.allFluxports.filter((port) => !usedPorts.includes(port));
@@ -143,7 +147,7 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
                 ({ data } = await axios_1.default.get(addressApi, { timeout: AXIOS_TIMEOUT }));
             }
             catch (err) {
-                log_1.default.warn(`Error getting IP address from ${addressApi}, switching...`);
+                logger.warn(`Error getting IP address from ${addressApi}, switching...`);
                 await this.sleep(1000);
             }
         }
@@ -158,7 +162,7 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
             this.myIp = await this.getMyPublicIp();
             this.startedAt = now;
         }
-        log_1.default.info(`My ip is: ${this.myIp}`);
+        logger.info(`My ip is: ${this.myIp}`);
         // this now means the gossipserver is reliant on UPnP working as we're using the
         // interface provided by UPnP for multicast
         // use generics for this and type properly
@@ -213,7 +217,7 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
         const server = (0, node_http_1.createServer)(requestListener);
         // all interfaces
         server.listen(port, () => {
-            log_1.default.info(`Admin server is running on http://0.0.0.0:${port}`);
+            logger.info(`Admin server is running on http://0.0.0.0:${port}`);
         });
     }
     runSocketServer(iface) {
@@ -225,7 +229,7 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
         socket.on("message", (data, remote) => this.messageHandler(socket, iface.address, data, remote));
         socket.on("listening", async () => await this.initiate(socket, iface.address, sendDisover));
         socket.once("error", (err) => this.removeSocketServer(socket, err));
-        log_1.default.info(`Binding to ${this.port} on ${iface.address}`);
+        logger.info(`Binding to ${this.port} on ${iface.address}`);
         // this will receive on multicast address only, not iface.address
         // (if you specify dont specify address, it will listen on both
         socket.bind(this.port, bindAddress);
@@ -258,14 +262,14 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
         this.portSelectTimeout = null;
         this.pendingSelectId = null;
         this.state.nodeState = READY;
-        log_1.default.info(`Port confirmed: ${this.state.port}`);
+        logger.info(`Port confirmed: ${this.state.port}`);
         // this happens when the node hits the portSelectTimeout (i.e. there are
         // no other nodes) This is a courtesy message for an observer, or starting node.
         if (sendPortSelectAck) {
             this.sendPortSelectAck(this.generateId(), localAddress, this.state.port);
         }
         this.emit("portConfirmed", this.state.port);
-        log_1.default.info((0, util_1.inspect)(this.networkState, INSPECT_OPTIONS));
+        logger.info((0, util_1.inspect)(this.networkState, INSPECT_OPTIONS));
     }
     createMessageFlows() {
         const aggregatedMsgTypes = {};
@@ -346,7 +350,7 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
                 res = await axios_1.default.get(url, { timeout: 1000 });
             }
             catch (err) {
-                log_1.default.warn(`No response on ${url}, ${3 - attempts} attempts remaining`);
+                logger.warn(`No response on ${url}, ${3 - attempts} attempts remaining`);
                 continue;
             }
         }
@@ -361,7 +365,7 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
         if (this.outPoint.txhash == "testtx") {
             return null;
         }
-        log_1.default.info("Checking for prior confirmed port via flux api");
+        logger.info("Checking for prior confirmed port via flux api");
         const url = `https://api.runonflux.io/daemon/viewdeterministiczelnodelist?filter=${this.myIp}`;
         let data = null;
         while (!data) {
@@ -369,7 +373,7 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
                 ({ data } = await axios_1.default.get(url, { timeout: AXIOS_TIMEOUT }));
             }
             catch (err) {
-                log_1.default.warn(`Error getting fluxnode deterministic list for my ip: ${this.myIp}, retrying`);
+                logger.warn(`Error getting fluxnode deterministic list for my ip: ${this.myIp}, retrying`);
                 await this.sleep(1 * 1000);
             }
             if (data?.status === "success") {
@@ -406,7 +410,7 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
         await this.updatePortToNodeMap();
         // looks up the flux api to see if our ip / txhash is in the determzelnode list
         const priorPort = await this.fluxnodePriorPort();
-        log_1.default.info(`Prior port found: ${priorPort}`);
+        logger.info(`Prior port found: ${priorPort}`);
         const portsAvailable = this.portsAvailable;
         // sort DISCOVERING nodes from lowest IP to higest. We select
         // the same index in the list. I.e. lowest IP gets index 0 (16197)
@@ -417,38 +421,44 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
         thisNodesIndex = thisNodesIndex === -1 ? 0 : thisNodesIndex;
         while (!selectedPort && portsAvailable.length) {
             if (priorPort && portsAvailable.includes(priorPort)) {
-                selectedPort = priorPort;
-                log_1.default.info(`Prior port ${selectedPort} found and available, selecting`);
+                const priorIndex = this.portsAvailable.indexOf(priorPort);
+                selectedPort = portsAvailable.splice(priorIndex, 1)[0];
+                logger.info(`Prior port ${selectedPort} found and available, selecting`);
             }
             else {
-                // this is based on the FluxGossip network state (all multicast participants)
-                selectedPort = portsAvailable.splice(thisNodesIndex, 1)[0];
-                log_1.default.info(`Selecting port ${selectedPort}`);
-                // we only try the tiebreak thing once, then just rawdog ports
+                // check router port mappings
+                selectedPort = this.getPortFromNode(localAddress);
+                if (selectedPort) {
+                    logger.info(`Port ${selectedPort} found in router mapping table for our IP, selecting`);
+                }
+                else {
+                    // this is based on the FluxGossip network state (all multicast participants)
+                    selectedPort = portsAvailable.splice(thisNodesIndex, 1)[0];
+                    logger.info(`Selecting next available port: ${selectedPort}`);
+                }
+                // we only try the tiebreak thing once, then just rawdog ports after that
                 thisNodesIndex = 0;
             }
             // checks what ip's are mapped to what ports via upnp (call above)
             const collisionIp = this.portToNodeMap.get(selectedPort);
-            log_1.default.info(`Collision IP check: ${collisionIp}`);
             // the port we want has a upnp mapping, check if it's actually on a live node
             if (collisionIp && collisionIp !== localAddress) {
-                log_1.default.warn(`Our selected port already has a mapping for ${collisionIp}, checking if node live`);
+                logger.warn(`Our selected port already has a mapping for ${collisionIp}, checking if node live`);
                 if (await this.fluxportInUse(collisionIp, selectedPort)) {
-                    log_1.default.warn(`Fluxnode responded at http://${collisionIp}:${selectedPort}/flux/uptime, marking port as used`);
-                    // FYI, port has already been remove above from portsAvailable
-                    // this shouldn't happen IRL as if the port is in use, it should have
-                    // been picked up when we computed portsAvailable.
-                    // adding this as a precautionary measure, should probably contact node or something
+                    logger.warn(`Fluxnode responded at http://${collisionIp}:${selectedPort}/flux/uptime, marking port as used`);
+                    // This can happen when running a blend of old fluxnodes and new autoUPnP nodes
+                    // adding this as a precautionary measure
                     if (!(collisionIp in this.networkState)) {
                         this.networkState[collisionIp] = {
                             port: selectedPort,
                             nodeState: UNKNOWN
                         };
                     }
-                    selectedPort = null;
-                    continue;
                 }
-                // the port wasn't in use, so we wrax it. (will break from loop here)
+                // previously, we were going to usurp the port. If the node didn't respond. However, if a
+                // mapping exists, we are unable to remove it from another node, which, for
+                // what are now obvious reasons, makes sense.
+                selectedPort = null;
             }
         }
         if (selectedPort) {
@@ -458,7 +468,7 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
             this.portSelectTimeout = setTimeout(() => this.portConfirm(localAddress, true), this.responseTimeout * 1000);
         }
         else {
-            log_1.default.error("No free ports... will try again in 5 minutes");
+            logger.error("No free ports... will try again in 5 minutes");
             this.resetState();
             this.restartTimeout = setTimeout(async () => {
                 await this.initiate(socket, localAddress, true);
@@ -487,7 +497,7 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
         }
         if (!socket.fluxGroupJoined) {
             socket.setMulticastTTL(1);
-            log_1.default.info(`Joining multicast group: ${this.multicastGroup}`);
+            logger.info(`Joining multicast group: ${this.multicastGroup}`);
             socket.addMembership(this.multicastGroup, interfaceAddress);
             socket.fluxGroupJoined = true;
         }
@@ -504,11 +514,11 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
         }
         if (this.mode === "OBSERVE") {
             if (this.observerTestId >= this.observerTestCount) {
-                log_1.default.info("Test limit reached, END");
-                log_1.default.info("Results available at: http://localhost:33333");
+                logger.info("Test limit reached, END");
+                logger.info("Results available at: http://localhost:33333");
                 return;
             }
-            log_1.default.info("Starting in 5 seconds...");
+            logger.info("Starting in 5 seconds...");
             await this.sleep(5 * 1000);
             // allow 60 seconds for network to converge... then reset
             // nodes, store results and rerun. This would only fire on failure
@@ -538,7 +548,7 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
             res = await upnpCall.call(this.upnpClient);
         }
         catch (err1) {
-            log_1.default.warn(`Unable to run upnp request: ${err1}. Will try again without SSDP if possible`);
+            logger.warn(`Unable to run upnp request: ${err1}. Will try again without SSDP if possible`);
             let errMsg = "";
             if (this.upnpServiceUrl &&
                 err1 instanceof Error &&
@@ -551,7 +561,7 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
                 catch (err2) {
                     // we tried, we failed, reset
                     this.upnpClient.url = null;
-                    log_1.default.warn(`Unable to run upnp request: ${err2}.`);
+                    logger.warn(`Unable to run upnp request: ${err2}.`);
                     errMsg = err2 instanceof Error ? err2.message : err2;
                 }
             }
@@ -562,6 +572,13 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
         }
         return res;
     }
+    getPortFromNode(nodeIp) {
+        for (let [key, value] of this.portToNodeMap.entries()) {
+            if (value === nodeIp)
+                return key;
+        }
+        return null;
+    }
     async updatePortToNodeMap() {
         const allMappings = await this.runUpnpRequest(this.upnpClient.getMappings);
         if (!allMappings)
@@ -570,11 +587,7 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
             // we only care about Flux tcp maps
             if (mapping.protocol !== "tcp")
                 continue;
-            // think about this... is it correct? We are saying that if a port has
-            // been used in our networkState, we don't put it in the nodeMap. Maybe
-            // portToNodeMap name needs to change, as it's really nodes that have a UPnP
-            // mapping that we don't have network state for via direct comms?!?
-            if (this.portsAvailable.includes(mapping.public.port)) {
+            if (this.allFluxports.includes(mapping.public.port)) {
                 this.portToNodeMap.set(mapping.public.port, mapping.private.host);
             }
         }
@@ -659,7 +672,7 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
         }
         const payload = this.preparePayload(msg, options.addSeparators);
         this.sockets.forEach((socket) => {
-            log_1.default.info(`Sending type: ${msg.type} to: ${targetAddress}:${this.port}`);
+            logger.info(`Sending type: ${msg.type} to: ${targetAddress}:${this.port}`);
             socket.send(payload, 0, payload.length, this.port, targetAddress);
         });
     }
@@ -717,9 +730,9 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
         if (this.mode === "OBSERVE") {
             this.observerAckedPorts.add(msg.port);
             if (this.observerAckedPorts.size === this.observerNodeCount) {
-                log_1.default.info("Acked ports matches node count... sending admin discover in 5s...");
+                logger.info("Acked ports matches node count... sending admin discover in 5s...");
                 await this.sleep(5 * 1000);
-                log_1.default.info("Sending admin discover message");
+                logger.info("Sending admin discover message");
                 this.sendAdminDiscover(localAddress);
             }
         }
@@ -738,7 +751,7 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
     async portSelectNakHandler(socket, localAddress, msg) {
         this.unhandledMessages.delete(msg.id);
         if (this.portSelectTimeout && this.pendingSelectId === msg.id) {
-            log_1.default.warn("Our port request got NAKd... restarting in 10 seconds");
+            logger.warn("Our port request got NAKd... restarting in 10 seconds");
             clearTimeout(this.portSelectTimeout);
             this.portSelectTimeout = null;
             this.pendingSelectId = null;
@@ -753,13 +766,13 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
         }
     }
     async adminStartHandler(socket, localAddress) {
-        log_1.default.info("admin Start received... starting");
+        logger.info("admin Start received... starting");
         await this.initiate(socket, localAddress, true);
     }
     adminResetHandler() {
         this.resetTimers();
         this.resetState();
-        log_1.default.info("admin Reset complete");
+        logger.info("admin Reset complete");
     }
     async adminDiscoverHandler(localAddress, remote) {
         // send our state and nakCount unicast to msg.host
@@ -787,7 +800,7 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
             // if there were port NAKs... log the full schebang to file with run
             // number or something. (then restart) mount volume file in for logging
             // into observer container
-            log_1.default.info("Writing results and resetting nodes...");
+            logger.info("Writing results and resetting nodes...");
             this.writeAdminResults(this.observerTestId);
             this.sendAdminReset(localAddress);
             this.resetState();
@@ -812,7 +825,7 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
             // if (!(msg.type === "ADMIN_DISCOVER_REPLY")) {
             //   logger.info(inspect(msg, INSPECT_OPTIONS));
             // }
-            log_1.default.info(`Received type: ${msg.type} from: ${remote.address}:${remote.port}`);
+            logger.info(`Received type: ${msg.type} from: ${remote.address}:${remote.port}`);
             switch (this.mode) {
                 case "PRODUCTION":
                     break;
@@ -866,7 +879,7 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
                 //   await this.adminResultsHandler(localAddress, remote);
                 //   break;
                 default:
-                    log_1.default.warn(`Received an unknown message of type: ${msg.type}, ignoring`);
+                    logger.warn(`Received an unknown message of type: ${msg.type}, ignoring`);
             }
         }
     }

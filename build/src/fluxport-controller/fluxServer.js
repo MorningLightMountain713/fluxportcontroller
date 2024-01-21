@@ -8,6 +8,7 @@ const events_1 = require("events");
 const os_1 = __importDefault(require("os"));
 const util_1 = require("util");
 const log_1 = __importDefault(require("./log"));
+const logger = log_1.default.getLogger();
 class ServerError extends Error {
     constructor(msg) {
         super(msg);
@@ -16,6 +17,7 @@ class ServerError extends Error {
 }
 exports.ServerError = ServerError;
 class FluxServer extends events_1.EventEmitter {
+    // overridden in child classes
     MESSAGE_SEPARATOR = "!FluxServer!";
     buff = new Map();
     unhandledMessages = new Set();
@@ -37,12 +39,9 @@ class FluxServer extends events_1.EventEmitter {
         else {
             this.interfaces.push(...Object.keys(availableInterfaces).reduce((arr, key) => arr.concat(availableInterfaces[key]?.filter((item) => !item.internal && item.family == "IPv4") ?? []), []));
         }
-        log_1.default.debug((0, util_1.inspect)(this.interfaces, { showHidden: false, depth: null, colors: true }));
+        logger.debug((0, util_1.inspect)(this.interfaces, { showHidden: false, depth: null, colors: true }));
     }
     start() {
-        // for (const intf of this.interfaces) {
-        //   this.sockets.push(this.runSocketServer(intf));
-        // }
         this.closed = false;
         this.sockets.push(this.runSocketServer(this.interfaces[0]));
     }
@@ -51,7 +50,7 @@ class FluxServer extends events_1.EventEmitter {
     }
     removeSocketServer(socket, err) {
         if (err) {
-            log_1.default.error("Socket error:", err);
+            logger.error("Socket error:", err);
         }
         socket.close();
         this.sockets.splice(this.sockets.indexOf(socket), 1);
@@ -89,8 +88,8 @@ class FluxServer extends events_1.EventEmitter {
         }
         if (this.buff.get(id) === "" &&
             !stringData.startsWith(this.MESSAGE_SEPARATOR)) {
-            log_1.default.warn("Received a non standard message... discarding");
-            log_1.default.warn((0, util_1.inspect)(stringData, { depth: null }));
+            logger.warn("Received a non standard message... discarding");
+            logger.warn((0, util_1.inspect)(stringData, { depth: null }));
             return [];
         }
         if (!stringData.endsWith(this.MESSAGE_SEPARATOR)) {
@@ -110,7 +109,7 @@ class FluxServer extends events_1.EventEmitter {
                 parsedMessages.push(JSON.parse(message));
             }
             catch {
-                log_1.default.warn("Message parsing error:", message);
+                logger.warn("Message parsing error:", message);
             }
         }
         return parsedMessages;

@@ -515,7 +515,7 @@ const axios_1 = __importDefault(require("axios"));
         strict_1.default.strictEqual(server.pendingSelectId, "test_id");
         strict_1.default.ok(server.portSelectTimeout);
     });
-    (0, node_test_1.it)("SELECTS previous used port when node is live and mapping exists but port not it use", async (t) => {
+    (0, node_test_1.it)("SELECTS next free port when node is live and mapping exists and port not it use", async (t) => {
         const localAddress = "1.1.1.1";
         const socket = {};
         server.portToNodeMap = new Map([[16137, "2.2.2.2"]]);
@@ -537,14 +537,14 @@ const axios_1 = __importDefault(require("axios"));
         strict_1.default.strictEqual(server.sendPortSelect.mock.calls.length, 1);
         strict_1.default.strictEqual(server.fluxportInUse.mock.calls.length, 1);
         strict_1.default.strictEqual(server.state.nodeState, "SELECTING");
-        strict_1.default.strictEqual(server.state.port, 16137);
+        strict_1.default.strictEqual(server.state.port, 16197);
         strict_1.default.strictEqual(server.pendingSelectId, "test_id");
         strict_1.default.ok(server.portSelectTimeout);
     });
     (0, node_test_1.it)("RESTARTS when no port is available", async (t) => {
         const localAddress = "1.1.1.1";
         const socket = {};
-        t.mock.timers.enable({ apis: { apis: ["setTimeout"] } });
+        t.mock.timers.enable({ apis: ["setTimeout"] });
         const testNetworkState = {
             "1.1.1.1": { port: 16197, nodeState: "READY" },
             "2.2.2.2": { port: 16187, nodeState: "READY" },
@@ -552,8 +552,8 @@ const axios_1 = __importDefault(require("axios"));
             "4.4.4.4": { port: 16167, nodeState: "READY" },
             "5.5.5.5": { port: 16157, nodeState: "READY" },
             "6.6.6.6": { port: 16147, nodeState: "READY" },
-            "7.7.7.7": { port: 16137, nodeState: "READY" },
-            "8.8.8.8": { port: 16127, nodeState: "READY" }
+            "7.7.7.7": { port: 16137, nodeState: "UNKNOWN" },
+            "8.8.8.8": { port: 16127, nodeState: "UNKNOWN" }
         };
         server.networkState = testNetworkState;
         server.updatePortToNodeMap = t.mock.fn();
