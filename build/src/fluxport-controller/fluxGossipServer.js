@@ -12,6 +12,7 @@ const axios_1 = __importDefault(require("axios"));
 const fluxServer_1 = require("./fluxServer");
 const nat_upnp_1 = require("@megachips/nat-upnp");
 const log_1 = require("./log");
+const util_1 = require("util");
 const fs_1 = require("fs");
 const logger = log_1.logController.getLogger();
 const AXIOS_TIMEOUT = 3000; // ms
@@ -353,8 +354,9 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
             this.sendPortSelectAck(this.generateId(), localAddress, this.state.port);
         }
         this.emit("portConfirmed", this.state.port);
-        // logger.info(inspect(this.networkState, INSPECT_OPTIONS));
-        logger.info(this.networkState);
+        // just going back to inspect as have moved to custom formatter for Winston
+        logger.info((0, util_1.inspect)(this.networkState, INSPECT_OPTIONS));
+        // logger.info(this.networkState);
     }
     resetState(resetMsgLog = true) {
         if (this.mode !== "OBSERVE") {
