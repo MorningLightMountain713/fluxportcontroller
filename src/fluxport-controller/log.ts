@@ -1,14 +1,23 @@
 import winston from "winston";
 
+const { combine, timestamp, label, printf } = winston.format;
+
+const formatter = printf(({ level, message, label, timestamp }) => {
+  return `${timestamp} [${label}] ${level}: ${message}`;
+});
+
 class GossipServerLogger {
   logger: winston.Logger;
   defaultConsole: winston.transports.ConsoleTransportInstance;
 
   constructor() {
-    this.logger = winston.createLogger({ silent: true });
+    this.logger = winston.createLogger({
+      silent: true,
+      format: combine(label({ label: "fpc" }), timestamp(), formatter)
+    });
     this.defaultConsole = new winston.transports.Console({
-      level: "info",
-      format: winston.format.simple()
+      level: "info"
+      // format: winston.format.simple()
     });
 
     this.logger.add(this.defaultConsole);
