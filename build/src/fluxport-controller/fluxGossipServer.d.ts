@@ -47,23 +47,35 @@ export declare class FluxGossipServer extends FluxServer {
     getMyPublicIp(): Promise<string>;
     start(): Promise<boolean>;
     stop(): void;
+    /**
+     * This is for the observer to send results to someone running tests. Only
+     * run when mode is set to OBSERVER
+     * @param port
+     * The port to listen on
+     */
     runAdminWebserver(port: number): void;
     runSocketServer(iface: os.NetworkInterfaceInfo): Socket;
-    resetState(resetMsgLog?: boolean): void;
+    initiate(socket: FluxSocket, interfaceAddress: string, sendDiscover: boolean): Promise<void>;
     portConfirm(localAddress: string, sendPortSelectAck?: boolean): void;
+    resetState(resetMsgLog?: boolean): void;
+    fluxnodePriorPort(): Promise<number | null>;
+    fluxportInUse(ip: string, port: number): Promise<boolean>;
+    resetTimers(): void;
+    sleep(ms: number): Promise<void>;
+    updateState(localAddress: string, networkState: NetworkState): void;
+    /**
+     * Helper function to sort ip addresses. Nodes use this as a tiebreaker
+     * when more than one node is discovering
+     * @returns string[]
+     * Array of all hosts sorted from lowest to highest IP
+     */
+    sortDiscoveringHosts(): string[];
+    ipv4ToNumber(ipv4: string): number;
+    getPortFromNode(nodeIp: string): fluxPorts | null;
+    updatePortToNodeMap(): Promise<void>;
     createMessageFlows(): Record<string, Record<string, string[]>>;
     writeAdminResults(testId: number): void;
     writeDataToJsonFile(data: any): void;
-    fluxportInUse(ip: string, port: number): Promise<boolean>;
-    fluxnodePriorPort(): Promise<number | null>;
-    sortDiscoveringHosts(): string[];
-    ipv4ToNumber(ipv4: string): number;
-    resetTimers(): void;
-    initiate(socket: FluxSocket, interfaceAddress: string, sendDiscover: boolean): Promise<void>;
-    sleep(ms: number): Promise<void>;
-    updateState(localAddress: string, networkState: NetworkState): void;
-    getPortFromNode(nodeIp: string): fluxPorts | null;
-    updatePortToNodeMap(): Promise<void>;
     sendAdminDiscover(host: string): void;
     sendAdminDiscoverReply(srcHost: string, dstHost: string): void;
     sendAdminStart(localAddress: string): void;
@@ -76,8 +88,8 @@ export declare class FluxGossipServer extends FluxServer {
     messageHandler(socket: Socket, localAddress: string, socketData: Buffer, remote: AddressInfo): Promise<void>;
 }
 export default FluxGossipServer;
-export type NodeState = "UNKNOWN" | "STARTING" | "DISCOVERING" | "SELECTING" | "READY";
 type fluxPorts = 16197 | 16187 | 16177 | 16167 | 16157 | 16147 | 16137 | 16127;
+export type NodeState = "UNKNOWN" | "STARTING" | "DISCOVERING" | "SELECTING" | "READY";
 export type ServerMode = "DEVELOPMENT" | "PRODUCTION" | "OBSERVE";
 interface State {
     port: number | null;

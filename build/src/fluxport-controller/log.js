@@ -5,11 +5,17 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.logController = void 0;
 const winston_1 = __importDefault(require("winston"));
+const { combine, timestamp, label, printf } = winston_1.default.format;
+const formatter = printf(({ level, message, label, timestamp }) => {
+    return `${timestamp} [${label}] ${level}: ${message}`;
+});
 class GossipServerLogger {
     logger;
     defaultConsole;
     constructor() {
-        this.logger = winston_1.default.createLogger({ silent: true });
+        this.logger = winston_1.default.createLogger({
+            silent: true
+        });
         this.defaultConsole = new winston_1.default.transports.Console({
             level: "info",
             format: winston_1.default.format.simple()
@@ -26,7 +32,8 @@ class GossipServerLogger {
             // add error handling
             this.logger.add(new winston_1.default.transports.File({
                 level: level,
-                filename: options.filePath
+                filename: options.filePath,
+                format: combine(label({ label: "fpc" }), timestamp(), formatter)
             }));
         }
         else if (type === "console") {
