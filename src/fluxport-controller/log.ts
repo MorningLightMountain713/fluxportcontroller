@@ -12,12 +12,11 @@ class GossipServerLogger {
 
   constructor() {
     this.logger = winston.createLogger({
-      silent: true,
-      format: combine(label({ label: "fpc" }), timestamp(), formatter)
+      silent: true
     });
     this.defaultConsole = new winston.transports.Console({
-      level: "info"
-      // format: winston.format.simple()
+      level: "info",
+      format: winston.format.simple()
     });
 
     this.logger.add(this.defaultConsole);
@@ -37,7 +36,8 @@ class GossipServerLogger {
       this.logger.add(
         new winston.transports.File({
           level: level,
-          filename: options.filePath
+          filename: options.filePath,
+          format: combine(label({ label: "fpc" }), timestamp(), formatter)
         })
       );
     } else if (type === "console") {

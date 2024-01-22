@@ -449,7 +449,8 @@ export class FluxGossipServer extends FluxServer {
 
     this.emit("portConfirmed", this.state.port!);
 
-    logger.info(inspect(this.networkState, INSPECT_OPTIONS));
+    // logger.info(inspect(this.networkState, INSPECT_OPTIONS));
+    logger.info(this.networkState);
   }
 
   resetState(resetMsgLog: boolean = true): void {

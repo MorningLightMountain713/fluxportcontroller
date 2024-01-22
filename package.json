@@ -1,6 +1,6 @@
 {
   "name": "@megachips/fluxport-controller",
-  "version": "0.0.16",
+  "version": "0.0.17",
   "main": "build/src/index",
   "files": [
     "/build"
