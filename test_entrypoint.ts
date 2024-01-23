@@ -1,11 +1,18 @@
 #!/usr/bin/env -S npx tsx
 
-import { FluxEchoServer, FluxGossipServer, ServerMode } from "./src";
+import {
+  FluxEchoServer,
+  FluxGossipServer,
+  ServerMode,
+  logController
+} from "./src";
 
 function closeGracefully() {
   gossipServer.stop();
   process.exit();
 }
+
+logController.addLoggerTransport("console");
 
 process.on("SIGINT", closeGracefully);
 

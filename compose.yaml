@@ -13,6 +13,7 @@ services:
     image: "megachips/fluxport_controller:latest"
     init: true
     environment:
+    # Normally, this would be set to 10 so there is a randomized start delay
       - START_DELAY=0
     networks:
       - upnp
