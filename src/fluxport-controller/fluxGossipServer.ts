@@ -13,6 +13,11 @@ import { logController } from "./log";
 import { inspect } from "util";
 import { readFileSync, writeFileSync } from "fs";
 
+// this isn't the best, but is only in use on development anyway
+if (+process.versions.node.split(".")[0] < 17) {
+  global.structuredClone = (val) => JSON.parse(JSON.stringify(val));
+}
+
 const logger = logController.getLogger();
 
 const AXIOS_TIMEOUT = 3000; // ms
