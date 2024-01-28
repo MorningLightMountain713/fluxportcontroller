@@ -206,7 +206,6 @@ export class FluxGossipServer extends FluxServer {
     // this now means the gossipserver is reliant on UPnP working as we're using the
     // interface provided by UPnP for multicast
 
-    // use generics for this and type properly
     const gatewayResponse = await this.runUpnpRequest(
       this.upnpClient.getGateway
     );
@@ -259,6 +258,7 @@ export class FluxGossipServer extends FluxServer {
       res.writeHead(200, {
         "content-type": "application/json; charset=utf-8"
       });
+      // this makes no sense lol
       const results = JSON.parse(readFileSync("results.json").toString());
       res.end(JSON.stringify(results));
     };
@@ -293,7 +293,7 @@ export class FluxGossipServer extends FluxServer {
 
     logger.info(`Binding to ${this.port} on ${iface.address}`);
     // this will receive on multicast address only, not iface.address
-    // (if you specify dont specify address, it will listen on both
+    // (if you dont specify address, it will listen on both
     socket.bind(this.port, bindAddress);
 
     return socket;
@@ -618,7 +618,7 @@ export class FluxGossipServer extends FluxServer {
         // skip SSDP (multicast) and use cached router url
         this.upnpClient.url = this.upnpServiceUrl;
         try {
-          res = await upnpCall();
+          res = await upnpCall.call(this.upnpClient);
         } catch (err2) {
           // we tried, we failed, reset
           this.upnpClient.url = null;
@@ -1287,7 +1287,9 @@ export declare interface FluxGossipServer {
    * @param upnpCall
    * A method from UpnpClient
    */
-  runUpnpRequest(upnpCall: () => Promise<any>): Promise<any>;
+  runUpnpRequest<T extends keyof UpnpClient>(
+    upnpCall: UpnpClient[T]
+  ): Promise<any>;
   /**
    * This function does the heavy lifting. Based on the following assumptions:
    *  * Once a portmapping is set - another node cannot remove it, only the node that,
