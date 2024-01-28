@@ -248,7 +248,7 @@ export declare interface FluxGossipServer {
      * @param upnpCall
      * A method from UpnpClient
      */
-    runUpnpRequest(upnpCall: () => Promise<any>): Promise<any>;
+    runUpnpRequest<T extends keyof UpnpClient>(upnpCall: UpnpClient[T]): Promise<any>;
     /**
      * This function does the heavy lifting. Based on the following assumptions:
      *  * Once a portmapping is set - another node cannot remove it, only the node that,

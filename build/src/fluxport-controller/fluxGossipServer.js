@@ -14,6 +14,10 @@ const nat_upnp_1 = require("@megachips/nat-upnp");
 const log_1 = require("./log");
 const util_1 = require("util");
 const fs_1 = require("fs");
+// this isn't the best, but is only in use on development anyway
+if (+process.versions.node.split(".")[0] < 17) {
+    global.structuredClone = (val) => JSON.parse(JSON.stringify(val));
+}
 const logger = log_1.logController.getLogger();
 const AXIOS_TIMEOUT = 3000; // ms
 const ADDRESS_APIS = [
@@ -165,7 +169,6 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
         logger.info(`My ip is: ${this.myIp}`);
         // this now means the gossipserver is reliant on UPnP working as we're using the
         // interface provided by UPnP for multicast
-        // use generics for this and type properly
         const gatewayResponse = await this.runUpnpRequest(this.upnpClient.getGateway);
         if (!gatewayResponse) {
             this.emit("startError");
@@ -205,6 +208,7 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
             res.writeHead(200, {
                 "content-type": "application/json; charset=utf-8"
             });
+            // this makes no sense lol
             const results = JSON.parse((0, fs_1.readFileSync)("results.json").toString());
             res.end(JSON.stringify(results));
         };
@@ -227,7 +231,7 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
         socket.once("error", (err) => this.removeSocketServer(socket, err));
         logger.info(`Binding to ${this.port} on ${iface.address}`);
         // this will receive on multicast address only, not iface.address
-        // (if you specify dont specify address, it will listen on both
+        // (if you dont specify address, it will listen on both
         socket.bind(this.port, bindAddress);
         return socket;
     }
@@ -488,7 +492,7 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
                 // skip SSDP (multicast) and use cached router url
                 this.upnpClient.url = this.upnpServiceUrl;
                 try {
-                    res = await upnpCall();
+                    res = await upnpCall.call(this.upnpClient);
                 }
                 catch (err2) {
                     // we tried, we failed, reset
