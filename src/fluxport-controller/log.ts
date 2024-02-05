@@ -6,6 +6,15 @@ const formatter = printf(({ level, message, label, timestamp }) => {
   return `${timestamp} [${label}] ${level}: ${message}`;
 });
 
+const colorsLogger = {
+  error: "red",
+  warn: "yellow"
+  // info: 'cyan',
+  // debug: "green"
+};
+
+winston.addColors(colorsLogger);
+
 class GossipServerLogger {
   logger: winston.Logger;
   defaultConsole: winston.transports.ConsoleTransportInstance;
@@ -16,7 +25,10 @@ class GossipServerLogger {
     });
     this.defaultConsole = new winston.transports.Console({
       level: "info",
-      format: winston.format.simple()
+      format: winston.format.combine(
+        winston.format.colorize(),
+        winston.format.simple()
+      )
     });
 
     this.logger.add(this.defaultConsole);

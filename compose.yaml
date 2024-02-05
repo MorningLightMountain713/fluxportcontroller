@@ -14,7 +14,7 @@ services:
     init: true
     environment:
     # Normally, this would be set to 10 so there is a randomized start delay
-      - START_DELAY=0
+      - START_DELAY=3
     networks:
       - upnp
     deploy:
@@ -29,7 +29,7 @@ services:
     environment:
       - MODE=OBSERVE
       - NODE_COUNT=8
-      - TEST_COUNT=20
+      - TEST_COUNT=50
     networks:
       - upnp
     ports:

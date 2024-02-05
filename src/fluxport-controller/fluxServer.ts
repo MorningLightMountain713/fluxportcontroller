@@ -55,6 +55,25 @@ export class FluxServer extends EventEmitter {
     );
   }
 
+  // filter(obj: Object, predicate: (v: any) => {}): Object {
+  //   return Object.fromEntries(
+  //     Object.entries(obj).filter(([_, value]) => predicate(value))
+  //   );
+  // }
+
+  filter<T extends object>(
+    obj: T,
+    fn: (entry: Entry<T>, i: number, arr: Entry<T>[]) => boolean
+  ) {
+    return Object.fromEntries(
+      (Object.entries(obj) as Entry<T>[]).filter(fn)
+    ) as Partial<T>;
+  }
+
+  ipv4ToNumber(ipv4: string): number {
+    return ipv4.split(".").reduce<number>((a, b) => (a << 8) | +b, 0) >>> 0;
+  }
+
   start(): void {
     this.closed = false;
     this.sockets.push(this.runSocketServer(this.interfaces[0]));
@@ -155,7 +174,20 @@ export class FluxServer extends EventEmitter {
   generateId(): string {
     return Math.random().toString(36).substring(2, 9);
   }
+
+  /**
+   *
+   * @param ms Milliseconds to sleep for. (Minimum 50)
+   * @returns
+   */
+  sleep(ms: number): Promise<NodeJS.Timeout> {
+    return new Promise((r) => setTimeout(r, Math.max(ms, 50)));
+  }
 }
+
+type Entry<T> = {
+  [K in keyof T]: [K, T[K]];
+}[keyof T];
 
 export interface ServerOptions {
   port?: number;
@@ -163,7 +195,7 @@ export interface ServerOptions {
 }
 
 export interface Message {
-  type: string;
+  type: number;
   host: string;
   id: string;
 }

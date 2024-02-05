@@ -2,7 +2,8 @@ import assert from "assert/strict";
 import { describe, it, beforeEach, afterEach, mock } from "node:test";
 import {
   FluxGossipServer,
-  NodeState
+  NodeState,
+  Msg
 } from "../../src/fluxport-controller/fluxGossipServer";
 import { Socket } from "dgram";
 import axios from "axios";
@@ -15,7 +16,11 @@ describe("handler tests", () => {
   afterEach(() => server.stop());
 
   it("should UPDATE STATE when a D message is received that has ALREADY been handled", async (t) => {
-    const testDiscover = { type: "DISCOVER", id: "test", host: "1.1.1.1" };
+    const testDiscover = {
+      type: Msg.PORT_DISCOVER,
+      id: "test",
+      host: "1.1.1.1"
+    };
 
     assert.deepEqual(server.networkState, {});
 
@@ -52,7 +57,11 @@ describe("handler tests", () => {
   });
 
   it("should REPLY when a D message is received that HASN'T been handled yet", async (t) => {
-    const testDiscover = { type: "DISCOVER", id: "test", host: "1.1.1.1" };
+    const testDiscover = {
+      type: Msg.PORT_DISCOVER,
+      id: "test",
+      host: "1.1.1.1"
+    };
 
     server.unhandledMessages.add("test");
     assert.deepEqual(server.networkState, {});
@@ -80,24 +89,32 @@ describe("handler tests", () => {
   it("should UPDATE STATE when a DR message is received for this node within timeout", async (t) => {
     const localAddress = "1.1.1.1";
     const socket = {} as Socket;
+    const localState = {
+      port: null,
+      nodeState: "DISCOVERING" as NodeState
+    };
     const testDiscoverReply = {
-      type: "DISCOVER_REPLY",
+      type: Msg.PORT_DISCOVER_REPLY,
       id: "test",
       host: "2.2.2.2",
       networkState: {
-        "1.1.1.1": { port: null, nodeState: "DISCOVERING" as NodeState },
-        "2.2.2.2": { port: 16197, nodeState: "READY" as NodeState }
+        "1.1.1.1": localState,
+        "2.2.2.2": {
+          port: 16197,
+          nodeState: "READY" as NodeState
+        }
       }
     };
 
     server.unhandledMessages.add("test");
+    server.state = localState;
+    server.networkState = { "1.1.1.1": server.state };
     server.pendingDiscoverId = "test";
     server.discoverTimeout = setTimeout(() => {}, 3000);
 
-    assert.deepEqual(server.networkState, {});
+    assert.deepEqual(server.networkState, { "1.1.1.1": localState });
 
     t.mock.method(server, "discoverReplyHandler");
-    t.mock.method(server, "updateState");
 
     server.portSelect = t.mock.fn();
 
@@ -119,7 +136,6 @@ describe("handler tests", () => {
       1
     );
     assert.strictEqual((server.portSelect as any).mock.calls.length, 1);
-    assert.strictEqual((server.updateState as any).mock.calls.length, 1);
     assert.strictEqual(server.unhandledMessages.size, 0);
     assert.deepEqual(server.networkState, testDiscoverReply.networkState);
     assert.strictEqual(server.discoverTimeout, null);
@@ -130,12 +146,18 @@ describe("handler tests", () => {
     const localAddress = "1.1.1.1";
     const socket = {} as Socket;
     const testDiscoverReply = {
-      type: "DISCOVER_REPLY",
+      type: Msg.PORT_DISCOVER_REPLY,
       id: "test",
       host: "2.2.2.2",
       networkState: {
-        "1.1.1.1": { port: null, nodeState: "DISCOVERING" as NodeState },
-        "2.2.2.2": { port: 16197, nodeState: "READY" as NodeState }
+        "1.1.1.1": {
+          port: null,
+          nodeState: "DISCOVERING" as NodeState
+        },
+        "2.2.2.2": {
+          port: 16197,
+          nodeState: "READY" as NodeState
+        }
       }
     };
 
@@ -174,12 +196,18 @@ describe("handler tests", () => {
     const localAddress = "1.1.1.1";
     const socket = {} as Socket;
     const testDiscoverReply = {
-      type: "DISCOVER_REPLY",
+      type: Msg.PORT_DISCOVER_REPLY,
       id: "some_other_id",
       host: "3.3.3.3",
       networkState: {
-        "2.2.2.2": { port: null, nodeState: "DISCOVERING" as NodeState },
-        "3.3.3.3": { port: 16197, nodeState: "READY" as NodeState }
+        "2.2.2.2": {
+          port: null,
+          nodeState: "DISCOVERING" as NodeState
+        },
+        "3.3.3.3": {
+          port: 16197,
+          nodeState: "READY" as NodeState
+        }
       }
     };
 
@@ -221,12 +249,18 @@ describe("handler tests", () => {
     const localAddress = "1.1.1.1";
     const socket = {} as Socket;
     const testDiscoverReply = {
-      type: "DISCOVER_REPLY",
+      type: Msg.PORT_DISCOVER_REPLY,
       id: "some_other_id",
       host: "3.3.3.3",
       networkState: {
-        "2.2.2.2": { port: null, nodeState: "DISCOVERING" as NodeState },
-        "3.3.3.3": { port: 16197, nodeState: "READY" as NodeState }
+        "2.2.2.2": {
+          port: null,
+          nodeState: "DISCOVERING" as NodeState
+        },
+        "3.3.3.3": {
+          port: 16197,
+          nodeState: "READY" as NodeState
+        }
       }
     };
 
@@ -263,18 +297,29 @@ describe("handler tests", () => {
 
   it("should ACK a PS message received for another node that HAS NOT been handled", async (t) => {
     const testPortSelect = {
-      type: "PORT_SELECT",
+      type: Msg.PORT_SELECT,
       id: "test",
       host: "1.1.1.1",
       port: 16187
     };
     const expectedState = {
-      "1.1.1.1": { port: 16187, nodeState: "READY" as NodeState }
+      "1.1.1.1": {
+        port: 16187,
+        nodeState: "READY" as NodeState
+      }
     };
 
     server.unhandledMessages.add("test");
 
     assert.deepEqual(server.networkState, {});
+
+    // state as if discover had been received
+    server.networkState = {
+      "1.1.1.1": { port: null, nodeState: "DISCOVERING" }
+    };
+    server.nodeTimeouts["1.1.1.1"] = new Map([
+      ["startUp", setTimeout(() => {})]
+    ]);
 
     t.mock.timers.enable({ apis: ["setTimeout"] });
     t.mock.method(server, "portSelectHandler");
@@ -297,7 +342,7 @@ describe("handler tests", () => {
   });
   it("should DROP a PS message received for another node that HAS been handled", async (t) => {
     const testPortSelect = {
-      type: "PORT_SELECT",
+      type: Msg.PORT_SELECT,
       id: "test",
       host: "1.1.1.1",
       port: 16187
@@ -305,10 +350,17 @@ describe("handler tests", () => {
     // this should really be READY as we would have received a PORT_SELECT_ACK
     // from another node (but we have isolated it for this test)
     const expectedState = {
-      "1.1.1.1": { port: 16187, nodeState: "SELECTING" as NodeState }
+      "1.1.1.1": {
+        port: 16187,
+        nodeState: "SELECTING" as NodeState
+      }
     };
 
     assert.deepEqual(server.networkState, {});
+
+    server.networkState = {
+      "1.1.1.1": { port: null, nodeState: "DISCOVERING" }
+    };
 
     t.mock.timers.enable({ apis: ["setTimeout"] });
     t.mock.method(server, "portSelectHandler");
@@ -332,13 +384,16 @@ describe("handler tests", () => {
   });
   it("should NAK a PS message received for another node where the port is in use", async (t) => {
     const testPortSelect = {
-      type: "PORT_SELECT",
+      type: Msg.PORT_SELECT,
       id: "test",
       host: "1.1.1.1",
       port: 16187
     };
     const expectedState = {
-      "2.2.2.2": { port: 16187, nodeState: "READY" as NodeState }
+      "2.2.2.2": {
+        port: 16187,
+        nodeState: "READY" as NodeState
+      }
     };
 
     server.unhandledMessages.add("test");
@@ -368,18 +423,29 @@ describe("handler tests", () => {
   it("should UPDATE STATE when a PS_ACK message is received for ANOTHER node", async (t) => {
     const localAddress = "2.2.2.2";
     const testPortSelectAck = {
-      type: "PORT_SELECT_ACK",
+      type: Msg.PORT_SELECT_ACK,
       id: "test",
       host: "1.1.1.1",
       port: 16187
     };
     const expectedState = {
-      "1.1.1.1": { port: 16187, nodeState: "READY" as NodeState }
+      "1.1.1.1": {
+        port: 16187,
+        nodeState: "READY" as NodeState
+      }
     };
 
     server.unhandledMessages.add("test");
 
     assert.deepEqual(server.networkState, {});
+
+    // assumed state
+    server.networkState = {
+      "1.1.1.1": { port: 16187, nodeState: "SELECTING" }
+    };
+    server.nodeTimeouts["1.1.1.1"] = new Map([
+      ["startUp", setTimeout(() => {})]
+    ]);
 
     t.mock.method(server, "portSelectAckHandler");
 
@@ -402,7 +468,7 @@ describe("handler tests", () => {
   it("should UPDATE STATE when a PS_ACK message is received for THIS node", async (t) => {
     const localAddress = "2.2.2.2";
     const testPortSelectAck = {
-      type: "PORT_SELECT_ACK",
+      type: Msg.PORT_SELECT_ACK,
       id: "test",
       host: "1.1.1.1",
       port: 16187
@@ -442,7 +508,7 @@ describe("handler tests", () => {
     const localAddress = "1.1.1.1";
     const socket = {} as Socket;
     const testPortSelectNak = {
-      type: "PORT_SELECT_NAK",
+      type: Msg.PORT_SELECT_NAK,
       id: "test",
       host: "1.1.1.1",
       port: 16187
@@ -487,7 +553,10 @@ describe("handler tests", () => {
     assert.strictEqual(server.pendingSelectId, null);
 
     assert.deepEqual(server.networkState, {});
-    assert.deepEqual(server.state, { port: null, nodeState: "STARTING" });
+    assert.deepEqual(server.state, {
+      port: null,
+      nodeState: "STARTING"
+    });
     assert.strictEqual(server.unhandledMessages.size, 0);
   });
 
@@ -495,12 +564,14 @@ describe("handler tests", () => {
     const localAddress = "1.1.1.1";
     const socket = {} as Socket;
     const testPortSelectNak = {
-      type: "PORT_SELECT_NAK",
+      type: Msg.PORT_SELECT_NAK,
       id: "test",
       host: "2.2.2.2",
       port: 16187
     };
-    const expectedState = { "2.2.2.2": { port: null, nodeState: "STARTING" } };
+    const expectedState = {
+      "2.2.2.2": { port: null, nodeState: "STARTING" }
+    };
 
     server.unhandledMessages.add("test");
 
@@ -664,7 +735,10 @@ describe("Port select tests", () => {
     const socket = {} as Socket;
 
     server.networkState = {
-      "2.2.2.2": { port: 16197, nodeState: "SELECTING" as NodeState }
+      "2.2.2.2": {
+        port: 16197,
+        nodeState: "SELECTING" as NodeState
+      }
     };
     server.state.nodeState = "DISCOVERING";
 
@@ -730,7 +804,10 @@ describe("Port select tests", () => {
     const socket = {} as Socket;
 
     const expectedState = {
-      "2.2.2.2": { port: 16137, nodeState: "UNKNOWN" as NodeState }
+      "2.2.2.2": {
+        port: 16137,
+        nodeState: "UNKNOWN" as NodeState
+      }
     };
 
     server.state.nodeState = "DISCOVERING";
@@ -820,14 +897,38 @@ describe("Port select tests", () => {
     t.mock.timers.enable({ apis: ["setTimeout"] } as any);
 
     const testNetworkState = {
-      "1.1.1.1": { port: 16197, nodeState: "READY" as NodeState },
-      "2.2.2.2": { port: 16187, nodeState: "READY" as NodeState },
-      "3.3.3.3": { port: 16177, nodeState: "READY" as NodeState },
-      "4.4.4.4": { port: 16167, nodeState: "READY" as NodeState },
-      "5.5.5.5": { port: 16157, nodeState: "READY" as NodeState },
-      "6.6.6.6": { port: 16147, nodeState: "READY" as NodeState },
-      "7.7.7.7": { port: 16137, nodeState: "UNKNOWN" as NodeState },
-      "8.8.8.8": { port: 16127, nodeState: "UNKNOWN" as NodeState }
+      "1.1.1.1": {
+        port: 16197,
+        nodeState: "READY" as NodeState
+      },
+      "2.2.2.2": {
+        port: 16187,
+        nodeState: "READY" as NodeState
+      },
+      "3.3.3.3": {
+        port: 16177,
+        nodeState: "READY" as NodeState
+      },
+      "4.4.4.4": {
+        port: 16167,
+        nodeState: "READY" as NodeState
+      },
+      "5.5.5.5": {
+        port: 16157,
+        nodeState: "READY" as NodeState
+      },
+      "6.6.6.6": {
+        port: 16147,
+        nodeState: "READY" as NodeState
+      },
+      "7.7.7.7": {
+        port: 16137,
+        nodeState: "UNKNOWN" as NodeState
+      },
+      "8.8.8.8": {
+        port: 16127,
+        nodeState: "UNKNOWN" as NodeState
+      }
     };
 
     server.networkState = testNetworkState;

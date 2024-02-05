@@ -1,11 +1,6 @@
 #!/usr/bin/env -S npx tsx
 
-import {
-  FluxEchoServer,
-  FluxGossipServer,
-  ServerMode,
-  logController
-} from "./src";
+import { FluxGossipServer, ServerMode, logController } from "./src";
 
 function closeGracefully() {
   gossipServer.stop();
@@ -78,14 +73,3 @@ gossipServer.on("startError", () => {
 });
 
 gossipServer.start();
-
-// let echoServer: FluxEchoServer;
-
-// if (process.argv[2]) {
-//     echoServer = new FluxEchoServer({ peers: [process.argv[2]] });
-// } else {
-//     echoServer = new FluxEchoServer();
-// }
-
-// echoServer.on("timeout", (peer: string, seconds: number) => console.log("Broken, peer:", peer, "No contact for:", seconds, "seconds"));
-// echoServer.start();
