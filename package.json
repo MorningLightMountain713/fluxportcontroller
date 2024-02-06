@@ -16,7 +16,7 @@
     "build": "tsc",
     "watch": "tsc --watch",
     "unittest": "node --import tsx --test test/unit/*.spec.ts",
-    "inttest": "docker container prune --filter 'label=ContainerType=FluxportTest' -f && docker compose up --attach observer",
+    "inttest": "docker container prune --filter 'label=com.megachips.container_type=fluxport_controller_test' -f && docker compose up --attach observer",
     "start": "node --import tsx test_docker_entrypoint.ts"
   },
   "bin": {

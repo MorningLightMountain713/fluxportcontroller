@@ -6,9 +6,8 @@ services:
     networks:
       - upnp
     stop_signal: SIGINT
-    deploy:
-      labels:
-        ContainerType: "FluxportTest"
+    labels:
+      com.megachips.container_type: "fluxport_controller_test"
   fluxnode:
     image: "megachips/fluxport_controller:latest"
     init: true
@@ -20,8 +19,8 @@ services:
     deploy:
       mode: replicated
       replicas: 8
-      labels:
-        ContainerType: "FluxportTest"
+    labels:
+      com.megachips.container_type: "fluxport_controller_test"
   observer:
     image: "megachips/fluxport_controller:latest"
     container_name: observer
@@ -34,9 +33,8 @@ services:
       - upnp
     ports:
       - "127.0.0.1:33333:33333"
-    deploy:
-      labels:
-        ContainerType: "FluxportTest"
+    labels:
+      com.megachips.container_type: "fluxport_controller_test"
 
 networks:
   upnp: {}
