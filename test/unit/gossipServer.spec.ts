@@ -296,6 +296,7 @@ describe("handler tests", () => {
   });
 
   it("should ACK a PS message received for another node that HAS NOT been handled", async (t) => {
+    const localAddress = "1.1.1.1";
     const testPortSelect = {
       type: Msg.PORT_SELECT,
       id: "test",
@@ -303,7 +304,7 @@ describe("handler tests", () => {
       port: 16187
     };
     const expectedState = {
-      "1.1.1.1": {
+      [localAddress]: {
         port: 16187,
         nodeState: "READY" as NodeState
       }
@@ -315,7 +316,7 @@ describe("handler tests", () => {
 
     // state as if discover had been received
     server.networkState = {
-      "1.1.1.1": { port: null, nodeState: "DISCOVERING" }
+      [localAddress]: { port: null, nodeState: "DISCOVERING" }
     };
     server.nodeTimeouts["1.1.1.1"] = new Map([
       ["startUp", setTimeout(() => {})]
@@ -330,7 +331,7 @@ describe("handler tests", () => {
     assert.strictEqual((server.sendPortSelectAck as any).mock.calls.length, 0);
     assert.strictEqual((server.sendPortSelectNak as any).mock.calls.length, 0);
 
-    const promise = server.portSelectHandler(testPortSelect);
+    const promise = server.portSelectHandler(testPortSelect, localAddress);
     t.mock.timers.tick(1000);
     await promise;
 
@@ -341,16 +342,17 @@ describe("handler tests", () => {
     assert.deepEqual(server.networkState, expectedState);
   });
   it("should DROP a PS message received for another node that HAS been handled", async (t) => {
+    const localAddress = "1.1.1.1";
     const testPortSelect = {
       type: Msg.PORT_SELECT,
       id: "test",
-      host: "1.1.1.1",
+      host: localAddress,
       port: 16187
     };
     // this should really be READY as we would have received a PORT_SELECT_ACK
     // from another node (but we have isolated it for this test)
     const expectedState = {
-      "1.1.1.1": {
+      [localAddress]: {
         port: 16187,
         nodeState: "SELECTING" as NodeState
       }
@@ -359,7 +361,7 @@ describe("handler tests", () => {
     assert.deepEqual(server.networkState, {});
 
     server.networkState = {
-      "1.1.1.1": { port: null, nodeState: "DISCOVERING" }
+      [localAddress]: { port: null, nodeState: "DISCOVERING" }
     };
 
     t.mock.timers.enable({ apis: ["setTimeout"] });
@@ -371,7 +373,7 @@ describe("handler tests", () => {
     assert.strictEqual((server.sendPortSelectAck as any).mock.calls.length, 0);
     assert.strictEqual((server.sendPortSelectNak as any).mock.calls.length, 0);
 
-    const promise = server.portSelectHandler(testPortSelect);
+    const promise = server.portSelectHandler(testPortSelect, localAddress);
     t.mock.timers.tick(1000);
     await promise;
 
@@ -383,6 +385,8 @@ describe("handler tests", () => {
     assert.deepEqual(server.networkState, expectedState);
   });
   it("should NAK a PS message received for another node where the port is in use", async (t) => {
+    const localAddress = "3.3.3.3";
+
     const testPortSelect = {
       type: Msg.PORT_SELECT,
       id: "test",
@@ -408,7 +412,7 @@ describe("handler tests", () => {
     assert.strictEqual((server.sendPortSelectAck as any).mock.calls.length, 0);
     assert.strictEqual((server.sendPortSelectNak as any).mock.calls.length, 0);
 
-    const promise = server.portSelectHandler(testPortSelect);
+    const promise = server.portSelectHandler(testPortSelect, localAddress);
     t.mock.timers.tick(1000);
     await promise;
 

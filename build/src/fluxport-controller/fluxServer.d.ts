@@ -3,6 +3,7 @@
 /// <reference types="node" />
 /// <reference types="node" />
 /// <reference types="node" />
+/// <reference types="node" />
 import { Socket } from "dgram";
 import { EventEmitter } from "events";
 import { AddressInfo } from "net";
@@ -18,13 +19,24 @@ export declare class FluxServer extends EventEmitter {
     readonly interfaces: os.NetworkInterfaceInfo[];
     closed: boolean;
     constructor(options?: ServerOptions);
+    filter<T extends object>(obj: T, fn: (entry: Entry<T>, i: number, arr: Entry<T>[]) => boolean): Partial<T>;
+    ipv4ToNumber(ipv4: string): number;
+    /**
+     *
+     * @param ms Milliseconds to sleep for. (Minimum 50)
+     * @returns
+     */
+    sleep(ms: number): Promise<NodeJS.Timeout>;
 }
+type Entry<T> = {
+    [K in keyof T]: [K, T[K]];
+}[keyof T];
 export interface ServerOptions {
     port?: number;
     bindInterface?: string;
 }
 export interface Message {
-    type: string;
+    type: number;
     host: string;
     id: string;
 }
@@ -38,3 +50,4 @@ export declare interface FluxServer {
     runSocketServer(iface: os.NetworkInterfaceInfo): Socket;
     removeSocketServer(socket: Socket, err?: Error): void;
 }
+export {};

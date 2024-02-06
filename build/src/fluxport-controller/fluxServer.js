@@ -41,6 +41,17 @@ class FluxServer extends events_1.EventEmitter {
         }
         logger.debug((0, util_1.inspect)(this.interfaces, { showHidden: false, depth: null, colors: true }));
     }
+    // filter(obj: Object, predicate: (v: any) => {}): Object {
+    //   return Object.fromEntries(
+    //     Object.entries(obj).filter(([_, value]) => predicate(value))
+    //   );
+    // }
+    filter(obj, fn) {
+        return Object.fromEntries(Object.entries(obj).filter(fn));
+    }
+    ipv4ToNumber(ipv4) {
+        return ipv4.split(".").reduce((a, b) => (a << 8) | +b, 0) >>> 0;
+    }
     start() {
         this.closed = false;
         this.sockets.push(this.runSocketServer(this.interfaces[0]));
@@ -119,6 +130,14 @@ class FluxServer extends events_1.EventEmitter {
     }
     generateId() {
         return Math.random().toString(36).substring(2, 9);
+    }
+    /**
+     *
+     * @param ms Milliseconds to sleep for. (Minimum 50)
+     * @returns
+     */
+    sleep(ms) {
+        return new Promise((r) => setTimeout(r, Math.max(ms, 50)));
     }
 }
 exports.FluxServer = FluxServer;

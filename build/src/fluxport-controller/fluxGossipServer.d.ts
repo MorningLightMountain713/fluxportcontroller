@@ -8,6 +8,22 @@ import { AddressInfo } from "node:net";
 import os from "node:os";
 import { FluxServer, ServerOptions, Message } from "./fluxServer";
 import { Client as UpnpClient } from "@megachips/nat-upnp";
+export declare enum Msg {
+    PORT_DISCOVER = 0,
+    PORT_DISCOVER_REPLY = 1,
+    PORT_SELECT = 2,
+    PORT_SELECT_ACK = 3,
+    PORT_SELECT_NAK = 4,
+    PEERING_REQUEST = 5,
+    PEERING_REQUEST_ACK = 6,
+    PEERING_UPDATE = 7,
+    CHAIN_DISCOVER = 8,
+    CHAIN_DISCOVER_REPLY = 9,
+    ADMIN_START = 10,
+    ADMIN_RESET = 11,
+    ADMIN_DISCOVER = 12,
+    ADMIN_DISCOVER_REPLY = 13
+}
 export declare class FluxGossipServer extends FluxServer {
     private outPoint;
     MESSAGE_SEPARATOR: string;
@@ -15,22 +31,31 @@ export declare class FluxGossipServer extends FluxServer {
     restartTimeout: NodeJS.Timeout | null;
     discoverTimeout: NodeJS.Timeout | null;
     portSelectTimeout: NodeJS.Timeout | null;
+    peeringRequestTimeout: NodeJS.Timeout | null;
     adminTimeout: NodeJS.Timeout | null;
     pendingDiscoverId: string | null;
     pendingSelectId: string | null;
+    pendingPeeringRequestId: string | null;
     private upnpServiceUrl;
     private localAddresses;
     myIp: string | null;
     private addressApis;
     portToNodeMap: Map<number, string>;
+    peeringRequestCounter: Map<string, number>;
     state: State;
     networkState: NetworkState;
+    nodeTimeouts: Record<string, Map<string, NodeJS.Timeout>>;
+    nodeConnectionCooldowns: Map<string, number>;
     private multicastGroup;
     private port;
     private startDelay;
     private firstResponderDelay;
     private responseTimeoutMultiplier;
     private responseTimeout;
+    private nodeStartupTimeout;
+    private nodeDisconnectingTimeout;
+    private nodeDownTimeout;
+    private echoServer;
     mode: ServerMode;
     msgLog: Message[] | null;
     observerMsgHistory: Record<string, AdminMessage[]> | null;
@@ -44,8 +69,11 @@ export declare class FluxGossipServer extends FluxServer {
     startedAt: number;
     constructor(outPoint: OutPoint, options?: GossipServerOptions);
     get ["portsAvailable"](): fluxPorts[];
+    get ["networkConverged"](): boolean;
+    get ["nodeCount"](): number;
     getMyPublicIp(): Promise<string>;
     start(): Promise<boolean>;
+    createAndStartEchoServer(localAddress: string): void;
     stop(): void;
     /**
      * This is for the observer to send results to someone running tests. Only
@@ -61,26 +89,40 @@ export declare class FluxGossipServer extends FluxServer {
     fluxnodePriorPort(): Promise<number | null>;
     fluxportInUse(ip: string, port: number): Promise<boolean>;
     resetTimers(): void;
-    sleep(ms: number): Promise<void>;
-    updateState(localAddress: string, networkState: NetworkState): void;
+    updateState(host: string, state: Partial<State>): void;
     /**
      * Helper function to sort ip addresses. Nodes use this as a tiebreaker
      * when more than one node is discovering
      * @returns string[]
      * Array of all hosts sorted from lowest to highest IP
      */
-    sortDiscoveringHosts(): string[];
-    ipv4ToNumber(ipv4: string): number;
+    sortHosts(stateFilter?: NodeState | null): string[];
     getPortFromNode(nodeIp: string): fluxPorts | null;
     updatePortToNodeMap(): Promise<void>;
     createMessageFlows(): Record<string, Record<string, string[]>>;
+    deepEqual(x: any, y: any): boolean;
     writeAdminResults(testId: number): void;
     writeDataToJsonFile(data: any): void;
+    sendPeeringUpdate(host: string, peer: string, peerState: "CONNECTED" | "TIMED_OUT" | "DISCONNECTING" | "DOWN"): void;
+    sendPeeringRequest(msgId: string, host: string, peersRequired: number, outboundPeers: string[]): void;
+    sendPeeringRequestAck(host: string, id: string, peer: string, connectTo?: string | null): void;
     sendAdminDiscover(host: string): void;
     sendAdminDiscoverReply(srcHost: string, dstHost: string): void;
     sendAdminStart(localAddress: string): void;
     sendAdminReset(localAddress: string): void;
     sendMessageToSockets(msg: Message, options?: sendMessageOptions): void;
+    connectToPeers(localAddress: string, options?: {
+        exclude?: string;
+    }): Promise<void>;
+    requestPeerConnections(localAddress: string, options?: {
+        converged?: boolean;
+    }): Promise<void>;
+    clearNodeTimeouts(node: string): void;
+    createNodeDownCallback(peer: string): void;
+    peeringUpdateHandler(socket: Socket, localAddress: string, msg: PeeringUpdateMessage): Promise<void>;
+    checkDisconnectingPeer(peer: string, localAddress: string): Promise<void>;
+    peeringRequestHandler(socket: Socket, localAddress: string, msg: PeeringRequestMessage): Promise<void>;
+    peeringRequestAckHandler(msg: PeeringRequestMessage, localAddress: string): Promise<void>;
     adminStartHandler(socket: Socket, localAddress: string): Promise<void>;
     adminResetHandler(): void;
     adminDiscoverHandler(localAddress: string, remote: AddressInfo): Promise<void>;
@@ -89,7 +131,7 @@ export declare class FluxGossipServer extends FluxServer {
 }
 export default FluxGossipServer;
 type fluxPorts = 16197 | 16187 | 16177 | 16167 | 16157 | 16147 | 16137 | 16127;
-export type NodeState = "UNKNOWN" | "STARTING" | "DISCOVERING" | "SELECTING" | "READY";
+export type NodeState = "UNKNOWN" | "STARTING" | "DISCOVERING" | "SELECTING" | "READY" | "TIMED_OUT" | "DISCONNECTING" | "DOWN";
 export type ServerMode = "DEVELOPMENT" | "PRODUCTION" | "OBSERVE";
 interface State {
     port: number | null;
@@ -165,6 +207,16 @@ interface DiscoverReplyMessage extends Message {
 interface PortSelectMessage extends Message {
     port: number;
 }
+interface PeeringUpdateMessage extends Message {
+    peer: string;
+    peerState: "CONNECTED" | "TIMED_OUT" | "DISCONNECTING" | "DOWN";
+}
+interface PeeringRequestMessage extends Message {
+    peersRequired: number;
+    outboundPeers: string[];
+    peer: string;
+    connectTo: string;
+}
 interface sendMessageOptions {
     address?: string;
     addSeparators?: boolean;
@@ -221,7 +273,7 @@ export declare interface FluxGossipServer {
      * @param msg
      * The PORT_SELECT message received
      */
-    portSelectHandler(msg: PortSelectMessage): Promise<void>;
+    portSelectHandler(msg: PortSelectMessage, localAddress: string): Promise<void>;
     /**
      * Handles a PORT_SELECT_ACK message. Upon reciept, this node will
      * update state for the host in the message to READY. (this may be itself)

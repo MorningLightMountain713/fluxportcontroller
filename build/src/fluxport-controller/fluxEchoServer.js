@@ -3,65 +3,200 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.FluxEchoServer = void 0;
+exports.Dir = exports.FluxEchoServer = exports.Msg = void 0;
 const dgram_1 = __importDefault(require("dgram"));
 const fluxServer_1 = require("./fluxServer");
 const log_1 = require("./log");
 const util_1 = require("util");
 const logger = log_1.logController.getLogger();
-const PING = "PING";
-const PONG = "PONG";
+const INSPECT_OPTIONS = { showHidden: false, depth: null, colors: true };
+var Msg;
+(function (Msg) {
+    Msg[Msg["PING"] = 0] = "PING";
+    Msg[Msg["PING_NAK"] = 1] = "PING_NAK";
+    Msg[Msg["PONG"] = 2] = "PONG";
+})(Msg = exports.Msg || (exports.Msg = {}));
+class TwoWayMap extends Map {
+    revMap;
+    // skip being able to init by constructor
+    constructor() {
+        super();
+        this.revMap = new Map();
+    }
+    set(key, value) {
+        this.revMap.set(value, key);
+        return super.set(key, value);
+    }
+    getByValue(value) {
+        return this.revMap.get(value);
+    }
+    delete(key) {
+        const value = this.get(key);
+        this.revMap.delete(value);
+        return super.delete(key);
+    }
+    deleteByValue(value) {
+        const key = this.revMap.get(value);
+        if (key) {
+            this.revMap.delete(value);
+            return this.delete(key);
+        }
+        return false;
+    }
+}
 class FluxEchoServer extends fluxServer_1.FluxServer {
     MESSAGE_SEPARATOR = "^#!@!#^";
-    peers = {};
+    inbound = {};
+    outbound = {};
+    transitions = new TwoWayMap();
     port;
     pingInterval; // seconds
-    maxMissed;
+    maxMissedPings;
+    maxTimeoutCount;
+    bindAddress;
+    lastPingAction = 0;
     constructor(options = {}) {
         super();
         if (options.peers) {
-            for (const peer of options.peers) {
-                this.peers[peer] = {
-                    pingTimer: null,
-                    messageTimeouts: new Map(),
-                    missedPingCount: 0
-                };
-            }
+            options.peers.forEach((peer) => this.addPeer(peer, Dir.OUTBOUND, { connect: false }));
         }
         this.port = options.port || 16137;
-        this.pingInterval = options.interval || 5;
-        this.maxMissed = options.maxMissed || 3;
-        logger.info(this.interfaces);
+        this.pingInterval = options.interval || 8;
+        this.maxMissedPings = options.maxMissedPings || 3;
+        this.maxTimeoutCount = options.maxTimeoutCount || 3;
+        this.bindAddress = options.bindAddress || null;
+        logger.info((0, util_1.inspect)(this.interfaces, INSPECT_OPTIONS));
     }
-    addPeer(peerAddress) {
-        this.peers[peerAddress] = {
-            pingTimer: null,
-            messageTimeouts: new Map(),
-            missedPingCount: 0
-        };
+    addTransition(from, to) {
+        this.transitions.set(to, from);
+    }
+    addPeer(peerAddress, direction, options = {}) {
+        const activeSince = options.activeSince || 0;
+        const connect = options.connect === false ? false : true;
+        if (direction === Dir.OUTBOUND) {
+            this.outbound[peerAddress] = {
+                pingTimer: null,
+                messageTimeouts: new Map(),
+                missedPingCount: 0,
+                timeoutCount: 0,
+                activeSince: activeSince
+            };
+        }
+        else {
+            this.inbound[peerAddress] = {
+                activeSince: activeSince
+            };
+        }
+        console.log("Added peer", peerAddress, "DIRECTION", Dir[direction]);
+        if (!connect || direction === Dir.INBOUND)
+            return;
         // this only works with one socket, probably change this up a little, make multisocket
         for (const socket of this.sockets) {
             this.sendPing(socket, peerAddress);
-            this.peers[peerAddress].pingTimer = setInterval(() => this.sendPing(socket, peerAddress), this.pingInterval * 1000);
+            this.outbound[peerAddress].pingTimer = setInterval(() => this.sendPing(socket, peerAddress), this.pingInterval * 1000);
         }
     }
-    removePeer(peer) {
-        if (this.peers[peer].pingTimer) {
-            clearInterval(this.peers[peer].pingTimer);
+    get ["peerAddresses"]() {
+        return Array.from(new Set([...this.outboundPeerAddresses, ...this.inboundPeerAddresses]));
+    }
+    get ["inboundPeerAddresses"]() {
+        return this.sortHosts(Object.keys(this.inbound));
+    }
+    get ["outboundPeerAddresses"]() {
+        return this.sortHosts(Object.keys(this.outbound));
+    }
+    // get ["inboundPeerAddresses"](): string[] {
+    //   return Object.keys(
+    //     this.filter(this.outbound, ([_, peer]) => peer.direction === Dir.INBOUND)
+    //   );
+    // }
+    // get ["outboundPeerAddresses"](): string[] {
+    //   return Object.keys(
+    //     this.filter(this.outbound, ([_, connections]) =>
+    //       connections.some((con) => con.direction === Dir.OUTBOUND)
+    //     )
+    //   );
+    // }
+    // get ["outboundPeerAddresses"](): string[] {
+    //   return Object.keys(
+    //     this.filter(this.outbound, ([_, peer]) => peer.direction === Dir.OUTBOUND)
+    //   );
+    // }
+    get ["peerCount"]() {
+        return this.inboundPeerCount + this.outboundPeerCount;
+    }
+    get ["inboundPeerCount"]() {
+        return this.inboundPeerAddresses.length;
+    }
+    get ["outboundPeerCount"]() {
+        return this.outboundPeerAddresses.length;
+    }
+    sortHosts(toSort) {
+        toSort.sort((a, b) => {
+            const numA = this.ipv4ToNumber(a);
+            const numB = this.ipv4ToNumber(b);
+            return numA - numB;
+        });
+        return toSort;
+    }
+    /**
+     * If the node is a peer of this node and hasn't missed any pings
+     * @param peer
+     * @returns boolean
+     */
+    peerAvailable(peer) {
+        return this.outbound[peer] && this.outbound[peer].missedPingCount === 0;
+    }
+    removePeer(peer, options = {}) {
+        console.log("REMOVING PEER:", peer);
+        // if we're removing the outbound... we remove the inbound too
+        if (this.inbound[peer]) {
+            delete this.inbound[peer];
+            this.emit("peerRemoved", peer, Dir.INBOUND);
         }
-        for (const timeout of this.peers[peer].messageTimeouts.values()) {
+        if (options.inbound) {
+            return;
+        }
+        const active = options.active === false ? false : true;
+        if (this.outbound[peer].pingTimer) {
+            clearInterval(this.outbound[peer].pingTimer);
+        }
+        for (const timeout of this.outbound[peer].messageTimeouts.values()) {
             clearTimeout(timeout);
         }
-        delete this.peers[peer];
+        delete this.outbound[peer];
+        if (active) {
+            this.emit("peerRemoved", peer, Dir.OUTBOUND);
+        }
     }
     initiate(socket, multicastGroup, interfaceAddress) {
         socket.setMulticastTTL(1);
         logger.info(`Joining multicast group: ${multicastGroup}`);
         socket.addMembership(multicastGroup, interfaceAddress);
-        for (const [peerName, peerData] of Object.entries(this.peers)) {
+        for (const [peerName, peerData] of Object.entries(this.outbound)) {
             this.sendPing(socket, peerName);
             peerData.pingTimer = setInterval(() => this.sendPing(socket, peerName), this.pingInterval * 1000);
         }
+        this.logPeers();
+        setInterval(() => {
+            this.logPeers();
+        }, 10 * 1000);
+    }
+    logPeers() {
+        logger.info(`Inbound peers: ${this.inboundPeerCount}`);
+        logger.info(`Outbound peers: ${this.outboundPeerCount}`);
+        logger.info(`All peers: ${this.peerCount}`);
+    }
+    start() {
+        this.closed = false;
+        let bindInterface;
+        if (this.bindAddress) {
+            bindInterface = this.interfaces.find((int) => int.address === this.bindAddress);
+        }
+        else {
+            bindInterface = this.interfaces[0];
+        }
+        this.sockets.push(this.runSocketServer(bindInterface));
     }
     runSocketServer(iface) {
         const socket = dgram_1.default.createSocket("udp4");
@@ -80,64 +215,142 @@ class FluxEchoServer extends fluxServer_1.FluxServer {
     messageHandler(socket, localAddress, socketData, remote) {
         if (this.closed)
             return;
-        logger.info("Message received from:", remote);
         const messages = this.decodeMessages(remote.address, socketData);
-        logger.info((0, util_1.inspect)(messages, { showHidden: false, depth: null, colors: true }));
         for (const msg of messages) {
             this.unhandledMessages.add(msg.id);
+            logger.info(`Message: ${Msg[msg.type]} received from: ${remote.address}`);
             switch (msg.type) {
-                case PING:
-                    this.pingHandler(socket, msg, remote.address);
+                case Msg.PING:
+                    this.pingHandler(socket, localAddress, msg, remote.address);
                     break;
-                case PONG:
+                case Msg.PONG:
                     this.pongHandler(msg, remote.address);
+                    break;
+                case Msg.PING_NAK:
+                    this.pingNakHandler(msg, remote.address);
                     break;
                 default:
                     logger.info(`Received an unknown message of type: ${msg.type}, ignoring`);
             }
         }
     }
-    pingHandler(socket, msg, remoteAddress) {
+    async pingHandler(socket, localAddress, msg, remoteAddress) {
+        // TRANSITION
         const [_, hostPart] = remoteAddress.split(/\.(.*)/);
         const peerMulticastGroup = `239.${hostPart}`;
-        if (!(remoteAddress in this.peers)) {
-            this.addPeer(remoteAddress);
+        if (this.transitions.size) {
+            const to = this.transitions.getByValue(remoteAddress);
+            if (to && this.inboundPeerAddresses.includes(to)) {
+                console.log("transition complete");
+                this.sendPingNak(socket, localAddress, msg.id, peerMulticastGroup);
+                this.removePeer(remoteAddress, { inbound: true });
+                this.transitions.delete(to);
+                return;
+            }
         }
-        this.sendPong(socket, msg.id, peerMulticastGroup);
+        if (!this.inboundPeerAddresses.includes(remoteAddress)) {
+            console.log("NEW PING RECEIVED FROM:", remoteAddress);
+            const transitionRequired = this.transitions.get(remoteAddress);
+            console.log("transitions", this.transitions);
+            if (this.inboundPeerCount >= 2 && !transitionRequired) {
+                logger.info(`Max inbound peer count reached. Rejecting: ${remoteAddress}`);
+                this.sendPingNak(socket, localAddress, msg.id, peerMulticastGroup);
+                return;
+            }
+            this.addPeer(remoteAddress, Dir.INBOUND, { activeSince: Date.now() });
+            this.emit("peerConnected", remoteAddress, Dir.INBOUND);
+        }
+        this.sendPong(socket, localAddress, msg.id, peerMulticastGroup);
     }
     pongHandler(msg, peer) {
-        if (this.peers[peer].messageTimeouts.has(msg.id)) {
-            const timeoutId = this.peers[peer].messageTimeouts.get(msg.id);
+        if (this.outbound[peer].missedPingCount > 0) {
+            for (const timeout of this.outbound[peer].messageTimeouts.values()) {
+                clearTimeout(timeout);
+            }
+            this.outbound[peer].timeoutCount = 0;
+            this.outbound[peer].missedPingCount = 0;
+            this.outbound[peer].messageTimeouts.clear();
+            this.emit("peerReconnected", peer);
+        }
+        else if (this.outbound[peer].messageTimeouts.has(msg.id)) {
+            const timeoutId = this.outbound[peer].messageTimeouts.get(msg.id);
             clearTimeout(timeoutId);
-            this.peers[peer].messageTimeouts.delete(msg.id);
+            this.outbound[peer].messageTimeouts.delete(msg.id);
+        }
+        if (!this.outbound[peer].activeSince) {
+            this.outbound[peer].activeSince = Date.now();
+            this.emit("peerConnected", peer, Dir.OUTBOUND);
         }
     }
-    sendPing(socket, peer) {
+    pingNakHandler(msg, peer) {
+        // don't emit peer removed if it wasn't active
+        console.log("PING NAK RECEIVED:", peer);
+        this.removePeer(peer, { active: false });
+        this.emit("peerRejected", peer);
+    }
+    async sendPing(socket, peer) {
         const [_, hostPart] = peer.split(/\.(.*)/);
         const peerMulticastGroup = `239.${hostPart}`;
-        if (this.peers[peer].missedPingCount >= this.maxMissed) {
-            this.emit("timeout", peer, this.peers[peer].missedPingCount * this.pingInterval);
-            this.peers[peer].missedPingCount = 0;
-            for (const timeoutId of this.peers[peer].messageTimeouts.values()) {
+        // just use modulo here
+        if (this.outbound[peer].missedPingCount >= this.maxMissedPings) {
+            this.outbound[peer].timeoutCount++;
+            const culmulative = this.outbound[peer].timeoutCount *
+                this.pingInterval *
+                this.maxMissedPings;
+            this.emit("peerTimeout", peer, culmulative);
+            this.outbound[peer].missedPingCount = 0;
+            if (this.outbound[peer].timeoutCount >= this.maxTimeoutCount) {
+                this.removePeer(peer);
+                return;
+            }
+            for (const timeoutId of this.outbound[peer].messageTimeouts.values()) {
                 clearTimeout(timeoutId);
             }
-            this.peers[peer].messageTimeouts.clear();
+            this.outbound[peer].messageTimeouts.clear();
+            // emit interupts the flow here - which could trigger a peerRemoval,
+            // If so - we give up
+            if (!this.outbound[peer])
+                return;
         }
+        const localAddress = socket.address().address;
         const msgId = this.generateId();
-        const msg = { type: PING, id: msgId };
+        // localAddress is the multicast group 239.x.x.x
+        const msg = { type: Msg.PING, host: localAddress, id: msgId };
+        const timeoutId = setTimeout(() => {
+            logger.warn(`Peer ${peer} MISSED PING`);
+            this.outbound[peer].missedPingCount++;
+        }, this.pingInterval * 1000);
+        this.outbound[peer].messageTimeouts.set(msgId, timeoutId);
+        const now = Date.now();
+        const elapsed = now - this.lastPingAction;
+        // within 2000ms default
+        if (elapsed + (this.pingInterval / 4) * 1000 > now) {
+            // only sleep 100ms so the change is gradual.
+            await this.sleep(100);
+            this.lastPingAction = Date.now();
+        }
+        else {
+            this.lastPingAction = now;
+        }
+        this.sendMessageToSocket(msg, socket, peerMulticastGroup);
+    }
+    sendPong(socket, localAddress, msgId, multicastGroup) {
+        const msg = { type: Msg.PONG, host: localAddress, id: msgId };
+        this.sendMessageToSocket(msg, socket, multicastGroup);
+    }
+    sendPingNak(socket, localAddress, msgId, multicastGroup) {
+        const msg = { type: Msg.PING_NAK, host: localAddress, id: msgId };
+        this.sendMessageToSocket(msg, socket, multicastGroup);
+    }
+    sendMessageToSocket(msg, socket, multicastGroup) {
+        logger.info(`Sending: ${Msg[msg.type]} To: ${multicastGroup}:${this.port}`);
         const payload = this.preparePayload(msg);
-        const timeoutId = setTimeout(() => this.peers[peer].missedPingCount++, 3 * 1000);
-        this.peers[peer].messageTimeouts.set(msgId, timeoutId);
-        this.sendPayloadToSocket(payload, socket, peerMulticastGroup);
-    }
-    sendPong(socket, msgId, multicastGroup) {
-        const reply = { type: PONG, id: msgId };
-        const payload = this.preparePayload(reply);
-        this.sendPayloadToSocket(payload, socket, multicastGroup);
-    }
-    sendMessageToSocket(payload, socket, multicastGroup) {
-        logger.info(`Sending message to ${multicastGroup}:${this.port}`);
         socket.send(payload, 0, payload.length, this.port, multicastGroup);
     }
 }
 exports.FluxEchoServer = FluxEchoServer;
+var Dir;
+(function (Dir) {
+    Dir[Dir["INBOUND"] = 0] = "INBOUND";
+    Dir[Dir["OUTBOUND"] = 1] = "OUTBOUND";
+})(Dir = exports.Dir || (exports.Dir = {}));
