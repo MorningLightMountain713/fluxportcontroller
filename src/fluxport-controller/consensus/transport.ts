@@ -16,6 +16,7 @@
 
 import dgram from "node:dgram";
 import { ProtocolMessage, decodeDatagram, encode } from "./messages";
+import { Clock } from "./clock";
 
 export type MessageHandler = (msg: ProtocolMessage, from: string) => void;
 
@@ -110,16 +111,41 @@ export type DropPredicate = (
   msg: ProtocolMessage
 ) => boolean;
 
+export interface VirtualNetworkOptions {
+  /** When set (with maxLatency > 0), deliveries are scheduled on this clock. */
+  clock?: Clock;
+  /** Seeded randomness for per-message latency (default Math.random). */
+  rng?: () => number;
+  minLatency?: number;
+  maxLatency?: number;
+}
+
 /**
- * Deterministic in-memory network for tests. Delivers synchronously. Supports
- * partitioning and an arbitrary drop predicate (loss / targeted drops). Each
- * delivery is an independent encode→decode round-trip, mirroring the real wire:
- * receivers get their own object copies and anything non-serialisable is caught.
+ * Deterministic in-memory network for tests. Supports partitioning and an
+ * arbitrary drop predicate (loss / targeted drops). Each delivery is an
+ * independent encode→decode round-trip, mirroring the real wire.
+ *
+ * By default it delivers synchronously and in order. Given a clock + a latency
+ * range, each message is instead scheduled at an independent random delay, which
+ * models the real wire's variable latency and packet REORDER (a later-sent
+ * message can arrive first) — still fully deterministic via the ManualClock and
+ * a seeded rng.
  */
 export class VirtualNetwork {
   private readonly endpoints = new Map<string, VirtualTransport>();
   private partitions: Set<string>[] | null = null;
   private dropPredicate: DropPredicate | null = null;
+  private readonly clock?: Clock;
+  private readonly rng: () => number;
+  private readonly minLatency: number;
+  private readonly maxLatency: number;
+
+  constructor(options: VirtualNetworkOptions = {}) {
+    this.clock = options.clock;
+    this.rng = options.rng ?? Math.random;
+    this.minLatency = options.minLatency ?? 0;
+    this.maxLatency = options.maxLatency ?? 0;
+  }
 
   register(address: string): VirtualTransport {
     if (this.endpoints.has(address)) {
@@ -154,23 +180,32 @@ export class VirtualNetwork {
   /** internal: route a message; `to === null` means multicast to the group. */
   route(from: string, to: string | null, msg: ProtocolMessage): void {
     const buf = encode(msg);
-    const deliver = (addr: string): void => {
+    const send = (addr: string): void => {
       if (this.dropPredicate && this.dropPredicate(from, addr, msg)) return;
-      const endpoint = this.endpoints.get(addr);
-      if (!endpoint) return;
-      const copy = decodeDatagram(buf)[0];
-      if (copy) endpoint.receive(copy, from);
+      if (!this.endpoints.has(addr)) return;
+      const deliver = (): void => {
+        const endpoint = this.endpoints.get(addr);
+        const copy = decodeDatagram(buf)[0];
+        if (endpoint && copy) endpoint.receive(copy, from);
+      };
+      if (this.clock && this.maxLatency > 0) {
+        const span = this.maxLatency - this.minLatency;
+        const delay = this.minLatency + (span > 0 ? Math.floor(this.rng() * (span + 1)) : 0);
+        this.clock.setTimer(delay, deliver); // async + reorder
+      } else {
+        deliver(); // synchronous, in order
+      }
     };
 
     if (to === null) {
       for (const addr of this.endpoints.keys()) {
         if (addr === from) continue; // no multicast loopback
         if (!this.sameGroup(from, addr)) continue;
-        deliver(addr);
+        send(addr);
       }
     } else {
       if (!this.sameGroup(from, to)) return;
-      deliver(to); // unicast to self is allowed
+      send(to); // unicast to self is allowed
     }
   }
 }

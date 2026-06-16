@@ -76,11 +76,16 @@ interface Timing {
   commitTimeout: number;
 }
 
+// Timing invariant: a full rotation takes ~|members| × tokenRotationTarget plus
+// network latency. tokenRetransmitTimeout MUST exceed one rotation (else the
+// token is retransmitted every lap — harmless after dedup, but wasteful), and
+// tokenLossTimeout MUST exceed that again (else a slow rotation is mistaken for a
+// dead ring → spurious reconfiguration). Sized here for the max ring of 8.
 const DEFAULT_TIMING: Timing = {
-  tokenRotationTarget: 100,
-  tokenRetransmitTimeout: 500,
+  tokenRotationTarget: 40, // ~320ms/rotation for 8 members
+  tokenRetransmitTimeout: 1500, // > one rotation
   maxTokenRetransmits: 4,
-  tokenLossTimeout: 2000,
+  tokenLossTimeout: 4000, // > a couple of rotations
   maxMessagesPerToken: 16,
   announceInterval: 1000,
   joinInterval: 200,

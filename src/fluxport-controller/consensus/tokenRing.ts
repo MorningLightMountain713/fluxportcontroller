@@ -85,6 +85,7 @@ export class TokenRing {
   private retransmitTimer: TimerId | null = null;
   private forwardTimer: TimerId | null = null;
   private retransmitCount = 0;
+  private lastTokenSeq = -1; // highest token round seen; drops stale/duplicate tokens
 
   constructor(opts: TokenRingOptions) {
     this.self = opts.self;
@@ -141,6 +142,7 @@ export class TokenRing {
     this.members = sortMembers(members);
     this.holdsToken = false;
     this.lastToken = null;
+    this.lastTokenSeq = -1; // new ring = new token lineage (originate starts at 0)
     this.clearTimers();
     this.armLossTimer();
     if (originate) this.originateToken();
@@ -182,9 +184,17 @@ export class TokenRing {
       return;
     }
 
-    // Data-plane: a foreign ring/sender signals a membership change is needed.
-    if (this.isForeign(msg)) {
+    // Data-plane (TOKEN / MCAST).
+    if (!this.ringId || msg.ringId.rep !== this.ringId.rep) {
+      // A different representative means a genuinely different ring lineage
+      // (a merge / new membership) — signal a reconfiguration.
       this.hooks.onForeignMessage?.(msg, from);
+      return;
+    }
+    if (msg.ringId.seq !== this.ringId.seq) {
+      // Same lineage, different incarnation: a delayed message from a prior ring
+      // (or a premature one from the next). Drop it — re-gathering here would
+      // cascade. The token dedup + membership protocol resync us.
       return;
     }
     if (msg.kind === "TOKEN") {
@@ -194,18 +204,14 @@ export class TokenRing {
     }
   }
 
-  private isForeign(msg: ProtocolMessage): boolean {
-    if (!this.ringId) return true;
-    if (msg.ringId.rep !== this.ringId.rep || msg.ringId.seq !== this.ringId.seq) {
-      return true;
-    }
-    if ((msg.kind === "MCAST" || msg.kind === "JOIN") && !this.members.includes(msg.senderNid)) {
-      return true;
-    }
-    return false;
-  }
-
   private receiveToken(token: TokenMessage): void {
+    // Drop stale/duplicate tokens (e.g. a retransmit racing the delayed original
+    // under reorder). Two live tokens would each assign sequence numbers,
+    // corrupting the total order and dropping claims. Only advance to a strictly
+    // newer token round.
+    if (token.tokenSeq <= this.lastTokenSeq) return;
+    this.lastTokenSeq = token.tokenSeq;
+
     this.holdsToken = true;
     this.lastToken = token;
     this.retransmitCount = 0;

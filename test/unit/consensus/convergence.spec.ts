@@ -63,4 +63,56 @@ describe("8-node convergence (no churn)", () => {
       assert.deepEqual(allocs.get(nid)!.snapshot(), snap, `${nid} disagrees`);
     }
   });
+
+  // Closes the coverage gap that let the docker run find bugs the synchronous
+  // virtual network couldn't: real UDP reorders/delays packets. With timeouts
+  // sized above a full rotation, 8 nodes must still converge to one stable,
+  // distinct, agreed allocation under reordered delivery.
+  it("converges under packet reorder (variable latency)", () => {
+    const ports = [16197, 16187, 16177, 16167, 16157, 16147, 16137, 16127];
+    const nids = ["n1", "n2", "n3", "n4", "n5", "n6", "n7", "n8"];
+    // timeouts > worst-case rotation (8 hops * 5ms hold + up to 30ms latency)
+    const cfg: PortAllocatorConfig = {
+      ...TIMING,
+      ports,
+      priority: 100,
+      tokenRetransmitTimeout: 500,
+      tokenLossTimeout: 2000
+    };
+
+    for (let seed = 1; seed <= 8; seed++) {
+      let s = seed >>> 0;
+      const rand = () => {
+        s = (s + 0x6d2b79f5) | 0;
+        let t = Math.imul(s ^ (s >>> 15), 1 | s);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+      const clock = new ManualClock();
+      const net = new VirtualNetwork({ clock, rng: rand, minLatency: 1, maxLatency: 30 });
+      const allocs = new Map<string, PortAllocator>();
+      for (const nid of nids) {
+        const t = net.register(nid);
+        const a = new PortAllocator({ self: nid, transport: t, clock, config: cfg });
+        t.start();
+        a.start();
+        allocs.set(nid, a);
+      }
+      nids.forEach((nid) => allocs.get(nid)!.bootstrap());
+
+      clock.advance(20000);
+      const v1 = nids.map((n) => allocs.get(n)!.viewId);
+      clock.advance(20000);
+      const v2 = nids.map((n) => allocs.get(n)!.viewId);
+
+      assert.equal(new Set(v2).size, 1, `seed ${seed}: not one view ${[...new Set(v2)]}`);
+      assert.deepEqual(v2, v1, `seed ${seed}: churn ${v1[0]} -> ${v2[0]}`);
+      const snap = allocs.get("n1")!.snapshot();
+      assert.equal(Object.keys(snap).length, 8, `seed ${seed}: incomplete ${JSON.stringify(snap)}`);
+      assert.equal(new Set(Object.values(snap)).size, 8, `seed ${seed}: duplicate ports`);
+      for (const nid of nids) {
+        assert.deepEqual(allocs.get(nid)!.snapshot(), snap, `seed ${seed}: ${nid} disagrees`);
+      }
+    }
+  });
 });
