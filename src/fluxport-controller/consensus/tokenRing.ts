@@ -1,0 +1,234 @@
+/**
+ * OPERATIONAL token rotation (Phase 2).
+ *
+ * A single token circulates the ring (unicast to the successor). Holding the
+ * token is the privilege to broadcast (Phase 3 fills that in via `processToken`).
+ * This module owns the failure detector:
+ *
+ *  - the token-loss timer is reset on every token receipt; if it fires, the ring
+ *    is broken (a member crashed or the token was lost) → `onTokenLost`, which
+ *    Phase 4 will turn into a membership reconfiguration;
+ *  - after forwarding, a shorter retransmit timer re-sends the token to ride out
+ *    a single drop, until either the token returns or the loss timer gives up.
+ *
+ * A message from a foreign ring (or an unknown sender) signals that membership
+ * must change → `onForeignMessage` (the Phase 4 GATHER trigger).
+ *
+ * Timeout hierarchy (config must satisfy): rotationTarget ≪ retransmitTimeout
+ * (≈ one rotation) ≪ tokenLossTimeout.
+ */
+
+import { Transport } from "./transport";
+import { Clock, TimerId } from "./clock";
+import { Nid, RingId, ProtocolMessage, TokenMessage } from "./messages";
+import { sortMembers, successorOf, representativeOf } from "./ring";
+
+export interface TokenRingConfig {
+  /** Minimum time the token is held before forwarding (idle pacing). */
+  tokenRotationTarget: number;
+  /** If the token hasn't returned within this, retransmit to the successor. */
+  tokenRetransmitTimeout: number;
+  /**
+   * Max retransmits before giving up. Bounded so a node retransmitting toward a
+   * dead successor stops re-feeding the *next* node's loss timer — otherwise a
+   * downstream failure would be masked and never detected past the first node.
+   */
+  maxTokenRetransmits: number;
+  /** No token within this ⇒ the ring is broken. */
+  tokenLossTimeout: number;
+}
+
+export interface TokenRingHooks {
+  onTokenLost?: () => void;
+  onForeignMessage?: (msg: ProtocolMessage, from: string) => void;
+  onReceiveToken?: (token: TokenMessage) => void;
+  onForward?: (token: TokenMessage, to: Nid) => void;
+  /** Phase 3 hook: mutate the token (assign seqs, service rtr, update aru) while held. */
+  processToken?: (token: TokenMessage) => void;
+}
+
+export interface TokenRingOptions {
+  self: Nid;
+  transport: Transport;
+  clock: Clock;
+  config: TokenRingConfig;
+  hooks?: TokenRingHooks;
+}
+
+export class TokenRing {
+  readonly self: Nid;
+  private readonly transport: Transport;
+  private readonly clock: Clock;
+  private readonly config: TokenRingConfig;
+  private readonly hooks: TokenRingHooks;
+
+  private ringId: RingId | null = null;
+  private members: Nid[] = [];
+  private running = false;
+  private holdsToken = false;
+  private lastToken: TokenMessage | null = null;
+
+  private lossTimer: TimerId | null = null;
+  private retransmitTimer: TimerId | null = null;
+  private forwardTimer: TimerId | null = null;
+  private retransmitCount = 0;
+
+  constructor(opts: TokenRingOptions) {
+    this.self = opts.self;
+    this.transport = opts.transport;
+    this.clock = opts.clock;
+    this.config = opts.config;
+    this.hooks = opts.hooks ?? {};
+    this.transport.onMessage((msg, from) => this.handleMessage(msg, from));
+  }
+
+  get ring(): RingId | null {
+    return this.ringId;
+  }
+  get currentMembers(): Nid[] {
+    return [...this.members];
+  }
+  get holding(): boolean {
+    return this.holdsToken;
+  }
+  get successor(): Nid {
+    return successorOf(this.self, this.members);
+  }
+
+  start(): void {
+    this.running = true;
+  }
+
+  stop(): void {
+    this.running = false;
+    this.holdsToken = false;
+    this.clearTimers();
+  }
+
+  /** Bootstrap a one-node ring and originate the token (the production start path). */
+  bootstrap(): void {
+    this.installRing({ rep: this.self, seq: 1 }, [this.self], true);
+  }
+
+  /**
+   * Install a (new) ring configuration. If `originate` and this node is the
+   * representative, seed a fresh token — used at bootstrap and after recovery.
+   */
+  installRing(ringId: RingId, members: Nid[], originate = false): void {
+    this.ringId = ringId;
+    this.members = sortMembers(members);
+    this.holdsToken = false;
+    this.lastToken = null;
+    this.clearTimers();
+    this.armLossTimer();
+    if (originate) this.originateToken();
+  }
+
+  private originateToken(): void {
+    if (!this.running || !this.ringId) return;
+    if (representativeOf(this.members) !== this.self) return;
+    this.receiveToken({
+      kind: "TOKEN",
+      ringId: this.ringId,
+      tokenSeq: 0,
+      seq: 0,
+      aru: 0,
+      aruId: null,
+      rtr: [],
+      fcc: 0
+    });
+  }
+
+  private handleMessage(msg: ProtocolMessage, from: string): void {
+    if (!this.running) return;
+    if (this.isForeign(msg)) {
+      this.hooks.onForeignMessage?.(msg, from);
+      return;
+    }
+    if (msg.kind === "TOKEN") {
+      this.receiveToken(msg);
+    }
+    // MCAST ordering is Phase 3; JOIN/COMMIT recovery is Phase 4.
+  }
+
+  private isForeign(msg: ProtocolMessage): boolean {
+    if (!this.ringId) return true;
+    if (msg.ringId.rep !== this.ringId.rep || msg.ringId.seq !== this.ringId.seq) {
+      return true;
+    }
+    if ((msg.kind === "MCAST" || msg.kind === "JOIN") && !this.members.includes(msg.senderNid)) {
+      return true;
+    }
+    return false;
+  }
+
+  private receiveToken(token: TokenMessage): void {
+    this.holdsToken = true;
+    this.lastToken = token;
+    this.retransmitCount = 0;
+    this.cancelRetransmit(); // the token came back (or we just originated it)
+    this.armLossTimer(); // a healthy rotation just happened
+    this.hooks.onReceiveToken?.(token);
+    this.hooks.processToken?.(token);
+
+    if (this.forwardTimer !== null) this.clock.clearTimer(this.forwardTimer);
+    this.forwardTimer = this.clock.setTimer(this.config.tokenRotationTarget, () =>
+      this.forwardToken()
+    );
+  }
+
+  private forwardToken(): void {
+    this.forwardTimer = null;
+    if (!this.holdsToken || !this.lastToken) return;
+    this.holdsToken = false;
+    const token = this.lastToken;
+    token.tokenSeq += 1;
+
+    // Arm the retransmit before sending: self-delivery (singleton ring) is
+    // synchronous and will cancel it in receiveToken right away.
+    this.retransmitCount = 0;
+    this.armRetransmit(token);
+    this.hooks.onForward?.(token, this.successor);
+    this.transport.sendUnicast(token, this.successor);
+  }
+
+  private armLossTimer(): void {
+    if (this.lossTimer !== null) this.clock.clearTimer(this.lossTimer);
+    this.lossTimer = this.clock.setTimer(this.config.tokenLossTimeout, () => {
+      this.lossTimer = null;
+      this.cancelRetransmit();
+      this.hooks.onTokenLost?.();
+    });
+  }
+
+  private armRetransmit(token: TokenMessage): void {
+    this.cancelRetransmit();
+    this.retransmitTimer = this.clock.setTimer(this.config.tokenRetransmitTimeout, () => {
+      this.retransmitTimer = null;
+      // Give up after the cap so a downstream failure is not masked; the loss
+      // timer (reset only on receipt) then fires and triggers reconfiguration.
+      if (this.retransmitCount >= this.config.maxTokenRetransmits) return;
+      this.retransmitCount += 1;
+      // Single-drop resilience: resend until the token returns (cancels this)
+      // or we hit the cap.
+      this.transport.sendUnicast(token, this.successor);
+      this.armRetransmit(token);
+    });
+  }
+
+  private cancelRetransmit(): void {
+    if (this.retransmitTimer !== null) {
+      this.clock.clearTimer(this.retransmitTimer);
+      this.retransmitTimer = null;
+    }
+  }
+
+  private clearTimers(): void {
+    for (const t of [this.lossTimer, this.retransmitTimer, this.forwardTimer]) {
+      if (t !== null) this.clock.clearTimer(t);
+    }
+    this.lossTimer = null;
+    this.retransmitTimer = null;
+    this.forwardTimer = null;
+  }
+}
