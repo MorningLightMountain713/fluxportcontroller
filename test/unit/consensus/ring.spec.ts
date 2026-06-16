@@ -4,7 +4,7 @@ import {
   sortMembers,
   successorOf,
   representativeOf
-} from "../../../src/fluxport-controller/consensus/ring";
+} from "@/fluxport-controller/consensus/ring";
 
 describe("ring helpers", () => {
   it("sorts and de-duplicates members", () => {

@@ -1,11 +1,11 @@
 import assert from "assert/strict";
 import { describe, it } from "node:test";
-import { VirtualNetwork } from "../../../src/fluxport-controller/consensus/transport";
-import { ManualClock } from "../../../src/fluxport-controller/consensus/clock";
+import { VirtualNetwork } from "@/fluxport-controller/consensus/transport";
+import { ManualClock } from "@/fluxport-controller/consensus/clock";
 import {
   TokenRing,
   TokenRingConfig
-} from "../../../src/fluxport-controller/consensus/tokenRing";
+} from "@/fluxport-controller/consensus/tokenRing";
 
 const CONFIG: TokenRingConfig = {
   tokenRotationTarget: 10,

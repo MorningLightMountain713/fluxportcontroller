@@ -18,16 +18,16 @@ import { describe, it } from "node:test";
 import {
   VirtualNetwork,
   DropPredicate
-} from "../../../src/fluxport-controller/consensus/transport";
-import { ManualClock } from "../../../src/fluxport-controller/consensus/clock";
+} from "@/fluxport-controller/consensus/transport";
+import { ManualClock } from "@/fluxport-controller/consensus/clock";
 import {
   OrderedBroadcast,
   OrderedBroadcastConfig
-} from "../../../src/fluxport-controller/consensus/orderedBroadcast";
+} from "@/fluxport-controller/consensus/orderedBroadcast";
 import {
   PortAllocator,
   PortAllocatorConfig
-} from "../../../src/fluxport-controller/consensus/portAllocator";
+} from "@/fluxport-controller/consensus/portAllocator";
 
 // deterministic PRNG (mulberry32) so any failure is reproducible by seed
 function rng(seed: number): () => number {

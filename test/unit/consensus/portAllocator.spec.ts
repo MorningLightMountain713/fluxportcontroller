@@ -1,11 +1,11 @@
 import assert from "assert/strict";
 import { describe, it } from "node:test";
-import { VirtualNetwork } from "../../../src/fluxport-controller/consensus/transport";
-import { ManualClock } from "../../../src/fluxport-controller/consensus/clock";
+import { VirtualNetwork } from "@/fluxport-controller/consensus/transport";
+import { ManualClock } from "@/fluxport-controller/consensus/clock";
 import {
   PortAllocator,
   PortAllocatorConfig
-} from "../../../src/fluxport-controller/consensus/portAllocator";
+} from "@/fluxport-controller/consensus/portAllocator";
 
 const TIMING = {
   tokenRotationTarget: 5,

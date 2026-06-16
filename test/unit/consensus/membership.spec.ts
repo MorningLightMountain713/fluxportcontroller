@@ -1,12 +1,12 @@
 import assert from "assert/strict";
 import { describe, it } from "node:test";
-import { VirtualNetwork } from "../../../src/fluxport-controller/consensus/transport";
-import { ManualClock } from "../../../src/fluxport-controller/consensus/clock";
+import { VirtualNetwork } from "@/fluxport-controller/consensus/transport";
+import { ManualClock } from "@/fluxport-controller/consensus/clock";
 import {
   Membership,
   MembershipConfig,
   View
-} from "../../../src/fluxport-controller/consensus/membership";
+} from "@/fluxport-controller/consensus/membership";
 
 const CONFIG: MembershipConfig = {
   tokenRotationTarget: 5,

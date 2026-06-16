@@ -1,11 +1,11 @@
 import assert from "assert/strict";
 import { describe, it } from "node:test";
-import { VirtualNetwork } from "../../../src/fluxport-controller/consensus/transport";
-import { ManualClock } from "../../../src/fluxport-controller/consensus/clock";
+import { VirtualNetwork } from "@/fluxport-controller/consensus/transport";
+import { ManualClock } from "@/fluxport-controller/consensus/clock";
 import {
   OrderedBroadcast,
   OrderedBroadcastConfig
-} from "../../../src/fluxport-controller/consensus/orderedBroadcast";
+} from "@/fluxport-controller/consensus/orderedBroadcast";
 
 const CONFIG: OrderedBroadcastConfig = {
   tokenRotationTarget: 10,

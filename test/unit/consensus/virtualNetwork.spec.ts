@@ -3,11 +3,11 @@ import { describe, it, beforeEach } from "node:test";
 import {
   VirtualNetwork,
   VirtualTransport
-} from "../../../src/fluxport-controller/consensus/transport";
+} from "@/fluxport-controller/consensus/transport";
 import {
   ProtocolMessage,
   TokenMessage
-} from "../../../src/fluxport-controller/consensus/messages";
+} from "@/fluxport-controller/consensus/messages";
 
 const ring = { rep: "a", seq: 1 };
 const tok = (overrides: Partial<TokenMessage> = {}): TokenMessage => ({

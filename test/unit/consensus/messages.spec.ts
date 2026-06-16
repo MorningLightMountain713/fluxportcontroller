@@ -9,7 +9,7 @@ import {
   TokenMessage,
   JoinMessage,
   CommitTokenMessage
-} from "../../../src/fluxport-controller/consensus/messages";
+} from "@/fluxport-controller/consensus/messages";
 
 const ring = { rep: "a:0", seq: 1 };
 

@@ -1,6 +1,6 @@
 import assert from "assert/strict";
 import { describe, it } from "node:test";
-import { ManualClock } from "../../../src/fluxport-controller/consensus/clock";
+import { ManualClock } from "@/fluxport-controller/consensus/clock";
 
 describe("ManualClock", () => {
   it("starts at 0 and advances", () => {
