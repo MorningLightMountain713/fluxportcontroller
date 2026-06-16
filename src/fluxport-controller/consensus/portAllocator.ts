@@ -137,6 +137,17 @@ export class PortAllocator {
   get currentMembers(): Nid[] {
     return this.membership.currentMembers;
   }
+  /** Current ring identifier (for tests: are all nodes in the same view?). */
+  get viewId(): string {
+    const r = this.membership.currentRing;
+    return `${r.rep}:${r.seq}`;
+  }
+  /** Read-only allocation snapshot {port: owner identity} (for tests/observability). */
+  snapshot(): Record<number, Nid> {
+    const out: Record<number, Nid> = {};
+    for (const [port, owner] of this.allocation) out[port] = owner.nid;
+    return out;
+  }
 
   // ---- view changes: the ordered log restarts, so re-assert ----
 
