@@ -33,10 +33,11 @@ import {
   Nid,
   RingId,
   JoinMessage,
-  CommitTokenMessage,
+  CommitProposeMessage,
+  CommitReplyMessage,
   MemberState
 } from "./messages";
-import { sortMembers, successorOf, representativeOf } from "./ring";
+import { sortMembers, representativeOf } from "./ring";
 import { OrderedBroadcast, OrderedBroadcastConfig } from "./orderedBroadcast";
 
 export type MembershipState = "OPERATIONAL" | "GATHER" | "COMMIT";
@@ -46,6 +47,7 @@ export interface MembershipConfig extends OrderedBroadcastConfig {
   joinInterval: number; // JOIN resend cadence during GATHER
   joinTimeout: number; // candidate set stable this long ⇒ proceed to COMMIT
   commitTimeout: number; // no commit progress ⇒ re-GATHER
+  proposeInterval?: number; // COMMIT_PROPOSE retransmit cadence (default: joinInterval)
 }
 
 export interface View {
@@ -84,6 +86,15 @@ export class Membership {
   private joinResendTimer: TimerId | null = null;
   private joinStableTimer: TimerId | null = null;
   private commitTimer: TimerId | null = null;
+  private proposeTimer: TimerId | null = null;
+
+  // commit (2-phase) state
+  private commitRing: RingId | null = null;
+  private commitMembers: Nid[] = [];
+  private commitPhase: "collect" | "install" = "collect";
+  private collected = new Map<Nid, MemberState>();
+  private installed = new Set<Nid>();
+  private installedRing: string | null = null; // ringKey we've already installed
 
   constructor(opts: MembershipOptions) {
     this.self = opts.self;
@@ -101,7 +112,8 @@ export class Membership {
         onTokenLost: () => this.trigger("tokenLost"),
         onForeignMessage: () => this.trigger("foreign"),
         onJoin: (msg) => this.onJoin(msg),
-        onCommitToken: (msg) => this.onCommitToken(msg)
+        onCommitPropose: (msg) => this.onCommitPropose(msg),
+        onCommitReply: (msg) => this.onCommitReply(msg)
       }
     });
   }
@@ -112,6 +124,7 @@ export class Membership {
 
   stop(): void {
     this.clearTimers();
+    this.resetCommit();
     this.stopAnnounce();
     this.ob.stop();
   }
@@ -170,6 +183,7 @@ export class Membership {
     void reason;
     this.state = "GATHER";
     this.stopAnnounce();
+    this.resetCommit(); // abandon any in-flight commit
     this.ob.tokenRing.suspend();
     this.candidate = new Set<Nid>([this.self]); // grow from JOINs; crashed nodes drop out
     this.maxSeenSeq = Math.max(this.maxSeenSeq, this.currentRing.seq);
@@ -253,109 +267,156 @@ export class Membership {
     // non-representatives wait for the commit token
   }
 
-  // ---- COMMIT ----
-
-  private startCommit(members: Nid[]): void {
-    const newRing: RingId = { rep: this.self, seq: this.maxSeenSeq + 1 };
-    const token: CommitTokenMessage = {
-      kind: "COMMIT_TOKEN",
-      ringId: newRing,
-      phase: "collect",
-      originator: this.self,
-      members,
-      memberStates: [this.myState()],
-      visited: [this.self]
-    };
-    this.forward(token);
-  }
+  // ---- COMMIT (multicast 2-phase, retransmitted until all reply) ----
 
   private myState(): MemberState {
     return { nid: this.self, oldRing: this.currentRing, aru: this.ob.aru };
   }
 
-  private onCommitToken(token: CommitTokenMessage): void {
+  /** Representative: begin committing the new view. */
+  private startCommit(members: Nid[]): void {
+    this.commitRing = { rep: this.self, seq: this.maxSeenSeq + 1 };
+    this.commitMembers = members;
+    this.commitPhase = "collect";
+    this.collected = new Map([[this.self, this.myState()]]);
+    this.installed = new Set();
+    this.sendPropose();
+    this.scheduleProposeRetransmit();
+    this.maybeAdvanceCommit(); // handles the singleton case immediately
+  }
+
+  private sendPropose(): void {
+    if (!this.commitRing) return;
+    const msg: CommitProposeMessage = {
+      kind: "COMMIT_PROPOSE",
+      ringId: this.commitRing,
+      phase: this.commitPhase,
+      originator: this.self,
+      members: this.commitMembers,
+      memberStates:
+        this.commitPhase === "install" ? [...this.collected.values()] : undefined
+    };
+    this.transport.sendMulticast(msg);
+  }
+
+  /** Loss recovery: keep re-proposing until every member has replied. */
+  private scheduleProposeRetransmit(): void {
+    this.proposeTimer = this.clock.setTimer(
+      this.config.proposeInterval ?? this.config.joinInterval,
+      () => {
+        this.proposeTimer = null;
+        if (this.state !== "COMMIT" || !this.commitRing) return;
+        this.sendPropose();
+        this.scheduleProposeRetransmit();
+      }
+    );
+  }
+
+  /** Representative: collect a member's reply; advance when all have replied. */
+  private onCommitReply(msg: CommitReplyMessage): void {
+    if (!this.commitRing || ringKey(msg.ringId) !== ringKey(this.commitRing)) return;
+    if (msg.phase !== this.commitPhase) return; // stale-phase reply
+    if (msg.phase === "collect") {
+      if (msg.state) this.collected.set(msg.senderNid, msg.state);
+    } else {
+      this.installed.add(msg.senderNid);
+    }
+    this.maybeAdvanceCommit();
+  }
+
+  private maybeAdvanceCommit(): void {
+    if (!this.commitRing) return;
+    if (this.commitPhase === "collect") {
+      if (this.commitMembers.every((m) => this.collected.has(m))) {
+        this.commitPhase = "install"; // all states gathered
+        this.installed = new Set([this.self]); // we install ourselves last
+        this.sendPropose();
+        this.maybeAdvanceCommit();
+      }
+    } else {
+      const others = this.commitMembers.filter((m) => m !== this.self);
+      if (others.every((m) => this.installed.has(m))) {
+        // every other member installed: install ourselves and seed the token
+        this.applyInstall(this.commitRing, this.commitMembers, [
+          ...this.collected.values()
+        ]);
+        this.ob.tokenRing.seedToken();
+        this.resetCommit();
+        this.clearCommitTimeout();
+      }
+    }
+  }
+
+  /** Member (non-representative): handle the representative's proposal. */
+  private onCommitPropose(msg: CommitProposeMessage): void {
+    this.maxSeenSeq = Math.max(this.maxSeenSeq, msg.ringId.seq);
+    if (msg.originator === this.self) return; // the representative drives its own commit
+
+    // Already installed this ring? Just re-ack — don't disrupt our OPERATIONAL
+    // state on a retransmit meant for a slower peer.
+    if (this.installedRing === ringKey(msg.ringId)) {
+      this.commitRing = msg.ringId;
+      this.sendReply("install");
+      return;
+    }
+
     if (this.state === "OPERATIONAL") this.ob.tokenRing.suspend();
     this.state = "COMMIT";
     this.clearGatherTimers();
-    this.armCommitTimeout();
+    this.commitRing = msg.ringId;
+    this.commitMembers = msg.members;
+    if (this.commitTimer === null) this.armCommitTimeout();
 
-    if (token.phase === "collect") {
-      this.onCollect(token);
+    if (msg.phase === "collect") {
+      this.sendReply("collect", this.myState());
     } else {
-      this.onInstall(token);
+      this.applyInstall(msg.ringId, msg.members, msg.memberStates ?? []);
+      this.installedRing = ringKey(msg.ringId);
+      this.sendReply("install");
     }
   }
 
-  private onCollect(token: CommitTokenMessage): void {
-    if (token.originator === this.self) {
-      if (this.allVisited(token, token.members)) {
-        // collect circuit complete: flip to install and circulate again
-        token.phase = "install";
-        token.visited = [];
-      }
-      this.forward(token);
-      return;
-    }
-    if (!token.visited.includes(this.self)) {
-      token.memberStates.push(this.myState());
-      token.visited.push(this.self);
-    }
-    this.forward(token);
+  private sendReply(phase: "collect" | "install", state?: MemberState): void {
+    if (!this.commitRing) return;
+    const msg: CommitReplyMessage = {
+      kind: "COMMIT_REPLY",
+      ringId: this.commitRing,
+      phase,
+      senderNid: this.self,
+      state
+    };
+    this.transport.sendMulticast(msg);
   }
 
-  private onInstall(token: CommitTokenMessage): void {
-    if (token.originator === this.self) {
-      const others = token.members.filter((m) => m !== this.self);
-      if (others.every((m) => token.visited.includes(m))) {
-        // every other member installed: install ourselves and seed the token
-        this.recoverAndInstall(token);
-        this.ob.tokenRing.seedToken();
-      } else {
-        this.forward(token);
-      }
-      return;
-    }
-    if (!token.visited.includes(this.self)) {
-      this.recoverAndInstall(token);
-      token.visited.push(this.self);
-    }
-    this.forward(token);
-  }
-
-  /** Flush our old ring up to its agreed cut, deliver the view change, install. */
-  private recoverAndInstall(token: CommitTokenMessage): void {
+  /** Flush our old ring up to its agreed cut, install, deliver the view change. */
+  private applyInstall(ringId: RingId, members: Nid[], memberStates: MemberState[]): void {
     const myOld = ringKey(this.currentRing);
-    const arus = token.memberStates
+    const arus = memberStates
       .filter((s) => ringKey(s.oldRing) === myOld)
       .map((s) => s.aru);
     const target = arus.length ? Math.min(...arus) : 0;
 
     this.ob.flushTo(target); // deliver the agreed old-view prefix
     this.ob.resetForNewRing();
-    this.ob.tokenRing.installRing(token.ringId, token.members, false);
+    this.ob.tokenRing.installRing(ringId, members, false);
 
     this.state = "OPERATIONAL";
     this.clearCommitTimeout();
     this.scheduleAnnounce();
 
-    // Notify the app only after the new ring is live, so anything it broadcasts
-    // in response (the allocator's re-claim) queues into the fresh ring rather
-    // than being discarded by resetForNewRing.
-    this.onViewChange({ ringId: token.ringId, members: token.members });
+    // Notify the app only after the new ring is live, so its re-claim queues into
+    // the fresh ring rather than being discarded by resetForNewRing.
+    this.onViewChange({ ringId, members });
   }
 
-  private forward(token: CommitTokenMessage): void {
-    // Do NOT (re)arm the commit timeout here: a non-representative forwards the
-    // install token AFTER it has already installed and gone OPERATIONAL (which
-    // cleared the timer), so arming here left a stray timeout that fired later
-    // and re-triggered GATHER — a self-sustaining re-gather storm. The timeout is
-    // re-armed on every commit-token *receipt* (onCommitToken), which is the
-    // correct freshness signal.
-    this.transport.sendUnicast(token, successorOf(this.self, token.members));
-  }
-
-  private allVisited(token: CommitTokenMessage, members: Nid[]): boolean {
-    return members.every((m) => token.visited.includes(m));
+  private resetCommit(): void {
+    if (this.proposeTimer !== null) {
+      this.clock.clearTimer(this.proposeTimer);
+      this.proposeTimer = null;
+    }
+    this.commitRing = null;
+    this.collected.clear();
+    this.installed.clear();
   }
 
   // ---- timers ----

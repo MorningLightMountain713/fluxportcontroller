@@ -30,7 +30,8 @@ export interface OrderedBroadcastHooks {
   onTokenLost?: () => void;
   onForeignMessage?: TokenRingHooks["onForeignMessage"];
   onJoin?: TokenRingHooks["onJoin"];
-  onCommitToken?: TokenRingHooks["onCommitToken"];
+  onCommitPropose?: TokenRingHooks["onCommitPropose"];
+  onCommitReply?: TokenRingHooks["onCommitReply"];
 }
 
 export interface OrderedBroadcastOptions {
@@ -70,7 +71,8 @@ export class OrderedBroadcast {
         onTokenLost: opts.hooks.onTokenLost,
         onForeignMessage: opts.hooks.onForeignMessage,
         onJoin: opts.hooks.onJoin,
-        onCommitToken: opts.hooks.onCommitToken
+        onCommitPropose: opts.hooks.onCommitPropose,
+        onCommitReply: opts.hooks.onCommitReply
       }
     });
   }

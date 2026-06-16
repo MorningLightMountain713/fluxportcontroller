@@ -27,7 +27,8 @@ import {
   TokenMessage,
   McastMessage,
   JoinMessage,
-  CommitTokenMessage
+  CommitProposeMessage,
+  CommitReplyMessage
 } from "./messages";
 import { sortMembers, successorOf, representativeOf } from "./ring";
 
@@ -57,7 +58,8 @@ export interface TokenRingHooks {
   onMcast?: (msg: McastMessage) => void;
   /** Phase 4 hooks: membership-plane messages (delivered regardless of ring). */
   onJoin?: (msg: JoinMessage, from: string) => void;
-  onCommitToken?: (msg: CommitTokenMessage, from: string) => void;
+  onCommitPropose?: (msg: CommitProposeMessage, from: string) => void;
+  onCommitReply?: (msg: CommitReplyMessage, from: string) => void;
 }
 
 export interface TokenRingOptions {
@@ -179,8 +181,12 @@ export class TokenRing {
       this.hooks.onJoin?.(msg, from);
       return;
     }
-    if (msg.kind === "COMMIT_TOKEN") {
-      this.hooks.onCommitToken?.(msg, from);
+    if (msg.kind === "COMMIT_PROPOSE") {
+      this.hooks.onCommitPropose?.(msg, from);
+      return;
+    }
+    if (msg.kind === "COMMIT_REPLY") {
+      this.hooks.onCommitReply?.(msg, from);
       return;
     }
 

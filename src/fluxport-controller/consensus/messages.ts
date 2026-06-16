@@ -22,7 +22,12 @@ export interface RingId {
   seq: number;
 }
 
-export type MessageKind = "MCAST" | "TOKEN" | "JOIN" | "COMMIT_TOKEN";
+export type MessageKind =
+  | "MCAST"
+  | "TOKEN"
+  | "JOIN"
+  | "COMMIT_PROPOSE"
+  | "COMMIT_REPLY";
 
 interface Envelope {
   kind: MessageKind;
@@ -68,20 +73,27 @@ export interface JoinMessage extends Envelope {
 }
 
 /**
- * Circulated by the representative to commit a new view. Two circuits:
- *  - `collect`: each member appends its old-ring state; when it returns to the
- *    representative, the recovery cut `target` (min aru of surviving old members)
- *    is computed;
- *  - `install`: each member flushes up to `target`, delivers the view change, and
- *    installs the new ring.
+ * Multicast 2-phase commit of a new view, driven by the representative and
+ * retransmitted until every member replies — so no single dropped packet aborts
+ * the commit (unlike a unicast token chain).
+ *  - `collect`: members reply with their old-ring state;
+ *  - `install`: carries the gathered states; members flush, deliver the view
+ *    change, install the new ring, and reply.
  */
-export interface CommitTokenMessage extends Envelope {
-  kind: "COMMIT_TOKEN";
+export interface CommitProposeMessage extends Envelope {
+  kind: "COMMIT_PROPOSE";
   phase: "collect" | "install";
   originator: Nid; // the representative driving this commit
-  members: Nid[]; // committed member set (ring order)
-  memberStates: MemberState[];
-  visited: Nid[]; // members that have processed this circuit (full circuit detector)
+  members: Nid[]; // committed member set
+  memberStates?: MemberState[]; // present in the install phase
+}
+
+/** A member's multicast reply to a COMMIT_PROPOSE (the representative collects). */
+export interface CommitReplyMessage extends Envelope {
+  kind: "COMMIT_REPLY";
+  phase: "collect" | "install";
+  senderNid: Nid;
+  state?: MemberState; // present in a collect reply
 }
 
 export interface MemberState {
@@ -96,13 +108,15 @@ export type ProtocolMessage =
   | McastMessage
   | TokenMessage
   | JoinMessage
-  | CommitTokenMessage;
+  | CommitProposeMessage
+  | CommitReplyMessage;
 
 const KNOWN_KINDS: ReadonlySet<string> = new Set<MessageKind>([
   "MCAST",
   "TOKEN",
   "JOIN",
-  "COMMIT_TOKEN"
+  "COMMIT_PROPOSE",
+  "COMMIT_REPLY"
 ]);
 
 /** Encode one protocol message into a separator-framed datagram buffer. */

@@ -8,7 +8,8 @@ import {
   McastMessage,
   TokenMessage,
   JoinMessage,
-  CommitTokenMessage
+  CommitProposeMessage,
+  CommitReplyMessage
 } from "@/fluxport-controller/consensus/messages";
 
 const ring = { rep: "a:0", seq: 1 };
@@ -39,22 +40,28 @@ const join: JoinMessage = {
   procSet: ["a:0", "b:0"],
   failSet: ["c:0"]
 };
-const commit: CommitTokenMessage = {
-  kind: "COMMIT_TOKEN",
+const propose: CommitProposeMessage = {
+  kind: "COMMIT_PROPOSE",
   ringId: ring,
-  phase: "collect",
+  phase: "install",
   originator: "a:0",
   members: ["a:0", "b:0"],
   memberStates: [
     { nid: "a:0", oldRing: ring, aru: 5 },
     { nid: "b:0", oldRing: ring, aru: 4 }
-  ],
-  visited: ["a:0"]
+  ]
+};
+const reply: CommitReplyMessage = {
+  kind: "COMMIT_REPLY",
+  ringId: ring,
+  phase: "collect",
+  senderNid: "b:0",
+  state: { nid: "b:0", oldRing: ring, aru: 4 }
 };
 
 describe("messages codec", () => {
   it("round-trips every message kind (version injected then stripped)", () => {
-    for (const msg of [mcast, token, join, commit]) {
+    for (const msg of [mcast, token, join, propose, reply]) {
       const decoded = decodeDatagram(encode(msg));
       assert.equal(decoded.length, 1);
       assert.deepEqual(decoded[0], msg);
