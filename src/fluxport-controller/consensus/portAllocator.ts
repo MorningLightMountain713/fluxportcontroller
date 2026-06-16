@@ -92,7 +92,7 @@ export class PortAllocator {
 
   private allocation = new Map<number, Owner>();
   private phase: AllocatorPhase = "JOINING";
-  private myPort: number | null = null;
+  private ownedPort: number | null = null;
   private pendingPort: number | null = null;
   private desiredPort: number | null;
   private lastConfirmed: number | null = null;
@@ -129,7 +129,7 @@ export class PortAllocator {
   }
 
   get port(): number | null {
-    return this.myPort;
+    return this.ownedPort;
   }
   get allocatorPhase(): AllocatorPhase {
     return this.phase;
@@ -153,8 +153,8 @@ export class PortAllocator {
 
   private onViewChange(view: View): void {
     this.allocation.clear();
-    if (this.myPort != null) this.desiredPort = this.myPort; // sticky: keep our port
-    this.myPort = null;
+    if (this.ownedPort != null) this.desiredPort = this.ownedPort; // sticky: keep our port
+    this.ownedPort = null;
     this.pendingPort = null;
     this.phase = "JOINING";
     this.waitingEmitted = false;
@@ -171,10 +171,10 @@ export class PortAllocator {
     // displaced from our owned port by a higher-priority claimant (merge case)
     if (
       this.phase === "OWNED" &&
-      this.myPort != null &&
-      this.allocation.get(this.myPort)?.nid !== this.identity
+      this.ownedPort != null &&
+      this.allocation.get(this.ownedPort)?.nid !== this.identity
     ) {
-      this.myPort = null;
+      this.ownedPort = null;
       this.chooseAndClaim();
       return;
     }
@@ -250,7 +250,7 @@ export class PortAllocator {
   }
 
   private confirm(port: number): void {
-    this.myPort = port;
+    this.ownedPort = port;
     this.desiredPort = port;
     this.pendingPort = null;
     this.phase = "OWNED";
