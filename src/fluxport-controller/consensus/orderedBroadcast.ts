@@ -29,6 +29,8 @@ export interface OrderedBroadcastHooks {
   onDeliver: (payload: unknown, seq: number) => void;
   onTokenLost?: () => void;
   onForeignMessage?: TokenRingHooks["onForeignMessage"];
+  onJoin?: TokenRingHooks["onJoin"];
+  onCommitToken?: TokenRingHooks["onCommitToken"];
 }
 
 export interface OrderedBroadcastOptions {
@@ -49,7 +51,7 @@ export class OrderedBroadcast {
   private readonly sendQueue: unknown[] = [];
   /** Everything we hold (own + received), keyed by seq; serves both delivery and rtr. */
   private readonly have = new Map<number, McastMessage>();
-  private highSeq = 0;
+  private highestSeq = 0;
   private lastDelivered = 0;
 
   constructor(opts: OrderedBroadcastOptions) {
@@ -66,7 +68,9 @@ export class OrderedBroadcast {
         processToken: (token) => this.onToken(token),
         onMcast: (msg) => this.onMcast(msg),
         onTokenLost: opts.hooks.onTokenLost,
-        onForeignMessage: opts.hooks.onForeignMessage
+        onForeignMessage: opts.hooks.onForeignMessage,
+        onJoin: opts.hooks.onJoin,
+        onCommitToken: opts.hooks.onCommitToken
       }
     });
   }
@@ -86,11 +90,40 @@ export class OrderedBroadcast {
     this.sendQueue.push(payload);
   }
 
+  /** Our contiguous received-up-to in the current ring (for recovery commit). */
+  get aru(): number {
+    return this.computeMyAru();
+  }
+
+  /** Highest seq we hold in the current ring (for recovery commit). */
+  get highSeq(): number {
+    return this.highestSeq;
+  }
+
+  /**
+   * Recovery flush: deliver everything up to `target` in order, bypassing the
+   * safe gate. The membership layer sets `target` to the min aru of surviving
+   * old members, so every survivor holds and delivers exactly this prefix —
+   * preserving virtual synchrony across the view change.
+   */
+  flushTo(target: number): void {
+    this.deliverUpTo(target);
+  }
+
+  /** Reset ordering state for a freshly installed ring (seq space restarts at 1). */
+  resetForNewRing(): void {
+    this.have.clear();
+    this.highestSeq = 0;
+    this.lastDelivered = 0;
+    // sendQueue is intentionally kept: undelivered app payloads are re-broadcast
+    // in the new view.
+  }
+
   /** Received an in-ring application multicast: retain it for ordering + rtr service. */
   private onMcast(msg: McastMessage): void {
     if (msg.seq > this.lastDelivered && !this.have.has(msg.seq)) {
       this.have.set(msg.seq, msg);
-      if (msg.seq > this.highSeq) this.highSeq = msg.seq;
+      if (msg.seq > this.highestSeq) this.highestSeq = msg.seq;
     }
   }
 
@@ -130,7 +163,7 @@ export class OrderedBroadcast {
       };
       this.transport.sendMulticast(msg);
       this.have.set(seq, msg); // we deliver our own messages in order too
-      if (seq > this.highSeq) this.highSeq = seq;
+      if (seq > this.highestSeq) this.highestSeq = seq;
       sent += 1;
     }
     token.fcc = sent;

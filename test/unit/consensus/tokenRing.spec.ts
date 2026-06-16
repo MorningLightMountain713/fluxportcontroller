@@ -20,12 +20,14 @@ function makeWorld() {
   const order: string[] = []; // which node received the token, in order
   const lost = new Set<string>();
   const foreign = new Map<string, { msg: any; from: string }[]>();
+  const joins = new Map<string, { msg: any; from: string }[]>();
   const rings = new Map<string, TokenRing>();
   const transports = new Map<string, ReturnType<VirtualNetwork["register"]>>();
 
   const add = (nid: string): TokenRing => {
     const transport = net.register(nid);
     foreign.set(nid, []);
+    joins.set(nid, []);
     const ring = new TokenRing({
       self: nid,
       transport,
@@ -34,7 +36,8 @@ function makeWorld() {
       hooks: {
         onReceiveToken: () => order.push(nid),
         onTokenLost: () => lost.add(nid),
-        onForeignMessage: (msg, from) => foreign.get(nid)!.push({ msg, from })
+        onForeignMessage: (msg, from) => foreign.get(nid)!.push({ msg, from }),
+        onJoin: (msg, from) => joins.get(nid)!.push({ msg, from })
       }
     });
     transport.start();
@@ -44,7 +47,7 @@ function makeWorld() {
     return ring;
   };
 
-  return { net, clock, order, lost, foreign, rings, transports, add };
+  return { net, clock, order, lost, foreign, joins, rings, transports, add };
 }
 
 describe("TokenRing", () => {
@@ -133,7 +136,7 @@ describe("TokenRing", () => {
     assert.ok(w.lost.has("a:0"), "a gives up and declares loss");
   });
 
-  it("flags a message from a foreign ring (the join trigger)", () => {
+  it("routes a JOIN to the membership hook (the join trigger)", () => {
     const w = makeWorld();
     const a = w.add("a:0");
     a.bootstrap();
@@ -144,13 +147,33 @@ describe("TokenRing", () => {
       kind: "JOIN",
       ringId: { rep: "b:0", seq: 1 },
       senderNid: "b:0",
+      gathering: false,
       procSet: ["b:0"],
       failSet: []
     });
 
-    const seen = w.foreign.get("a:0")!;
+    const seen = w.joins.get("a:0")!;
     assert.equal(seen.length, 1);
-    assert.equal(seen[0].msg.kind, "JOIN");
+    assert.equal(seen[0].msg.senderNid, "b:0");
     assert.equal(seen[0].from, "b:0");
+  });
+
+  it("flags foreign data-plane traffic via onForeignMessage", () => {
+    const w = makeWorld();
+    const a = w.add("a:0");
+    a.bootstrap();
+
+    const b = w.net.register("b:0");
+    b.start();
+    b.sendMulticast({
+      kind: "MCAST",
+      ringId: { rep: "b:0", seq: 1 },
+      senderNid: "b:0",
+      seq: 1,
+      payload: "hi"
+    });
+
+    assert.equal(w.foreign.get("a:0")!.length, 1);
+    assert.equal(w.foreign.get("a:0")![0].msg.kind, "MCAST");
   });
 });

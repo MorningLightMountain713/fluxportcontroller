@@ -52,24 +52,44 @@ export interface TokenMessage extends Envelope {
   fcc: number;
 }
 
-/** Membership proposal multicast during GATHER. */
+/**
+ * Membership message. `gathering` distinguishes an active reconfiguration ("I am
+ * gathering — join me") from a steady-state discovery announce ("here is my
+ * view"). procSet is the sender's believed-alive set (informational); candidates
+ * are seeded from JOIN *senders* (proof of life), not procSets, so a crashed
+ * member that still appears in others' announced views is not resurrected.
+ */
 export interface JoinMessage extends Envelope {
   kind: "JOIN";
   senderNid: Nid;
+  gathering: boolean;
   procSet: Nid[];
   failSet: Nid[];
 }
 
-/** Circulated during COMMIT to fix the new ring and collect recovery high-water marks. */
+/**
+ * Circulated by the representative to commit a new view. Two circuits:
+ *  - `collect`: each member appends its old-ring state; when it returns to the
+ *    representative, the recovery cut `target` (min aru of surviving old members)
+ *    is computed;
+ *  - `install`: each member flushes up to `target`, delivers the view change, and
+ *    installs the new ring.
+ */
 export interface CommitTokenMessage extends Envelope {
   kind: "COMMIT_TOKEN";
+  phase: "collect" | "install";
+  originator: Nid; // the representative driving this commit
+  members: Nid[]; // committed member set (ring order)
   memberStates: MemberState[];
+  visited: Nid[]; // members that have processed this circuit (full circuit detector)
 }
 
 export interface MemberState {
   nid: Nid;
+  /** The member's old ring. Flush targets are per-old-ring (merged rings have
+   *  independent seq spaces, so their recovery cuts are computed separately). */
+  oldRing: RingId;
   aru: number;
-  highSeq: number;
 }
 
 export type ProtocolMessage =

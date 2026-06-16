@@ -20,7 +20,15 @@
 
 import { Transport } from "./transport";
 import { Clock, TimerId } from "./clock";
-import { Nid, RingId, ProtocolMessage, TokenMessage, McastMessage } from "./messages";
+import {
+  Nid,
+  RingId,
+  ProtocolMessage,
+  TokenMessage,
+  McastMessage,
+  JoinMessage,
+  CommitTokenMessage
+} from "./messages";
 import { sortMembers, successorOf, representativeOf } from "./ring";
 
 export interface TokenRingConfig {
@@ -47,6 +55,9 @@ export interface TokenRingHooks {
   processToken?: (token: TokenMessage) => void;
   /** Phase 3 hook: an in-ring application multicast was received. */
   onMcast?: (msg: McastMessage) => void;
+  /** Phase 4 hooks: membership-plane messages (delivered regardless of ring). */
+  onJoin?: (msg: JoinMessage, from: string) => void;
+  onCommitToken?: (msg: CommitTokenMessage, from: string) => void;
 }
 
 export interface TokenRingOptions {
@@ -110,6 +121,12 @@ export class TokenRing {
     this.clearTimers();
   }
 
+  /** Stop driving the token (during a membership change) but keep receiving. */
+  suspend(): void {
+    this.holdsToken = false;
+    this.clearTimers();
+  }
+
   /** Bootstrap a one-node ring and originate the token (the production start path). */
   bootstrap(): void {
     this.installRing({ rep: this.self, seq: 1 }, [this.self], true);
@@ -127,6 +144,12 @@ export class TokenRing {
     this.clearTimers();
     this.armLossTimer();
     if (originate) this.originateToken();
+  }
+
+  /** Originate a fresh token on the current ring (representative only). Used by the
+   *  membership layer once a new view's install circuit completes. */
+  seedToken(): void {
+    this.originateToken();
   }
 
   private originateToken(): void {
@@ -147,6 +170,19 @@ export class TokenRing {
 
   private handleMessage(msg: ProtocolMessage, from: string): void {
     if (!this.running) return;
+
+    // Membership-plane messages are delivered regardless of ring — they are how
+    // a new view is formed when rings differ.
+    if (msg.kind === "JOIN") {
+      this.hooks.onJoin?.(msg, from);
+      return;
+    }
+    if (msg.kind === "COMMIT_TOKEN") {
+      this.hooks.onCommitToken?.(msg, from);
+      return;
+    }
+
+    // Data-plane: a foreign ring/sender signals a membership change is needed.
     if (this.isForeign(msg)) {
       this.hooks.onForeignMessage?.(msg, from);
       return;
@@ -156,7 +192,6 @@ export class TokenRing {
     } else if (msg.kind === "MCAST") {
       this.hooks.onMcast?.(msg);
     }
-    // JOIN/COMMIT recovery is Phase 4.
   }
 
   private isForeign(msg: ProtocolMessage): boolean {

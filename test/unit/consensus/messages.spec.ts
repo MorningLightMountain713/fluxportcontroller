@@ -35,16 +35,21 @@ const join: JoinMessage = {
   kind: "JOIN",
   ringId: ring,
   senderNid: "a:0",
+  gathering: true,
   procSet: ["a:0", "b:0"],
   failSet: ["c:0"]
 };
 const commit: CommitTokenMessage = {
   kind: "COMMIT_TOKEN",
   ringId: ring,
+  phase: "collect",
+  originator: "a:0",
+  members: ["a:0", "b:0"],
   memberStates: [
-    { nid: "a:0", aru: 5, highSeq: 7 },
-    { nid: "b:0", aru: 4, highSeq: 7 }
-  ]
+    { nid: "a:0", oldRing: ring, aru: 5 },
+    { nid: "b:0", oldRing: ring, aru: 4 }
+  ],
+  visited: ["a:0"]
 };
 
 describe("messages codec", () => {
