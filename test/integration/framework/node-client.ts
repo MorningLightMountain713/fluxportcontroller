@@ -1,8 +1,16 @@
 /**
  * Pull-based client for one node container. The node serves its consensus state
- * on STATUS_PORT (see test_entrypoint.ts); the harness reaches it through the
- * testcontainers-mapped host port — no static IP needed, because we query the
- * container by its handle rather than by a pre-known address.
+ * on STATUS_PORT (see test_entrypoint.ts); the harness fetches it by exec'ing a
+ * loopback GET INSIDE the container (over Docker's exec API), NOT through a
+ * host-mapped port.
+ *
+ * Why not the mapped host port: on Docker Desktop the host->container
+ * port-forwarder is unreliable — a single container's forward can die for an
+ * entire run, so its status() throws for 90s even though consensus has fully
+ * converged (observed: 4/5 nodes agreeing on a 5-member view while the 5th was
+ * simply unreachable from the host). exec'ing 127.0.0.1 inside the container
+ * routes around that layer entirely while still doing a real HTTP GET of the
+ * real status endpoint.
  */
 import type { StartedTestContainer } from "testcontainers";
 
@@ -20,34 +28,63 @@ export interface NodeStatus {
 export class NodeClient {
   constructor(
     readonly container: StartedTestContainer,
-    private readonly statusPort: number
+    private readonly statusPort: number,
+    /**
+     * The TX_HASH the harness started this container with. The node's claim
+     * identity is `${txHash}:0` (OUT_IDX defaults to 0), so a chaos test can
+     * predict a node's nid without a status round-trip and can re-launch a
+     * crashed node under the SAME identity (see ConsensusEnv.addNode).
+     */
+    readonly txHash?: string
   ) {}
 
   get name(): string {
     return this.container.getName();
   }
 
-  /** Fetch the node's current consensus state. */
+  /** The claim identity this node will report (`${txHash}:0`). */
+  get expectedNid(): string | undefined {
+    return this.txHash != null ? `${this.txHash}:0` : undefined;
+  }
+
+  /** Fetch the node's current consensus state (loopback GET inside the container). */
   async status(): Promise<NodeStatus> {
-    const host = this.container.getHost();
-    const port = this.container.getMappedPort(this.statusPort);
-    const res = await fetch(`http://${host}:${port}/`, {
-      signal: AbortSignal.timeout(3000)
-    });
-    if (!res.ok) throw new Error(`status ${res.status} from ${this.name}`);
-    return (await res.json()) as NodeStatus;
+    const script =
+      `fetch('http://127.0.0.1:${this.statusPort}/',{signal:AbortSignal.timeout(3000)})` +
+      `.then(r=>r.text()).then(t=>process.stdout.write(t))` +
+      `.catch(e=>{process.stderr.write(String(e&&e.message||e));process.exit(1)})`;
+    const res = await this.container.exec(["node", "--no-warnings", "-e", script]);
+    if (res.exitCode !== 0) {
+      throw new Error(
+        `status fetch failed on ${this.name} (exit ${res.exitCode}): ${res.stderr || res.output}`
+      );
+    }
+    return JSON.parse(res.stdout) as NodeStatus;
   }
 
   /** Recent container logs (for diagnosing a failed convergence). */
   async tailLogs(lines = 40): Promise<string> {
-    const stream = await this.container.logs();
     const chunks: string[] = [];
-    return new Promise((resolve) => {
-      stream.on("data", (c) => chunks.push(c.toString()));
-      stream.on("end", () =>
-        resolve(chunks.join("").trimEnd().split("\n").slice(-lines).join("\n"))
-      );
-      stream.on("err", () => resolve(chunks.join("")));
-    });
+    try {
+      const stream = await this.container.logs();
+      return await new Promise<string>((resolve) => {
+        const finish = (): void =>
+          resolve(
+            chunks.join("").trimEnd().split("\n").slice(-lines).join("\n")
+          );
+        // Bound the read so a never-ending stream can't hang (or, via an
+        // unhandled 'error', crash) the diagnostic and swallow the dump.
+        const timer = setTimeout(finish, 5000);
+        const done = (): void => {
+          clearTimeout(timer);
+          finish();
+        };
+        stream.on("data", (c) => chunks.push(c.toString()));
+        stream.on("end", done);
+        stream.on("error", done);
+      });
+    } catch (err) {
+      return `<failed to read logs: ${(err as Error).message}>`;
+    }
   }
 }

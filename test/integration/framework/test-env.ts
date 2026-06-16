@@ -5,16 +5,26 @@
  * simpler: this system needs NO static IPs. FluxOS fixes node IPs because IP is
  * identity there (deterministic list, IP-based peer dialing); here peers are
  * found via multicast, claim identity is the nid (not the IP), the node list is
- * stubbed, and the harness reaches each node through its testcontainers handle.
- * So all we need is ONE shared bridge network (so multicast frames cross) with
- * ordinary dynamic IPs.
+ * stubbed, and the harness reaches each node over the Docker exec/logs API rather
+ * than by address. So all we need is ONE shared bridge network (so multicast
+ * frames cross) with ordinary dynamic IPs.
  *
  * It builds the node image once, starts a miniupnpd "router" (so the real UPnP
  * localAddress-discovery + multicast-bind path runs) and N node containers on the
  * network, then verifies convergence by PULLING each node's status endpoint.
+ *
+ * Beyond the convergence gate, the env exposes chaos primitives (kill / rejoin /
+ * partition / heal / loss). Partition and loss are both done with iptables INSIDE
+ * each container (so they need NET_ADMIN + iptables in the image), which leaves
+ * each container's IP untouched. That is deliberate: the multicast
+ * socket binds to the UPnP-discovered LAN IP at startup and is not re-discovered
+ * (see transport.ts), so a Docker-level network disconnect/reconnect would change
+ * the IP out from under that binding and silently break multicast — which is also
+ * not how a real partition behaves. Dropping packets by peer source-IP keeps the
+ * IP stable and is the faithful simulation of a partition / lossy link.
  */
 import { GenericContainer, Network, Wait } from "testcontainers";
-import type { StartedTestContainer } from "testcontainers";
+import type { StartedNetwork, StartedTestContainer } from "testcontainers";
 import { NodeClient, NodeStatus } from "./node-client";
 
 // `npm run inttest` runs from the package root, so the Docker build context (which
@@ -38,8 +48,61 @@ function buildImage(): Promise<unknown> {
   ));
 }
 
+// One node container (unstarted), wired for the harness. NET_ADMIN lets the chaos
+// helpers run iptables/tc in the container's own network namespace; it's inert
+// for the plain convergence gate.
+function nodeContainer(network: StartedNetwork, txHash: string): GenericContainer {
+  return (
+    new GenericContainer(IMAGE)
+      .withNetwork(network)
+      .withAddedCapabilities("NET_ADMIN")
+      .withEnvironment({
+        HARNESS: "1",
+        MULTICAST_GROUP,
+        PORT: String(CONSENSUS_PORT),
+        STATUS_PORT: String(STATUS_PORT),
+        TX_HASH: txHash
+      })
+      .withLabels(LABELS)
+      // Gate start on the listening-log line (a Docker-API signal). We don't map
+      // the status port to the host at all: both the start gate (this log line)
+      // and the verification (NodeClient.status execs a loopback GET inside the
+      // container) go through the Docker API, never the host port-forwarder —
+      // which on Docker Desktop is the unreliable layer (a forward can die for a
+      // whole run). The real HTTP check is not lost; it just doesn't traverse the
+      // host boundary.
+      .withWaitStrategy(Wait.forLogMessage(/status endpoint on/))
+  );
+}
+
 export interface ConsensusEnv {
+  /** Live nodes (a killed node is removed; a rejoined node is appended). */
   nodes: NodeClient[];
+  /**
+   * Launch one more node under a chosen TX_HASH (its nid becomes `${txHash}:0`).
+   * Pass a crashed node's TX_HASH to rejoin under the SAME identity.
+   */
+  addNode(txHash: string): Promise<NodeClient>;
+  /** Crash a node (stop its container) and drop it from `nodes`. */
+  kill(node: NodeClient): Promise<void>;
+  /**
+   * Sever all traffic between two groups: in each node's own netns, DROP every
+   * packet whose source is a node on the other side. This blocks the multicast
+   * data/discovery plane (datagrams carry the sender's unicast source IP) AND
+   * unicast token passing, in both directions, while leaving IPs untouched.
+   */
+  partition(groupA: NodeClient[], groupB: NodeClient[]): Promise<void>;
+  /** Remove every partition rule (flush the INPUT chain on all live nodes). */
+  heal(): Promise<void>;
+  /**
+   * Drop a random `lossPct`% of each target's INBOUND packets (iptables
+   * `statistic` match). This is per-recipient loss — the same model as the
+   * in-memory dropPredicate sweep — applied to real sockets. (tc/netem isn't an
+   * option: Docker Desktop's kernel has no sch_netem.)
+   */
+  injectLoss(targets: NodeClient[], lossPct: number): Promise<void>;
+  /** Remove injected loss on each target (flush its INPUT chain). */
+  clearLoss(targets: NodeClient[]): Promise<void>;
   teardown(): Promise<void>;
 }
 
@@ -48,11 +111,35 @@ export async function createConsensusEnv(opts: {
 }): Promise<ConsensusEnv> {
   await buildImage();
   const network = await new Network().start();
+  const networkName = network.getName();
   const started: StartedTestContainer[] = [];
+  const nodes: NodeClient[] = [];
 
   const teardown = async (): Promise<void> => {
     for (const c of [...started].reverse()) await c.stop().catch(() => {});
     await network.stop().catch(() => {});
+  };
+
+  // Run a shell command inside a node's container; throw on a non-zero exit so a
+  // mis-applied chaos rule fails the test loudly instead of silently no-op'ing.
+  const exec = async (node: NodeClient, cmd: string): Promise<void> => {
+    const res = await node.container.exec(["sh", "-c", cmd]);
+    if (res.exitCode !== 0) {
+      throw new Error(
+        `exec failed on ${node.name} (exit ${res.exitCode}): ${cmd}\n${res.output}`
+      );
+    }
+  };
+
+  const ipOf = (node: NodeClient): string =>
+    node.container.getIpAddress(networkName);
+
+  const startNode = async (txHash: string): Promise<NodeClient> => {
+    const c = await nodeContainer(network, txHash).start();
+    started.push(c);
+    const client = new NodeClient(c, STATUS_PORT, txHash);
+    nodes.push(client);
+    return client;
   };
 
   try {
@@ -69,36 +156,55 @@ export async function createConsensusEnv(opts: {
       .start();
     started.push(miniupnpd);
 
-    // Start nodes concurrently; each is tracked the instant it starts so a
+    // Start nodes concurrently; startNode tracks each the instant it starts so a
     // partial-failure teardown still stops everything already up.
-    const nodes = await Promise.all(
-      Array.from({ length: opts.nodes }, (_, i) =>
-        new GenericContainer(IMAGE)
-          .withNetwork(network)
-          .withExposedPorts(STATUS_PORT)
-          .withEnvironment({
-            HARNESS: "1",
-            MULTICAST_GROUP,
-            PORT: String(CONSENSUS_PORT),
-            STATUS_PORT: String(STATUS_PORT),
-            TX_HASH: `node-${i + 1}`
-          })
-          .withLabels(LABELS)
-          // Gate start on the listening-log line (a Docker-API signal), NOT
-          // Wait.forHttp: at N=8, forHttp's host-side probe races the concurrent
-          // port-forward setup on Docker Desktop and times out — even though the
-          // endpoint is listening in ~1s and host-reachable in ~1s (measured).
-          // The real HTTP check is not skipped: waitForConvergence GETs each
-          // node's status endpoint once all containers are up.
-          .withWaitStrategy(Wait.forLogMessage(/status endpoint on/))
-          .start()
-          .then((c) => {
-            started.push(c);
-            return new NodeClient(c, STATUS_PORT);
-          })
-      )
+    await Promise.all(
+      Array.from({ length: opts.nodes }, (_, i) => startNode(`node-${i + 1}`))
     );
-    return { nodes, teardown };
+
+    return {
+      nodes,
+      addNode: startNode,
+      async kill(node: NodeClient): Promise<void> {
+        await node.container.stop().catch(() => {});
+        const idx = nodes.indexOf(node);
+        if (idx >= 0) nodes.splice(idx, 1);
+      },
+      async partition(
+        groupA: NodeClient[],
+        groupB: NodeClient[]
+      ): Promise<void> {
+        const aIps = groupA.map(ipOf);
+        const bIps = groupB.map(ipOf);
+        const dropRules = (peerIps: string[]): string =>
+          peerIps.map((ip) => `iptables -A INPUT -s ${ip} -j DROP`).join(" && ");
+        await Promise.all([
+          ...groupA.map((n) => exec(n, dropRules(bIps))),
+          ...groupB.map((n) => exec(n, dropRules(aIps)))
+        ]);
+      },
+      async heal(): Promise<void> {
+        await Promise.all(nodes.map((n) => exec(n, "iptables -F INPUT")));
+      },
+      async injectLoss(
+        targets: NodeClient[],
+        lossPct: number
+      ): Promise<void> {
+        const probability = (lossPct / 100).toFixed(4);
+        await Promise.all(
+          targets.map((n) =>
+            exec(
+              n,
+              `iptables -A INPUT -m statistic --mode random --probability ${probability} -j DROP`
+            )
+          )
+        );
+      },
+      async clearLoss(targets: NodeClient[]): Promise<void> {
+        await Promise.all(targets.map((n) => exec(n, "iptables -F INPUT")));
+      },
+      teardown
+    };
   } catch (err) {
     await teardown();
     throw err;
@@ -127,7 +233,13 @@ export async function waitForConvergence(
       const allAssigned = ports.every((p) => typeof p === "number");
       const distinct = new Set(ports).size === expected;
       const oneView = views[0] != null && new Set(views).size === 1;
-      if (allAssigned && distinct && oneView) return ok;
+      // Membership must also have settled to exactly `expected` members. This is
+      // what distinguishes a real converged state from a STALE one: right after a
+      // partition, each side still reports the old (larger) view — distinct ports
+      // and one shared view both hold on that stale snapshot, so without this
+      // check waitForConvergence would return before the split actually manifests.
+      const fullMembers = ok.every((s) => s.members.length === expected);
+      if (allAssigned && distinct && oneView && fullMembers) return ok;
     }
     await new Promise((r) => setTimeout(r, intervalMs));
   }

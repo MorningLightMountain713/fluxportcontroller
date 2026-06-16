@@ -6,6 +6,16 @@ FROM node:20-bookworm-slim
 
 WORKDIR /app
 
+# Chaos tooling for the integration harness, run in each container's own netns via
+# NET_ADMIN: iptables does both partition (DROP by peer source-IP) and packet loss
+# (the `statistic` match). The legacy backend is selected because the nft backend
+# is unreliable inside containers; tc/netem isn't used (Docker Desktop's kernel has
+# no sch_netem). Harness image only — never shipped.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends iptables \
+ && update-alternatives --set iptables /usr/sbin/iptables-legacy \
+ && rm -rf /var/lib/apt/lists/*
+
 COPY package.json tsconfig.json ./
 COPY src ./src
 COPY test_entrypoint.ts ./
