@@ -19,6 +19,7 @@ import { ProtocolMessage, decodeDatagram, encode } from "./messages";
 import { Clock } from "./clock";
 
 export type MessageHandler = (msg: ProtocolMessage, from: string) => void;
+export type ErrorHandler = (err: NodeJS.ErrnoException) => void;
 
 export interface Transport {
   readonly localAddress: string;
@@ -27,6 +28,13 @@ export interface Transport {
   sendMulticast(msg: ProtocolMessage): void;
   sendUnicast(msg: ProtocolMessage, to: string): void;
   onMessage(handler: MessageHandler): void;
+  /**
+   * A post-start socket error (e.g. EADDRNOTAVAIL after the bound interface's IP
+   * changes). The transport binds multicast to a fixed local address, so it
+   * cannot recover on its own — the owner re-discovers and rebuilds. Without a
+   * handler a post-start 'error' would be an unhandled exception.
+   */
+  onError(handler: ErrorHandler): void;
 }
 
 export interface MulticastTransportOptions {
@@ -42,6 +50,7 @@ export class MulticastTransport implements Transport {
   private readonly port: number;
   private socket: dgram.Socket | null = null;
   private handler: MessageHandler = () => {};
+  private errorHandler: ErrorHandler = () => {};
 
   constructor(opts: MulticastTransportOptions) {
     this.localAddress = opts.localAddress;
@@ -51,6 +60,10 @@ export class MulticastTransport implements Transport {
 
   onMessage(handler: MessageHandler): void {
     this.handler = handler;
+  }
+
+  onError(handler: ErrorHandler): void {
+    this.errorHandler = handler;
   }
 
   start(): Promise<void> {
@@ -71,6 +84,10 @@ export class MulticastTransport implements Transport {
           // we self-deliver in the protocol layer; don't also receive our own multicast
           socket.setMulticastLoopback(false);
           socket.removeListener("error", reject);
+          // Swap the bind-time rejecter for a lifelong handler: a later error
+          // (e.g. the bound interface's IP changing under us) is surfaced to the
+          // owner to rebuild, not thrown as an unhandled exception.
+          socket.on("error", (err: NodeJS.ErrnoException) => this.errorHandler(err));
           resolve();
         } catch (err) {
           reject(err instanceof Error ? err : new Error(String(err)));
@@ -212,6 +229,7 @@ export class VirtualNetwork {
 
 export class VirtualTransport implements Transport {
   private handler: MessageHandler = () => {};
+  private errorHandler: ErrorHandler = () => {};
   private running = false;
 
   constructor(
@@ -221,6 +239,15 @@ export class VirtualTransport implements Transport {
 
   onMessage(handler: MessageHandler): void {
     this.handler = handler;
+  }
+
+  onError(handler: ErrorHandler): void {
+    this.errorHandler = handler;
+  }
+
+  /** Test seam: simulate a post-start socket error on this endpoint. */
+  failWith(err: NodeJS.ErrnoException): void {
+    this.errorHandler(err);
   }
 
   start(): Promise<void> {

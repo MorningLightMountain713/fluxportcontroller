@@ -13,7 +13,20 @@
  *    outpoint identity.
  *
  * Emits `routerIpConfirmed`, `portConfirmed(port)`, `noPortAvailable`,
- * `startError`. FluxOS just constructs it and listens — nothing to persist.
+ * `startError`, and `rebound({from,to})`. FluxOS just constructs it and listens —
+ * nothing to persist.
+ *
+ * Self-heal on a live IP change: the multicast socket binds to the
+ * UPnP-discovered LAN IP and cannot recover if that IP changes under it (the
+ * kernel drops the group membership → the node goes deaf). Two event-driven
+ * signals trigger a heal — a transport socket error (the fast path, e.g. a send
+ * raising EADDRNOTAVAIL) and the consensus collapsing to a singleton view (the
+ * reliable path: a deaf node still reforms a one-member ring). A heal re-resolves
+ * the local address and, only if it changed, rebuilds the transport + allocator
+ * with the new address; the claim identity (nid) is unchanged, so the node
+ * rejoins and reclaims its port (the proven address-change / same-nid path). The
+ * re-resolve is a no-op if the address is unchanged, so a transient or a
+ * genuinely-lone node costs nothing.
  *
  * Every external dependency is injectable so the whole flow is testable over the
  * in-memory virtual network with no sockets, UPnP, or HTTP.
@@ -27,6 +40,7 @@ import { Client as RealUpnpClient } from "@megachips/nat-upnp";
 import { Clock, SystemClock } from "./consensus/clock";
 import { Transport, MulticastTransport } from "./consensus/transport";
 import { PortAllocator } from "./consensus/portAllocator";
+import { View } from "./consensus/membership";
 import { logController } from "./log";
 
 const logger = logController.getLogger();
@@ -113,6 +127,13 @@ export interface FluxPortManagerOptions extends Partial<Timing> {
   ) => Transport;
   resolveNodeInfo?: (publicIp: string, outPoint: OutPoint) => Promise<NodeInfo>;
   getPublicIp?: () => Promise<string>;
+  /**
+   * Re-resolve this node's LAN address (used by the self-heal path). Must perform
+   * a FRESH lookup each call — the default re-runs UPnP discovery (the client is
+   * created with cacheGateway:false, since getLocalAddress is memoized per
+   * gateway, so a cached gateway would return the stale pre-change address).
+   */
+  resolveLocalAddress?: () => Promise<string>;
 }
 
 export class FluxPortManager extends EventEmitter {
@@ -134,9 +155,18 @@ export class FluxPortManager extends EventEmitter {
     outPoint: OutPoint
   ) => Promise<NodeInfo>;
   private readonly getPublicIp: () => Promise<string>;
+  private readonly resolveLocalAddress: () => Promise<string>;
 
   private transport: Transport | null = null;
   private allocator: PortAllocator | null = null;
+
+  // self-heal state
+  private localAddress: string | null = null; // the LAN IP currently bound
+  private cachedPriority = Number.MAX_SAFE_INTEGER;
+  private lastConfirmedPort: number | null = null; // for reclaim across a rebind
+  private lastMemberCount = 0; // to detect a multi -> singleton collapse
+  private healing = false;
+  private stopped = false;
 
   constructor(outPoint: OutPoint, options: FluxPortManagerOptions = {}) {
     super();
@@ -158,8 +188,10 @@ export class FluxPortManager extends EventEmitter {
       commitTimeout: options.commitTimeout ?? DEFAULT_TIMING.commitTimeout
     };
     this.clock = options.clock ?? new SystemClock();
+    // cacheGateway:false so a heal's re-resolve gets a FRESH gateway (and thus a
+    // fresh, non-memoized getLocalAddress) rather than the stale pre-change one.
     this.upnpClient =
-      options.upnpClient ?? new RealUpnpClient({ cacheGateway: true });
+      options.upnpClient ?? new RealUpnpClient({ cacheGateway: false });
     this.createTransport =
       options.createTransport ??
       ((localAddress, group, port) =>
@@ -167,6 +199,9 @@ export class FluxPortManager extends EventEmitter {
     this.resolveNodeInfo =
       options.resolveNodeInfo ?? ((ip, op) => this.fetchNodeInfo(ip, op));
     this.getPublicIp = options.getPublicIp ?? (() => this.fetchPublicIp());
+    this.resolveLocalAddress =
+      options.resolveLocalAddress ??
+      (async () => (await this.upnpClient.getGateway()).getLocalAddress());
   }
 
   get nid(): string {
@@ -184,6 +219,7 @@ export class FluxPortManager extends EventEmitter {
 
   async start(): Promise<boolean> {
     try {
+      this.stopped = false;
       const publicIp = await this.getPublicIp();
 
       const gateway = await this.upnpClient.getGateway();
@@ -204,36 +240,12 @@ export class FluxPortManager extends EventEmitter {
       }
 
       const info = await this.resolveNodeInfo(publicIp, this.outPoint);
+      this.cachedPriority = info.priority;
       logger.info(
         `Node info: priorPort=${info.priorPort}, priority=${info.priority}`
       );
 
-      const transport = this.createTransport(
-        localAddress,
-        this.multicastGroup,
-        this.port
-      );
-      this.transport = transport;
-      this.allocator = new PortAllocator({
-        self: localAddress,
-        transport,
-        clock: this.clock,
-        config: {
-          ...this.timing,
-          ports: this.ports,
-          identity: this.nid,
-          priority: info.priority,
-          priorPort: info.priorPort
-        },
-        hooks: {
-          onPortConfirmed: (port) => this.emit("portConfirmed", port),
-          onWaiting: () => this.emit("noPortAvailable")
-        }
-      });
-
-      await transport.start();
-      this.allocator.start();
-      this.allocator.bootstrap();
+      await this.buildAndStart(localAddress, info.priorPort);
       return true;
     } catch (err) {
       logger.warn(`Error starting FluxPortManager: ${err}`);
@@ -243,6 +255,7 @@ export class FluxPortManager extends EventEmitter {
   }
 
   stop(): void {
+    this.stopped = true;
     this.allocator?.stop();
     this.transport?.stop();
     try {
@@ -250,6 +263,105 @@ export class FluxPortManager extends EventEmitter {
     } catch {
       // already closed
     }
+  }
+
+  // ---- transport + allocator construction (shared by start and heal) ----
+
+  private async buildAndStart(
+    localAddress: string,
+    priorPort: number | null
+  ): Promise<void> {
+    this.localAddress = localAddress;
+    // The imminent bootstrap installs a singleton view; reset so it isn't read as
+    // a multi -> singleton collapse (which would re-trigger a heal).
+    this.lastMemberCount = 1;
+
+    const transport = this.createTransport(
+      localAddress,
+      this.multicastGroup,
+      this.port
+    );
+    transport.onError((err) => this.onTransportError(err));
+    this.transport = transport;
+    this.allocator = new PortAllocator({
+      self: localAddress,
+      transport,
+      clock: this.clock,
+      config: {
+        ...this.timing,
+        ports: this.ports,
+        identity: this.nid,
+        priority: this.cachedPriority,
+        priorPort
+      },
+      hooks: {
+        onPortConfirmed: (port) => {
+          this.lastConfirmedPort = port;
+          this.emit("portConfirmed", port);
+        },
+        onWaiting: () => this.emit("noPortAvailable"),
+        onViewChange: (view) => this.onViewChange(view)
+      }
+    });
+
+    await transport.start();
+    this.allocator.start();
+    this.allocator.bootstrap();
+  }
+
+  // ---- self-heal on a live IP change ----
+
+  /** Reliable detector: a collapse to a one-member view means we've gone deaf. */
+  private onViewChange(view: View): void {
+    const wasMulti = this.lastMemberCount > 1;
+    this.lastMemberCount = view.members.length;
+    if (view.members.length === 1 && wasMulti) {
+      this.triggerHeal("isolated");
+    }
+  }
+
+  /** Fast detector: a post-start socket error (e.g. our bound IP vanished). */
+  private onTransportError(err: NodeJS.ErrnoException): void {
+    logger.warn(`Transport error (${err.code ?? err.message}); re-validating address`);
+    this.triggerHeal(`transport:${err.code ?? "error"}`);
+  }
+
+  private triggerHeal(reason: string): void {
+    if (this.stopped || this.healing) return;
+    this.healing = true;
+    void this.heal(reason).finally(() => {
+      this.healing = false;
+    });
+  }
+
+  /**
+   * Re-resolve our LAN address; if it changed, rebuild the transport + allocator
+   * on the new address (same nid) so we rejoin and reclaim our port. A no-op when
+   * the address is unchanged (transient blip / genuinely lone node).
+   */
+  private async heal(reason: string): Promise<void> {
+    let newAddress: string;
+    try {
+      newAddress = await this.resolveLocalAddress();
+    } catch (err) {
+      logger.warn(`Heal (${reason}) address re-resolve failed: ${err}`);
+      return;
+    }
+    if (this.stopped) return;
+    if (!newAddress || newAddress === this.localAddress) return; // nothing changed
+
+    const from = this.localAddress;
+    // Reclaim the same port on the new address. assignedPort is transiently null
+    // if the heal fired mid view-change (the isolation path), so fall back to the
+    // last confirmed port.
+    const heldPort = this.assignedPort ?? this.lastConfirmedPort;
+    logger.info(
+      `Heal (${reason}): local address ${from} -> ${newAddress}; rebinding (port ${heldPort})`
+    );
+    this.allocator?.stop();
+    this.transport?.stop();
+    await this.buildAndStart(newAddress, heldPort);
+    this.emit("rebound", { from, to: newAddress });
   }
 
   // ---- default real-world resolvers (injectable above) ----
