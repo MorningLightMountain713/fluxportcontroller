@@ -237,3 +237,87 @@ describe("handler tests", () => {
     assert.deepStrictEqual(emitCall.arguments, ["peerRejected", peer]);
   });
 });
+
+describe("TwoWayMap (via transitions)", () => {
+  let server: FluxEchoServer;
+  beforeEach(() => (server = new FluxEchoServer()));
+  afterEach(() => server.stop());
+
+  it("addTransition stores an entry reachable by key and by value", () => {
+    // addTransition(from, to) stores set(to, from)
+    server.addTransition("from-host", "to-host");
+    assert.strictEqual(server.transitions.get("to-host"), "from-host");
+    assert.strictEqual(server.transitions.getByValue("from-host"), "to-host");
+  });
+
+  it("delete removes both the forward and reverse mappings", () => {
+    server.transitions.set("k", "v");
+    assert.strictEqual(server.transitions.getByValue("v"), "k");
+
+    assert.strictEqual(server.transitions.delete("k"), true);
+    assert.strictEqual(server.transitions.get("k"), undefined);
+    assert.strictEqual(server.transitions.getByValue("v"), undefined);
+  });
+
+  it("deleteByValue removes the entry keyed by its value", () => {
+    server.transitions.set("k", "v");
+
+    assert.strictEqual(server.transitions.deleteByValue("v"), true);
+    assert.strictEqual(server.transitions.get("k"), undefined);
+    assert.strictEqual(server.transitions.getByValue("v"), undefined);
+  });
+
+  it("deleteByValue returns false for an unknown value", () => {
+    server.transitions.set("k", "v");
+    assert.strictEqual(server.transitions.deleteByValue("missing"), false);
+    // the existing entry is untouched
+    assert.strictEqual(server.transitions.get("k"), "v");
+  });
+});
+
+describe("peer tracking", () => {
+  let server: FluxEchoServer;
+  beforeEach(() => (server = new FluxEchoServer()));
+  afterEach(() => server.stop());
+
+  it("sorts inbound and outbound peer addresses numerically", () => {
+    server.addPeer("10.0.0.10", Dir.OUTBOUND, { connect: false });
+    server.addPeer("10.0.0.2", Dir.OUTBOUND, { connect: false });
+    server.addPeer("2.2.2.20", Dir.INBOUND);
+    server.addPeer("2.2.2.3", Dir.INBOUND);
+
+    assert.deepEqual(server.outboundPeerAddresses, ["10.0.0.2", "10.0.0.10"]);
+    assert.deepEqual(server.inboundPeerAddresses, ["2.2.2.3", "2.2.2.20"]);
+    assert.strictEqual(server.outboundPeerCount, 2);
+    assert.strictEqual(server.inboundPeerCount, 2);
+    assert.strictEqual(server.peerCount, 4);
+  });
+
+  it("peerAddresses de-duplicates a host that is both inbound and outbound", () => {
+    server.addPeer("5.5.5.5", Dir.OUTBOUND, { connect: false });
+    server.addPeer("5.5.5.5", Dir.INBOUND);
+    assert.deepEqual(server.peerAddresses, ["5.5.5.5"]);
+  });
+
+  it("peerAvailable is true only for a known outbound peer with no missed pings", () => {
+    server.addPeer("3.3.3.3", Dir.OUTBOUND, { connect: false });
+    assert.strictEqual(server.peerAvailable("3.3.3.3"), true);
+
+    server.outbound["3.3.3.3"].missedPingCount = 1;
+    assert.strictEqual(server.peerAvailable("3.3.3.3"), false);
+
+    assert.ok(!server.peerAvailable("9.9.9.9"));
+  });
+
+  it("removePeer clears an outbound peer and emits peerRemoved (OUTBOUND)", (t) => {
+    server.addPeer("4.4.4.4", Dir.OUTBOUND, { connect: false });
+    server.emit = t.mock.fn();
+
+    server.removePeer("4.4.4.4");
+
+    assert.deepEqual(server.outbound, {});
+    assert.strictEqual((server.emit as any).mock.calls.length, 1);
+    const emitCall = (server.emit as any).mock.calls[0];
+    assert.deepStrictEqual(emitCall.arguments, ["peerRemoved", "4.4.4.4", Dir.OUTBOUND]);
+  });
+});
