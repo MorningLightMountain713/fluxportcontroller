@@ -30,7 +30,7 @@ function makeWorld(ports: number[]) {
 
   const add = (
     nid: string,
-    opts: { priorPort?: number | null; incarnation?: number } = {}
+    opts: { priorPort?: number | null; priority?: number } = {}
   ): PortAllocator => {
     const transport = net.register(nid);
     confirmed.set(nid, null);
@@ -38,7 +38,7 @@ function makeWorld(ports: number[]) {
     const config: PortAllocatorConfig = {
       ...TIMING,
       ports,
-      incarnation: opts.incarnation ?? 1,
+      priority: opts.priority ?? 1,
       priorPort: opts.priorPort ?? null
     };
     const a = new PortAllocator({

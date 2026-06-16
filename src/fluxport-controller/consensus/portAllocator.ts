@@ -6,15 +6,19 @@
  * every member delivers the same messages in the same order, every member
  * computes the same `allocation` — no votes, no negotiation.
  *
- * Per port the winner is the highest-priority claimant: older incarnation first,
- * then lower nid. Applying claims by that rule is order-independent, so the
- * outcome is identical on every node regardless of delivery interleaving.
+ * Identity vs address: the consensus ring is keyed by transport address (the LAN
+ * IP the token is unicast to), but claim ownership is keyed by a stable `identity`
+ * (the Fluxnode outpoint), so a node keeps its port across an IP change. `priority`
+ * is the node's deterministic-list `confirmed_height` (globally known, stable
+ * across restarts) — lower (older/more-established) wins a contested port, ties by
+ * identity. Applying claims by that rule is order-independent, so the outcome is
+ * identical on every node regardless of delivery interleaving.
  *
  * On a view change the ordered log restarts (new ring), so each node re-asserts
- * its held port (sticky preference ⇒ owners keep their port and don't churn);
- * a crashed member's port is simply not re-claimed and becomes free; conflicts
- * from a merge are resolved by the same priority rule. With more members than
- * ports, the unlucky ones go WAITING and claim the instant a port frees.
+ * its held port (sticky preference ⇒ owners keep their port, no churn); a crashed
+ * member's port is simply not re-claimed and becomes free; merge conflicts resolve
+ * by the priority rule; more members than ports ⇒ WAITING, claiming the instant a
+ * port frees.
  */
 
 import { Transport } from "./transport";
@@ -26,9 +30,9 @@ export type AllocatorPhase = "JOINING" | "CLAIMING" | "OWNED" | "WAITING";
 
 interface ClaimPayload {
   type: "CLAIM";
-  nid: Nid;
+  nid: Nid; // owner identity (outpoint), not the transport address
   port: number;
-  inc: number;
+  priority: number;
 }
 interface ReleasePayload {
   type: "RELEASE";
@@ -39,15 +43,18 @@ type AllocPayload = ClaimPayload | ReleasePayload;
 
 interface Owner {
   nid: Nid;
-  inc: number;
+  priority: number;
 }
 
 export interface PortAllocatorConfig extends MembershipConfig {
   ports: number[];
-  incarnation: number;
+  /** Owner identity for claims (outpoint). Defaults to `self` when omitted. */
+  identity?: Nid;
+  /** Conflict priority — lower wins (use deterministic-list confirmed_height). */
+  priority: number;
   priorPort?: number | null;
   /** Deterministic preference hash; identical on every node. */
-  hash?: (nid: Nid, port: number) => number;
+  hash?: (id: Nid, port: number) => number;
 }
 
 export interface PortAllocatorHooks {
@@ -57,16 +64,16 @@ export interface PortAllocatorHooks {
 }
 
 export interface PortAllocatorOptions {
-  self: Nid;
+  self: Nid; // transport address (ring identity)
   transport: Transport;
   clock: Clock;
   config: PortAllocatorConfig;
   hooks?: PortAllocatorHooks;
 }
 
-function fnv1a(nid: Nid, port: number): number {
+function fnv1a(id: Nid, port: number): number {
   let h = 2166136261;
-  const s = `${nid}:${port}`;
+  const s = `${id}:${port}`;
   for (let i = 0; i < s.length; i++) {
     h ^= s.charCodeAt(i);
     h = Math.imul(h, 16777619);
@@ -76,10 +83,11 @@ function fnv1a(nid: Nid, port: number): number {
 
 export class PortAllocator {
   readonly self: Nid;
+  readonly identity: Nid;
   private readonly membership: Membership;
   private readonly ports: number[];
-  private readonly inc: number;
-  private readonly hash: (nid: Nid, port: number) => number;
+  private readonly priority: number;
+  private readonly hash: (id: Nid, port: number) => number;
   private readonly hooks: PortAllocatorHooks;
 
   private allocation = new Map<number, Owner>();
@@ -92,8 +100,9 @@ export class PortAllocator {
 
   constructor(opts: PortAllocatorOptions) {
     this.self = opts.self;
+    this.identity = opts.config.identity ?? opts.self;
     this.ports = [...opts.config.ports];
-    this.inc = opts.config.incarnation;
+    this.priority = opts.config.priority;
     this.hash = opts.config.hash ?? fnv1a;
     this.hooks = opts.hooks ?? {};
     this.desiredPort = opts.config.priorPort ?? null;
@@ -152,7 +161,7 @@ export class PortAllocator {
     if (
       this.phase === "OWNED" &&
       this.myPort != null &&
-      this.allocation.get(this.myPort)?.nid !== this.self
+      this.allocation.get(this.myPort)?.nid !== this.identity
     ) {
       this.myPort = null;
       this.chooseAndClaim();
@@ -163,10 +172,10 @@ export class PortAllocator {
     if (
       this.phase === "CLAIMING" &&
       p.type === "CLAIM" &&
-      p.nid === this.self &&
+      p.nid === this.identity &&
       p.port === this.pendingPort
     ) {
-      if (this.allocation.get(this.pendingPort)?.nid === this.self) {
+      if (this.allocation.get(this.pendingPort)?.nid === this.identity) {
         this.confirm(this.pendingPort);
       } else {
         this.chooseAndClaim(); // lost the race; try the next free port
@@ -181,7 +190,7 @@ export class PortAllocator {
   private applyClaim(p: ClaimPayload): void {
     const cur = this.allocation.get(p.port);
     if (!cur || cur.nid === p.nid || this.higherPriority(p, cur)) {
-      this.allocation.set(p.port, { nid: p.nid, inc: p.inc });
+      this.allocation.set(p.port, { nid: p.nid, priority: p.priority });
     }
   }
 
@@ -190,9 +199,9 @@ export class PortAllocator {
     if (cur && cur.nid === p.nid) this.allocation.delete(p.port);
   }
 
-  /** Older incarnation wins; ties broken by lower nid. Order-independent. */
+  /** Lower priority value wins (older confirmed_height); ties by identity. */
   private higherPriority(a: Owner, b: Owner): boolean {
-    if (a.inc !== b.inc) return a.inc < b.inc;
+    if (a.priority !== b.priority) return a.priority < b.priority;
     return a.nid < b.nid;
   }
 
@@ -212,7 +221,9 @@ export class PortAllocator {
     if (this.desiredPort != null && free.includes(this.desiredPort)) {
       pick = this.desiredPort; // sticky: prior/held port, avoids churn
     } else {
-      pick = [...free].sort((a, b) => this.hash(this.self, a) - this.hash(this.self, b))[0];
+      pick = [...free].sort(
+        (a, b) => this.hash(this.identity, a) - this.hash(this.identity, b)
+      )[0];
     }
 
     this.pendingPort = pick;
@@ -220,9 +231,9 @@ export class PortAllocator {
     this.waitingEmitted = false;
     const claim: ClaimPayload = {
       type: "CLAIM",
-      nid: this.self,
+      nid: this.identity,
       port: pick,
-      inc: this.inc
+      priority: this.priority
     };
     this.membership.broadcast(claim);
   }
