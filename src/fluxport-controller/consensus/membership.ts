@@ -322,13 +322,17 @@ export class Membership {
     const target = arus.length ? Math.min(...arus) : 0;
 
     this.ob.flushTo(target); // deliver the agreed old-view prefix
-    this.onViewChange({ ringId: token.ringId, members: token.members });
     this.ob.resetForNewRing();
     this.ob.tokenRing.installRing(token.ringId, token.members, false);
 
     this.state = "OPERATIONAL";
     this.clearCommitTimeout();
     this.scheduleAnnounce();
+
+    // Notify the app only after the new ring is live, so anything it broadcasts
+    // in response (the allocator's re-claim) queues into the fresh ring rather
+    // than being discarded by resetForNewRing.
+    this.onViewChange({ ringId: token.ringId, members: token.members });
   }
 
   private forward(token: CommitTokenMessage): void {

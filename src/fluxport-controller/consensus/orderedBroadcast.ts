@@ -115,8 +115,10 @@ export class OrderedBroadcast {
     this.have.clear();
     this.highestSeq = 0;
     this.lastDelivered = 0;
-    // sendQueue is intentionally kept: undelivered app payloads are re-broadcast
-    // in the new view.
+    // Drop unsent payloads: messages not yet ordered in the old view do not cross
+    // the view boundary (virtual synchrony). Applications re-issue what they need
+    // on the view change (the port allocator re-claims).
+    this.sendQueue.length = 0;
   }
 
   /** Received an in-ring application multicast: retain it for ordering + rtr service. */
