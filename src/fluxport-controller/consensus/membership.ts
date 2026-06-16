@@ -98,8 +98,8 @@ export class Membership {
       config: opts.config,
       hooks: {
         onDeliver: opts.hooks.onDeliver,
-        onTokenLost: () => this.trigger(),
-        onForeignMessage: () => this.trigger(),
+        onTokenLost: () => this.trigger("tokenLost"),
+        onForeignMessage: () => this.trigger("foreign"),
         onJoin: (msg) => this.onJoin(msg),
         onCommitToken: (msg) => this.onCommitToken(msg)
       }
@@ -160,11 +160,14 @@ export class Membership {
 
   // ---- triggers -> GATHER ----
 
-  private trigger(): void {
-    if (this.state === "OPERATIONAL") this.enterGather();
+  private trigger(reason: string): void {
+    if (this.state === "OPERATIONAL") this.enterGather(reason);
   }
 
-  private enterGather(): void {
+  // `reason` documents what triggered the reconfiguration (tokenLost, foreign,
+  // gathering, newMember, commitTimeout) — useful when tracing convergence.
+  private enterGather(reason = "?"): void {
+    void reason;
     this.state = "GATHER";
     this.stopAnnounce();
     this.ob.tokenRing.suspend();
@@ -193,13 +196,19 @@ export class Membership {
 
     if (this.state === "OPERATIONAL") {
       if (msg.gathering) {
-        this.enterGather(); // a peer is reconfiguring — join in, even if same ring
+        this.enterGather("gathering"); // a peer is reconfiguring — join in
       } else {
-        const sameView =
-          ringKey(msg.ringId) === ringKey(this.currentRing) &&
-          this.currentMembers.includes(msg.senderNid);
-        if (sameView) return; // steady-state announce from a current member
-        this.enterGather(); // announce from a stranger / foreign ring
+        // Steady-state announce. Reconfigure ONLY if it reveals a member we don't
+        // already know (a genuine merge / new node) — NOT merely because the ring
+        // seq skews. Keying on seq equality here caused a re-gather cascade: any
+        // transient skew made a current member's announce look foreign, so all
+        // nodes re-gathered, bumping the seq, forever.
+        const known = new Set(this.currentMembers);
+        const revealsNewMember = [msg.senderNid, ...msg.procSet].some(
+          (n) => !known.has(n)
+        );
+        if (!revealsNewMember) return; // same-or-subset group; seq skew heals on its own
+        this.enterGather("newMember");
       }
     }
     if (this.state !== "GATHER") return; // mid-commit joins are picked up next round
@@ -336,7 +345,12 @@ export class Membership {
   }
 
   private forward(token: CommitTokenMessage): void {
-    this.armCommitTimeout();
+    // Do NOT (re)arm the commit timeout here: a non-representative forwards the
+    // install token AFTER it has already installed and gone OPERATIONAL (which
+    // cleared the timer), so arming here left a stray timeout that fired later
+    // and re-triggered GATHER — a self-sustaining re-gather storm. The timeout is
+    // re-armed on every commit-token *receipt* (onCommitToken), which is the
+    // correct freshness signal.
     this.transport.sendUnicast(token, successorOf(this.self, token.members));
   }
 
@@ -351,7 +365,7 @@ export class Membership {
     this.commitTimer = this.clock.setTimer(this.config.commitTimeout, () => {
       this.commitTimer = null;
       this.state = "OPERATIONAL"; // give up; a fresh GATHER recovers
-      this.enterGather();
+      this.enterGather("commitTimeout");
     });
   }
 
