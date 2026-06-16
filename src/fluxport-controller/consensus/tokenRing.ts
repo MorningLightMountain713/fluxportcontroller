@@ -20,7 +20,7 @@
 
 import { Transport } from "./transport";
 import { Clock, TimerId } from "./clock";
-import { Nid, RingId, ProtocolMessage, TokenMessage } from "./messages";
+import { Nid, RingId, ProtocolMessage, TokenMessage, McastMessage } from "./messages";
 import { sortMembers, successorOf, representativeOf } from "./ring";
 
 export interface TokenRingConfig {
@@ -45,6 +45,8 @@ export interface TokenRingHooks {
   onForward?: (token: TokenMessage, to: Nid) => void;
   /** Phase 3 hook: mutate the token (assign seqs, service rtr, update aru) while held. */
   processToken?: (token: TokenMessage) => void;
+  /** Phase 3 hook: an in-ring application multicast was received. */
+  onMcast?: (msg: McastMessage) => void;
 }
 
 export interface TokenRingOptions {
@@ -94,6 +96,9 @@ export class TokenRing {
   get successor(): Nid {
     return successorOf(this.self, this.members);
   }
+  get representative(): Nid | null {
+    return representativeOf(this.members);
+  }
 
   start(): void {
     this.running = true;
@@ -132,8 +137,9 @@ export class TokenRing {
       ringId: this.ringId,
       tokenSeq: 0,
       seq: 0,
+      safe: 0,
       aru: 0,
-      aruId: null,
+      aruId: this.self,
       rtr: [],
       fcc: 0
     });
@@ -147,8 +153,10 @@ export class TokenRing {
     }
     if (msg.kind === "TOKEN") {
       this.receiveToken(msg);
+    } else if (msg.kind === "MCAST") {
+      this.hooks.onMcast?.(msg);
     }
-    // MCAST ordering is Phase 3; JOIN/COMMIT recovery is Phase 4.
+    // JOIN/COMMIT recovery is Phase 4.
   }
 
   private isForeign(msg: ProtocolMessage): boolean {

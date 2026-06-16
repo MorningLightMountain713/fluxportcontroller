@@ -25,6 +25,7 @@ const token: TokenMessage = {
   ringId: ring,
   tokenSeq: 42,
   seq: 7,
+  safe: 4,
   aru: 5,
   aruId: "b:0",
   rtr: [6, 7],

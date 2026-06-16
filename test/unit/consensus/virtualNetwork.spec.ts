@@ -15,6 +15,7 @@ const tok = (overrides: Partial<TokenMessage> = {}): TokenMessage => ({
   ringId: ring,
   tokenSeq: 1,
   seq: 0,
+  safe: 0,
   aru: 0,
   aruId: null,
   rtr: [],

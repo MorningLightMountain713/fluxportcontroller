@@ -42,7 +42,11 @@ export interface TokenMessage extends Envelope {
   kind: "TOKEN";
   tokenSeq: number;
   seq: number;
+  /** Committed safe watermark: every member has delivered all seqs ≤ safe. */
+  safe: number;
+  /** Running per-rotation min of members' received-up-to; commits into `safe`. */
   aru: number;
+  /** The rotation anchor (representative) that commits aru → safe. */
   aruId: Nid | null;
   rtr: number[];
   fcc: number;
