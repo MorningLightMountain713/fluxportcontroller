@@ -1,9 +1,3 @@
-/// <reference types="node" />
-/// <reference types="node" />
-/// <reference types="node" />
-/// <reference types="node" />
-/// <reference types="node" />
-/// <reference types="node" />
 import { Socket } from "dgram";
 import { EventEmitter } from "events";
 import { AddressInfo } from "net";

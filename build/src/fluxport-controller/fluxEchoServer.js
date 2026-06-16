@@ -15,7 +15,7 @@ var Msg;
     Msg[Msg["PING"] = 0] = "PING";
     Msg[Msg["PING_NAK"] = 1] = "PING_NAK";
     Msg[Msg["PONG"] = 2] = "PONG";
-})(Msg = exports.Msg || (exports.Msg = {}));
+})(Msg || (exports.Msg = Msg = {}));
 class TwoWayMap extends Map {
     revMap;
     // skip being able to init by constructor
@@ -353,4 +353,4 @@ var Dir;
 (function (Dir) {
     Dir[Dir["INBOUND"] = 0] = "INBOUND";
     Dir[Dir["OUTBOUND"] = 1] = "OUTBOUND";
-})(Dir = exports.Dir || (exports.Dir = {}));
+})(Dir || (exports.Dir = Dir = {}));

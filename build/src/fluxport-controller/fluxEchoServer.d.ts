@@ -1,8 +1,3 @@
-/// <reference types="node" />
-/// <reference types="node" />
-/// <reference types="node" />
-/// <reference types="node" />
-/// <reference types="node" />
 import { Socket } from "dgram";
 import { AddressInfo } from "net";
 import os from "os";

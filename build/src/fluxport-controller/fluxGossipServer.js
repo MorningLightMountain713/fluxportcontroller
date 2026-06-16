@@ -64,7 +64,7 @@ var Msg;
     Msg[Msg["ADMIN_RESET"] = 11] = "ADMIN_RESET";
     Msg[Msg["ADMIN_DISCOVER"] = 12] = "ADMIN_DISCOVER";
     Msg[Msg["ADMIN_DISCOVER_REPLY"] = 13] = "ADMIN_DISCOVER_REPLY";
-})(Msg = exports.Msg || (exports.Msg = {}));
+})(Msg || (exports.Msg = Msg = {}));
 const ADMIN_MESSAGES = [
     Msg.PORT_SELECT_ACK,
     Msg.ADMIN_DISCOVER_REPLY
@@ -223,7 +223,10 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
         // prior port and our siblings
         this.closed = false;
         const now = Date.now();
-        if (!this.myIp || this.startedAt + 900 < now) {
+        // refresh our cached public IP at most once every 15 minutes (startedAt is
+        // a Date.now() millisecond timestamp, so the window must be in ms too)
+        const fifteenMinutesMs = 15 * 60 * 1000;
+        if (!this.myIp || this.startedAt + fifteenMinutesMs < now) {
             this.myIp = await this.getMyPublicIp();
             this.startedAt = now;
         }
@@ -241,7 +244,11 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
             this.emit("startError");
             return false;
         }
-        const { gateway, localAddress } = gatewayResponse;
+        // nat-upnp 2.x: getGateway resolves to a UpnpInfo. The Device still exposes
+        // the rootDesc URL via `description`, but the local interface address is now
+        // resolved lazily rather than returned alongside the gateway.
+        const { gateway } = gatewayResponse;
+        const localAddress = await gatewayResponse.getLocalAddress();
         // from testing, this is an IP. However, resolve just in case
         const gatewayFqdn = new URL(gateway.description).hostname;
         const gatewayIp = await (0, promises_1.lookup)(gatewayFqdn);
@@ -249,9 +256,16 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
         // we only run on the interface that we are able to communicate with the
         // upnp gateway
         const upnpInterface = this.interfaces.find((int) => int.address === localAddress);
+        // nat-upnp 2.x resolves the local address to "" if it can't be determined.
+        // Without a matching interface we have nothing to bind to, so bail cleanly
+        // instead of dereferencing undefined.
+        if (!upnpInterface) {
+            logger.error(`No local interface found for upnp address: "${localAddress}"`);
+            this.emit("startError");
+            return false;
+        }
         // disabled, needs more dev / testing
         // if (this.mode !== "OBSERVE") this.createAndStartEchoServer(localAddress);
-        // interface is guaranteed here
         this.sockets.push(this.runSocketServer(upnpInterface));
         return true;
     }
@@ -514,21 +528,16 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
     async fluxportInUse(ip, port) {
         // call that ip on that port for flux/uptime endpoint
         const url = `http://${ip}:${port}/flux/uptime`;
-        let attempts = 0;
-        let res = null;
-        while (attempts < 3) {
-            attempts++;
+        // retry only when we get no response at all; once a node actually answers
+        // we have our answer and stop. A 200 means a live fluxnode owns the port.
+        for (let attempt = 1; attempt <= 3; attempt++) {
             try {
-                res = await axios_1.default.get(url, { timeout: 1000 });
+                const res = await axios_1.default.get(url, { timeout: 1000 });
+                return res.status === 200;
             }
             catch (err) {
-                logger.warn(`No response on ${url}, ${3 - attempts} attempts remaining`);
-                continue;
+                logger.warn(`No response on ${url}, ${3 - attempt} attempts remaining`);
             }
-        }
-        if (res && res.status === 200) {
-            // some other node is live on this port
-            return true;
         }
         return false;
     }
@@ -947,7 +956,7 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
                 const nodeTimeout = this.nodeTimeouts[msg.host].get("startUp");
                 if (nodeTimeout) {
                     clearTimeout(nodeTimeout);
-                    this.nodeTimeouts[msg.host].delete(msg.host);
+                    this.nodeTimeouts[msg.host].delete("startUp");
                 }
                 this.sendPortSelectAck(msg.id, msg.host, msg.port);
                 // if (this.nodeCount <= 3) {
@@ -982,7 +991,7 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
             const nodeTimeout = this.nodeTimeouts[msg.host].get("startUp");
             if (nodeTimeout) {
                 clearTimeout(nodeTimeout);
-                this.nodeTimeouts[msg.host].delete(msg.host);
+                this.nodeTimeouts[msg.host].delete("startUp");
             }
         }
         // this.connectToPeers(localAddress);
@@ -1088,8 +1097,8 @@ class FluxGossipServer extends fluxServer_1.FluxServer {
             return;
         for (const timeout of timeouts.values()) {
             clearTimeout(timeout);
-            timeouts.clear();
         }
+        timeouts.clear();
     }
     createNodeDownCallback(peer) {
         this.clearNodeTimeouts(peer);
