@@ -1,0 +1,7 @@
+node_modules
+.git
+build
+dev
+test
+package-lock.json
+*.log

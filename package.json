@@ -17,7 +17,7 @@
     "prepare": "npm run build",
     "watch": "tsc --watch",
     "unittest": "node --import tsx --test test/unit/*.spec.ts test/unit/consensus/*.spec.ts",
-    "inttest": "docker compose up --build --exit-code-from observer; rc=$?; docker compose down -v --remove-orphans; exit $rc",
+    "inttest": "node --import tsx --test test/integration/*.int.spec.ts",
     "start": "node --import tsx test_docker_entrypoint.ts"
   },
   "bin": {
@@ -30,6 +30,7 @@
   ],
   "devDependencies": {
     "@types/node": "^25.9.3",
+    "testcontainers": "^12.0.2",
     "tsx": "^4.22.4",
     "typescript": "^6.0.3"
   },
