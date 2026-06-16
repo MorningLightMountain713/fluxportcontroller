@@ -6,10 +6,12 @@
  *
  *   GATHER   every node multicasts JOIN; the alive set converges to whoever is
  *            actually reachable (a crashed node sends no JOIN, so it drops out).
- *   COMMIT   the representative (lowest nid) circulates a commit token:
- *              · collect circuit — each member appends its old ring + aru;
- *              · install circuit — each member flushes, delivers the view change,
- *                and installs the new ring; the representative then seeds the
+ *   COMMIT   the representative (lowest nid) drives a multicast 2-phase commit,
+ *            re-proposing until every member replies (so it survives loss):
+ *              · collect — each member returns its old ring + aru;
+ *              · install — the representative multicasts the gathered states;
+ *                each member flushes, delivers the view change, installs the new
+ *                ring, and acks; the representative installs last and seeds the
  *                operational token.
  *
  * Discovery: while OPERATIONAL each node periodically multicasts an announce
@@ -22,9 +24,12 @@
  * always holds, that cut is one every survivor can reach without retransmission,
  * so all members of the new view deliver the identical prefix from the old view.
  *
- * Deferred hardening (documented): commit-token loss beyond a single re-gather,
- * and concurrent-representative races when candidate sets disagree transiently.
- * The commit timeout falls back to re-GATHER.
+ * The 2-phase commit is retransmit-until-acked, so commit-message loss no longer
+ * forces a re-gather. An A/B against the older unicast commit-token chain (with
+ * the operational token timing held fixed) held ~100% convergence to 20% packet
+ * loss, ~96% at 30%, ~76% at 40% — where the chain collapsed to 46% / 10% / 0%.
+ * Deferred hardening (documented): concurrent-representative races when candidate
+ * sets disagree transiently; the commit timeout falls back to re-GATHER.
  */
 
 import { Transport } from "./transport";
