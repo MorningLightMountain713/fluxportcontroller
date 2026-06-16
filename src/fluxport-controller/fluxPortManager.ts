@@ -165,6 +165,12 @@ export class FluxPortManager extends EventEmitter {
   get assignedPort(): number | null {
     return this.allocator?.port ?? null;
   }
+  get members(): string[] {
+    return this.allocator?.currentMembers ?? [];
+  }
+  get viewId(): string | null {
+    return this.allocator?.viewId ?? null;
+  }
 
   async start(): Promise<boolean> {
     try {

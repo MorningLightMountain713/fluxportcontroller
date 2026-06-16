@@ -8,31 +8,45 @@ services:
     stop_signal: SIGINT
     labels:
       com.megachips.container_type: "fluxport_controller_test"
-  fluxnode:
-    image: "megachips/fluxport_controller:latest"
-    init: true
-    environment:
-    # Normally, this would be set to 10 so there is a randomized start delay
-      - START_DELAY=3
-    networks:
-      - upnp
-    deploy:
-      mode: replicated
-      replicas: 8
-    labels:
-      com.megachips.container_type: "fluxport_controller_test"
+
+  # verifier: nodes POST their confirmed port here; passes when all are distinct
   observer:
-    image: "megachips/fluxport_controller:latest"
-    container_name: observer
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["node", "--import", "tsx", "observer.ts"]
     init: true
     environment:
-      - MODE=OBSERVE
       - NODE_COUNT=8
-      - TEST_COUNT=50
+      - PORT=33333
+      - TIMEOUT_SEC=120
     networks:
       - upnp
     ports:
       - "127.0.0.1:33333:33333"
+    labels:
+      com.megachips.container_type: "fluxport_controller_test"
+
+  # the nodes under test: real UPnP discovery (via miniupnpd) + multicast consensus
+  fluxnode:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["node", "--import", "tsx", "test_entrypoint.ts"]
+    init: true
+    depends_on:
+      - miniupnpd
+      - observer
+    environment:
+      - HARNESS=1
+      - REPORT_URL=http://observer:33333/report
+      - MULTICAST_GROUP=239.16.32.15
+      - PORT=33333
+    deploy:
+      mode: replicated
+      replicas: 8
+    networks:
+      - upnp
     labels:
       com.megachips.container_type: "fluxport_controller_test"
 
