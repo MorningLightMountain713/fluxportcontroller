@@ -23,8 +23,13 @@
  * not how a real partition behaves. Dropping packets by peer source-IP keeps the
  * IP stable and is the faithful simulation of a partition / lossy link.
  */
-import { GenericContainer, Network, Wait } from "testcontainers";
-import type { StartedNetwork, StartedTestContainer } from "testcontainers";
+import {
+  GenericContainer,
+  Network,
+  Wait,
+  getContainerRuntimeClient
+} from "testcontainers";
+import type { StartedTestContainer } from "testcontainers";
 import { NodeClient, NodeStatus } from "./node-client";
 
 // `npm run inttest` runs from the package root, so the Docker build context (which
@@ -49,12 +54,15 @@ function buildImage(): Promise<unknown> {
 }
 
 // One node container (unstarted), wired for the harness. NET_ADMIN lets the chaos
-// helpers run iptables/tc in the container's own network namespace; it's inert
-// for the plain convergence gate.
-function nodeContainer(network: StartedNetwork, txHash: string): GenericContainer {
-  return (
+// helpers run iptables in the container's own network namespace; it's inert for
+// the plain convergence gate. `attach` joins it to the env's network (a plain
+// testcontainers Network, or a user-IPAM one when static IPs are needed).
+function nodeContainer(
+  attach: (c: GenericContainer) => GenericContainer,
+  txHash: string
+): GenericContainer {
+  return attach(
     new GenericContainer(IMAGE)
-      .withNetwork(network)
       .withAddedCapabilities("NET_ADMIN")
       .withEnvironment({
         HARNESS: "1",
@@ -86,6 +94,13 @@ export interface ConsensusEnv {
   /** Crash a node (stop its container) and drop it from `nodes`. */
   kill(node: NodeClient): Promise<void>;
   /**
+   * Move a live node to a new IP on the same network (disconnect + reconnect).
+   * Its container/process keep running, so this exercises the live-IP-change
+   * self-heal end-to-end (the bound multicast socket's address vanishes under it).
+   * Returns the old and new IPs.
+   */
+  changeAddress(node: NodeClient): Promise<{ oldIp: string; newIp: string }>;
+  /**
    * Sever all traffic between two groups: in each node's own netns, DROP every
    * packet whose source is a node on the other side. This blocks the multicast
    * data/discovery plane (datagrams carry the sender's unicast source IP) AND
@@ -108,16 +123,55 @@ export interface ConsensusEnv {
 
 export async function createConsensusEnv(opts: {
   nodes: number;
+  /**
+   * When set, create the network with a user-configured IPAM subnet (via the
+   * Docker API) instead of a plain testcontainers Network. Required to reconnect
+   * a container at a chosen static IP — Docker rejects static IPs on the
+   * auto-IPAM networks `new Network()` produces. Used by the live-IP-change test.
+   */
+  subnet?: string;
 }): Promise<ConsensusEnv> {
   await buildImage();
-  const network = await new Network().start();
-  const networkName = network.getName();
+  const runtime = await getContainerRuntimeClient();
+  const dockerode = runtime.container.dockerode;
   const started: StartedTestContainer[] = [];
   const nodes: NodeClient[] = [];
 
+  // The network: a plain testcontainers Network by default; a user-IPAM network
+  // (so a test can assign a static IP on reconnect) when a subnet is requested.
+  // `attach` wires a container onto it; `dockerNetwork` is the dockerode handle
+  // used by changeAddress.
+  let networkName: string;
+  let attach: (c: GenericContainer) => GenericContainer;
+  let dockerNetwork: ReturnType<typeof dockerode.getNetwork>;
+  let teardownNetwork: () => Promise<void>;
+  if (opts.subnet) {
+    const name = `fpc-inttest-${Math.floor(Math.random() * 1e9).toString(36)}`;
+    const created = await dockerode.createNetwork({
+      Name: name,
+      Driver: "bridge",
+      IPAM: { Config: [{ Subnet: opts.subnet }] },
+      Labels: LABELS
+    });
+    networkName = name;
+    attach = (c) => c.withNetworkMode(name);
+    dockerNetwork = created;
+    teardownNetwork = async () => {
+      await created.remove().catch(() => {});
+    };
+  } else {
+    const net = await new Network().start();
+    networkName = net.getName();
+    attach = (c) => c.withNetwork(net);
+    dockerNetwork = dockerode.getNetwork(net.getId());
+    teardownNetwork = async () => {
+      await net.stop().catch(() => {});
+    };
+  }
+
   const teardown = async (): Promise<void> => {
     for (const c of [...started].reverse()) await c.stop().catch(() => {});
-    await network.stop().catch(() => {});
+    await teardownNetwork();
   };
 
   // Run a shell command inside a node's container; throw on a non-zero exit so a
@@ -135,7 +189,7 @@ export async function createConsensusEnv(opts: {
     node.container.getIpAddress(networkName);
 
   const startNode = async (txHash: string): Promise<NodeClient> => {
-    const c = await nodeContainer(network, txHash).start();
+    const c = await nodeContainer(attach, txHash).start();
     started.push(c);
     const client = new NodeClient(c, STATUS_PORT, txHash);
     nodes.push(client);
@@ -148,12 +202,12 @@ export async function createConsensusEnv(opts: {
     // endpoint to probe. Wait for its init log line instead. This gate isn't
     // load-bearing: nodes self-heal (test_entrypoint retries start() on a failed
     // UPnP discovery), so it only spares them an early retry cycle.
-    const miniupnpd = await new GenericContainer(MINIUPNPD_IMAGE)
-      .withNetwork(network)
-      .withAddedCapabilities("NET_ADMIN")
-      .withLabels(LABELS)
-      .withWaitStrategy(Wait.forLogMessage(/HTTP listening on port/))
-      .start();
+    const miniupnpd = await attach(
+      new GenericContainer(MINIUPNPD_IMAGE)
+        .withAddedCapabilities("NET_ADMIN")
+        .withLabels(LABELS)
+        .withWaitStrategy(Wait.forLogMessage(/HTTP listening on port/))
+    ).start();
     started.push(miniupnpd);
 
     // Start nodes concurrently; startNode tracks each the instant it starts so a
@@ -169,6 +223,20 @@ export async function createConsensusEnv(opts: {
         await node.container.stop().catch(() => {});
         const idx = nodes.indexOf(node);
         if (idx >= 0) nodes.splice(idx, 1);
+      },
+      async changeAddress(
+        node: NodeClient
+      ): Promise<{ oldIp: string; newIp: string }> {
+        const oldIp = ipOf(node);
+        // a high host octet in the same subnet — nodes get low ones, so it's free
+        const newIp = oldIp.replace(/\.\d+$/, ".250");
+        const id = node.container.getId();
+        await dockerNetwork.disconnect({ Container: id });
+        await dockerNetwork.connect({
+          Container: id,
+          EndpointConfig: { IPAMConfig: { IPv4Address: newIp } }
+        });
+        return { oldIp, newIp };
       },
       async partition(
         groupA: NodeClient[],

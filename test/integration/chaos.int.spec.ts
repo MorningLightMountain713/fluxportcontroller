@@ -194,4 +194,38 @@ describe("consensus chaos (real containers: kill / partition / loss)", () => {
       }
     }
   );
+
+  it(
+    "live IP change: a node's address changes; it self-heals and reclaims its port",
+    { timeout: 5 * T },
+    async () => {
+      // user-IPAM subnet so the victim can be reconnected at a chosen static IP
+      const env: ConsensusEnv = await createConsensusEnv({
+        nodes: NODES,
+        subnet: "10.88.0.0/24"
+      });
+      try {
+        const before = allocByNid(await converge(env.nodes, NODES, "initial"));
+        const victim = largestNid(env.nodes);
+
+        // change the victim's IP out from under its bound multicast socket — the
+        // container keeps running, so this is the real live-IP-change path: the
+        // node must detect it (transport error / isolation), re-discover the new
+        // address over real UPnP, rebuild, rejoin under the same nid, reclaim.
+        const { oldIp, newIp } = await env.changeAddress(victim);
+        assert.notEqual(oldIp, newIp, "the IP actually changed");
+
+        const after = allocByNid(await converge(env.nodes, NODES, "after-ip-change"));
+        for (const nid of Object.keys(before)) {
+          assert.equal(
+            after[nid],
+            before[nid],
+            `${nid} changed port across the IP change`
+          );
+        }
+      } finally {
+        await env.teardown();
+      }
+    }
+  );
 });
