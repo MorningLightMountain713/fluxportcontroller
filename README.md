@@ -109,6 +109,39 @@ network with no sockets, UPnP, or HTTP.
 - `members: string[]` — the current consensus view.
 - `viewId: string | null` — the current ring id.
 
+## Performance
+
+Time for a node to resolve its UPnP port, under the default timing. Measured two
+ways — **pure consensus** (the in-memory virtual network: deterministic, no
+sockets) and **end-to-end** (the Docker integration harness: real UPnP discovery
++ real multicast). The two agree within ~15%, so the cost is dominated by the
+consensus itself, not the transport. Numbers are indicative (default timing,
+≤10 ms per-message latency).
+
+**Cold convergence** — all nodes start together; each ends up owning a distinct port:
+
+| Nodes | Pure consensus | End-to-end (incl. UPnP) |
+|------:|---------------:|------------------------:|
+| 3     | ~1.4 s         | ~1.3 s                  |
+| 5     | ~2.4 s         | ~2.1 s                  |
+| 8     | ~4.4 s         | ~4.4 s                  |
+
+**Other operations:**
+
+| Operation | Time |
+|---|---|
+| A node joins an already-converged ring | ~2.1 s (3→4) … ~2.7 s (5→6) |
+| Self-heal + port reclaim (LAN-IP change / membership loss) | ~2–4 s (gated by the 2 s token-loss timeout) |
+
+- **Capacity: 8 nodes per LAN segment** — there are 8 Fluxports, so a 9th node
+  converges to `noPortAvailable` and claims one the instant it frees.
+- **What dominates** is discovery + membership cadence (`announceInterval` and
+  `joinTimeout`, ~1 s each), not the token — a full token lap is sub-second
+  (≈ N × 40 ms + latency). Lowering those intervals trades steady-state multicast
+  chatter and loss margin for faster convergence.
+- **Loss tolerance:** 8-node convergence holds ~100% up to 20% per-link packet
+  loss, and ~95% at 30%.
+
 ## Development
 
 ```bash
