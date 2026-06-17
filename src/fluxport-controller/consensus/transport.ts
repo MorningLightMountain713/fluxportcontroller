@@ -165,9 +165,12 @@ export class VirtualNetwork {
   }
 
   register(address: string): VirtualTransport {
-    if (this.endpoints.has(address)) {
+    const existing = this.endpoints.get(address);
+    if (existing?.isRunning) {
       throw new Error(`address already registered: ${address}`);
     }
+    // A fresh transport may take the address of a STOPPED one — this models a
+    // rebuild (close + reopen the socket on the same address) after a heal.
     const transport = new VirtualTransport(address, this);
     this.endpoints.set(address, transport);
     return transport;
@@ -231,11 +234,16 @@ export class VirtualTransport implements Transport {
   private handler: MessageHandler = () => {};
   private errorHandler: ErrorHandler = () => {};
   private running = false;
+  private deaf = false;
 
   constructor(
     readonly localAddress: string,
     private readonly net: VirtualNetwork
   ) {}
+
+  get isRunning(): boolean {
+    return this.running;
+  }
 
   onMessage(handler: MessageHandler): void {
     this.handler = handler;
@@ -248,6 +256,15 @@ export class VirtualTransport implements Transport {
   /** Test seam: simulate a post-start socket error on this endpoint. */
   failWith(err: NodeJS.ErrnoException): void {
     this.errorHandler(err);
+  }
+
+  /**
+   * Test seam: simulate silent multicast deafness (the kernel dropped the group
+   * membership) while the socket stays bound at the SAME address — inbound is
+   * dropped, sends still work, and only a rebuild (a fresh transport) cures it.
+   */
+  goDeaf(): void {
+    this.deaf = true;
   }
 
   start(): Promise<void> {
@@ -269,6 +286,6 @@ export class VirtualTransport implements Transport {
 
   /** internal: invoked by the VirtualNetwork to deliver an inbound message. */
   receive(msg: ProtocolMessage, from: string): void {
-    if (this.running) this.handler(msg, from);
+    if (this.running && !this.deaf) this.handler(msg, from);
   }
 }

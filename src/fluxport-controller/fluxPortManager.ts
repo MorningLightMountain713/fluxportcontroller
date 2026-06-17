@@ -16,17 +16,22 @@
  * `startError`, and `rebound({from,to})`. FluxOS just constructs it and listens —
  * nothing to persist.
  *
- * Self-heal on a live IP change: the multicast socket binds to the
- * UPnP-discovered LAN IP and cannot recover if that IP changes under it (the
- * kernel drops the group membership → the node goes deaf). Two event-driven
- * signals trigger a heal — a transport socket error (the fast path, e.g. a send
- * raising EADDRNOTAVAIL) and the consensus collapsing to a singleton view (the
- * reliable path: a deaf node still reforms a one-member ring). A heal re-resolves
- * the local address and, only if it changed, rebuilds the transport + allocator
- * with the new address; the claim identity (nid) is unchanged, so the node
- * rejoins and reclaims its port (the proven address-change / same-nid path). The
- * re-resolve is a no-op if the address is unchanged, so a transient or a
- * genuinely-lone node costs nothing.
+ * Self-heal on a transport break: the multicast socket pins reception and egress
+ * to the UPnP-discovered LAN IP (addMembership + setMulticastInterface). It cannot
+ * recover on its own if that IP changes under it, and the kernel does not
+ * transparently restore reception when the bound address is removed and restored
+ * to the SAME value, or the interface is recreated (a bare link down/up, by
+ * contrast, the kernel self-heals — it retains and re-announces the membership).
+ * Two event-driven signals trigger a heal — a transport socket error (the fast
+ * path, e.g. a send raising EADDRNOTAVAIL) and the consensus collapsing to a lone
+ * ring (the reliable path: a deaf node still reforms a one-member ring). A heal
+ * re-resolves the local address and rebuilds the transport + allocator — same nid,
+ * so the node rejoins and reclaims its port (the proven address-change / same-nid
+ * path) — when the address CHANGED, or, on an unchanged address, when we have
+ * actually gone deaf (the ring collapsed to just us), which rebinds in place to
+ * re-establish the dropped group membership. It is a no-op for a transient blip on
+ * a still-healthy multi-member ring and for a genuinely-lone node, so both
+ * detectors can fire liberally without harm.
  *
  * Every external dependency is injectable so the whole flow is testable over the
  * in-memory virtual network with no sockets, UPnP, or HTTP.
@@ -335,9 +340,14 @@ export class FluxPortManager extends EventEmitter {
   }
 
   /**
-   * Re-resolve our LAN address; if it changed, rebuild the transport + allocator
-   * on the new address (same nid) so we rejoin and reclaim our port. A no-op when
-   * the address is unchanged (transient blip / genuinely lone node).
+   * Re-resolve our LAN address and rebuild the transport + allocator (same nid, so
+   * we rejoin and reclaim our port) when either the address CHANGED, or it is
+   * unchanged but we have gone deaf — the ring collapsed to a lone member, so a
+   * same-IP membership loss (the bound IP removed and restored, or the interface
+   * recreated) is the cause and rebinding in place re-establishes the dropped
+   * group membership. A no-op for a transient blip on a still-healthy
+   * (multi-member) ring and for a genuinely-lone node, so both detectors can fire
+   * liberally without harm.
    */
   private async heal(reason: string): Promise<void> {
     let newAddress: string;
@@ -347,16 +357,26 @@ export class FluxPortManager extends EventEmitter {
       logger.warn(`Heal (${reason}) address re-resolve failed: ${err}`);
       return;
     }
-    if (this.stopped) return;
-    if (!newAddress || newAddress === this.localAddress) return; // nothing changed
+    if (this.stopped || !newAddress) return;
+
+    // A changed address must rebuild (the ring is keyed by address). An unchanged
+    // address only rebuilds if we have actually gone deaf — consensus collapsed to
+    // a lone ring — which cures a same-IP membership loss the kernel does not
+    // transparently recover; otherwise it is a harmless no-op (a transient blip on
+    // a healthy ring, or a genuinely-lone node).
+    const addressChanged = newAddress !== this.localAddress;
+    const wentDeaf = this.members.length <= 1;
+    if (!addressChanged && !wentDeaf) return;
 
     const from = this.localAddress;
-    // Reclaim the same port on the new address. assignedPort is transiently null
-    // if the heal fired mid view-change (the isolation path), so fall back to the
-    // last confirmed port.
+    // Reclaim the same port on the (possibly unchanged) address. assignedPort is
+    // transiently null if the heal fired mid view-change (the isolation path), so
+    // fall back to the last confirmed port.
     const heldPort = this.assignedPort ?? this.lastConfirmedPort;
     logger.info(
-      `Heal (${reason}): local address ${from} -> ${newAddress}; rebinding (port ${heldPort})`
+      addressChanged
+        ? `Heal (${reason}): local address ${from} -> ${newAddress}; rebinding (port ${heldPort})`
+        : `Heal (${reason}): rebinding in place on ${newAddress} after a membership loss (port ${heldPort})`
     );
     this.allocator?.stop();
     this.transport?.stop();

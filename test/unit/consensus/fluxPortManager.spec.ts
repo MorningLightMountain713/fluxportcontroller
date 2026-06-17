@@ -181,4 +181,82 @@ describe("FluxPortManager", () => {
     w.clock.advance(1000);
     assert.equal(a.assignedPort, portA, "kept its port through the isolation rebind");
   });
+
+  it("rebinds in place on a lone-ring collapse at an unchanged address", async () => {
+    // The fix's heal logic at the unit level: a collapse to a one-member ring while
+    // the re-resolved address is UNCHANGED means reception is broken (not an IP
+    // change), so the node rebinds IN PLACE rather than no-op'ing. goDeaf() forces
+    // that collapse deterministically by cutting all inbound. (In production the
+    // realistic path to this same collapse is a multicast-membership loss after an
+    // interface recreate, where the deaf node is excluded at the next view change —
+    // exercised end-to-end by the chaos integration test.)
+    const w = makeWorld([16197, 16187, 16177]);
+    // healAddress === the node's own address: the re-resolve reports NO change.
+    const a = w.make("aaa", "10.0.0.11", { priorPort: null, priority: 100 }, "10.0.0.11");
+    const b = w.make("bbb", "10.0.0.12");
+
+    await a.start();
+    await b.start();
+    w.clock.advance(1500);
+
+    const portA = a.assignedPort;
+    const portB = b.assignedPort;
+    assert.ok(portA != null && portB != null, `both converged: ${portA}, ${portB}`);
+    assert.equal(a.members.length, 2, "started in a 2-member view");
+
+    const rebound: Array<{ from: string | null; to: string }> = [];
+    a.on("rebound", (e) => rebound.push(e));
+
+    // A loses all inbound and reconfigures to a lone ring — the "I've gone deaf"
+    // signal — and, because the address is unchanged, rebinds IN PLACE (a fresh
+    // transport that can hear) rather than no-op'ing.
+    w.transports.get("10.0.0.11")!.goDeaf();
+
+    w.clock.advance(1000);
+    await settle();
+
+    assert.deepEqual(
+      rebound,
+      [{ from: "10.0.0.11", to: "10.0.0.11" }],
+      "rebound in place on the unchanged address"
+    );
+
+    // the fresh transport restored reception: A rejoins B, reclaims its exact port,
+    // and displaces no one.
+    w.clock.advance(3000);
+    assert.equal(a.assignedPort, portA, "reclaimed its port after the in-place rebind");
+    assert.equal(b.assignedPort, portB, "B was not displaced");
+    assert.equal(a.members.length, 2, "merged back into a 2-member view");
+  });
+
+  it("does NOT rebind on a transient error while the ring is still healthy", async () => {
+    const w = makeWorld([16197, 16187, 16177]);
+    // healAddress === own address: a heal trigger here must find nothing to do.
+    const a = w.make("aaa", "10.0.0.11", { priorPort: null, priority: 100 }, "10.0.0.11");
+    const b = w.make("bbb", "10.0.0.12");
+
+    await a.start();
+    await b.start();
+    w.clock.advance(1500);
+    const portA = a.assignedPort;
+    assert.ok(portA != null);
+    assert.equal(a.members.length, 2, "healthy 2-member view");
+
+    const rebound: Array<{ from: string | null; to: string }> = [];
+    a.on("rebound", (e) => rebound.push(e));
+    const originalTransport = w.transports.get("10.0.0.11");
+
+    // A transient socket error fires while A is still hearing its peer (members > 1)
+    // and its address is unchanged: the heal must be an idempotent no-op.
+    w.transports.get("10.0.0.11")!.failWith(
+      Object.assign(new Error("transient"), { code: "ENETUNREACH" })
+    );
+    w.clock.advance(500);
+    await settle();
+
+    assert.deepEqual(rebound, [], "no rebind on a transient error with peers still present");
+    assert.equal(w.transports.get("10.0.0.11"), originalTransport, "transport not rebuilt");
+    assert.equal(a.assignedPort, portA, "port unchanged");
+    assert.equal(a.members.length, 2, "still a 2-member view");
+  });
 });
