@@ -101,6 +101,20 @@ export interface ConsensusEnv {
    */
   changeAddress(node: NodeClient): Promise<{ oldIp: string; newIp: string }>;
   /**
+   * Destroy and recreate a node's network interface at the SAME IP (disconnect +
+   * reconnect the endpoint at its current address), leaving its identity
+   * untouched. libnetwork tears down the container's veth (NETDEV_UNREGISTER in
+   * the netns) and creates a fresh one with a new ifindex/in_dev, so the socket's
+   * multicast group membership — bound to the old ifindex — goes stale and the
+   * node goes DEAF at an UNCHANGED IP. The kernel does NOT migrate the membership
+   * to the new interface (that auto-rejoin happens only on a same-device link
+   * flap), so a bare `ip link` down/up or `ip addr del/add` would NOT reproduce
+   * this — only a genuine interface recreate does. This is the same-IP membership
+   * loss the rebind-in-place heal handles. The container process keeps running, so
+   * the Docker exec verify channel survives. Returns the unchanged IP.
+   */
+  recreateInterface(node: NodeClient): Promise<string>;
+  /**
    * Sever all traffic between two groups: in each node's own netns, DROP every
    * packet whose source is a node on the other side. This blocks the multicast
    * data/discovery plane (datagrams carry the sender's unicast source IP) AND
@@ -130,6 +144,15 @@ export async function createConsensusEnv(opts: {
    * auto-IPAM networks `new Network()` produces. Used by the live-IP-change test.
    */
   subnet?: string;
+  /**
+   * Enable an IGMP querier on the env's bridge so multicast is FILTERED by group
+   * membership (snooping is on by default, but Docker bridges run no querier, so
+   * by default they flood multicast — which masks a dropped membership). This is
+   * the production condition (a managed switch with snooping + querier) under
+   * which losing a group membership actually silences a node. Used by the same-IP
+   * membership-loss test. Needs a privileged host-network helper container.
+   */
+  querier?: boolean;
 }): Promise<ConsensusEnv> {
   await buildImage();
   const runtime = await getContainerRuntimeClient();
@@ -142,6 +165,7 @@ export async function createConsensusEnv(opts: {
   // `attach` wires a container onto it; `dockerNetwork` is the dockerode handle
   // used by changeAddress.
   let networkName: string;
+  let networkId: string;
   let attach: (c: GenericContainer) => GenericContainer;
   let dockerNetwork: ReturnType<typeof dockerode.getNetwork>;
   let teardownNetwork: () => Promise<void>;
@@ -154,6 +178,7 @@ export async function createConsensusEnv(opts: {
       Labels: LABELS
     });
     networkName = name;
+    networkId = created.id;
     attach = (c) => c.withNetworkMode(name);
     dockerNetwork = created;
     teardownNetwork = async () => {
@@ -162,12 +187,36 @@ export async function createConsensusEnv(opts: {
   } else {
     const net = await new Network().start();
     networkName = net.getName();
+    networkId = net.getId();
     attach = (c) => c.withNetwork(net);
     dockerNetwork = dockerode.getNetwork(net.getId());
     teardownNetwork = async () => {
       await net.stop().catch(() => {});
     };
   }
+
+  // Flip the bridge's IGMP querier on (in the kernel that owns the bridge — the
+  // host, or the LinuxKit VM under Docker Desktop) so the segment filters
+  // multicast by membership. A privileged host-network helper writes the bridge
+  // sysfs; Docker exposes no first-class option for it.
+  const enableQuerier = async (): Promise<void> => {
+    const br = `br-${networkId.slice(0, 12)}`;
+    const helper = await dockerode.createContainer({
+      Image: IMAGE,
+      Cmd: ["sh", "-c", `echo 1 > /sys/class/net/${br}/bridge/multicast_querier`],
+      HostConfig: { Privileged: true, NetworkMode: "host" },
+      Labels: LABELS
+    });
+    try {
+      await helper.start();
+      const { StatusCode } = await helper.wait();
+      if (StatusCode !== 0) {
+        throw new Error(`enabling multicast querier on ${br} exited ${StatusCode}`);
+      }
+    } finally {
+      await helper.remove({ force: true }).catch(() => {});
+    }
+  };
 
   const teardown = async (): Promise<void> => {
     for (const c of [...started].reverse()) await c.stop().catch(() => {});
@@ -188,6 +237,21 @@ export async function createConsensusEnv(opts: {
   const ipOf = (node: NodeClient): string =>
     node.container.getIpAddress(networkName);
 
+  // Disconnect then reconnect a RUNNING container's endpoint at `ip` on the env
+  // network. libnetwork deletes the old veth (NETDEV_UNREGISTER inside the netns)
+  // and creates a fresh one (new ifindex/in_dev); the container process is
+  // untouched. Used for both the IP-change path (reconnect at a new ip) and the
+  // same-IP interface-recreate path (reconnect at the same ip) — the IP is freed
+  // synchronously on disconnect, so reconnecting at the same address succeeds.
+  const reconnectAt = async (node: NodeClient, ip: string): Promise<void> => {
+    const id = node.container.getId();
+    await dockerNetwork.disconnect({ Container: id });
+    await dockerNetwork.connect({
+      Container: id,
+      EndpointConfig: { IPAMConfig: { IPv4Address: ip } }
+    });
+  };
+
   const startNode = async (txHash: string): Promise<NodeClient> => {
     const c = await nodeContainer(attach, txHash).start();
     started.push(c);
@@ -197,6 +261,10 @@ export async function createConsensusEnv(opts: {
   };
 
   try {
+    // Filter multicast by membership BEFORE nodes join, so the gating is active by
+    // the time they converge.
+    if (opts.querier) await enableQuerier();
+
     // miniupnpd's real interface is SSDP over UDP multicast, and its HTTP/SOAP
     // control port is randomly assigned each boot — so there's no fixed HTTP
     // endpoint to probe. Wait for its init log line instead. This gate isn't
@@ -230,13 +298,13 @@ export async function createConsensusEnv(opts: {
         const oldIp = ipOf(node);
         // a high host octet in the same subnet — nodes get low ones, so it's free
         const newIp = oldIp.replace(/\.\d+$/, ".250");
-        const id = node.container.getId();
-        await dockerNetwork.disconnect({ Container: id });
-        await dockerNetwork.connect({
-          Container: id,
-          EndpointConfig: { IPAMConfig: { IPv4Address: newIp } }
-        });
+        await reconnectAt(node, newIp);
         return { oldIp, newIp };
+      },
+      async recreateInterface(node: NodeClient): Promise<string> {
+        const ip = ipOf(node);
+        await reconnectAt(node, ip);
+        return ip;
       },
       async partition(
         groupA: NodeClient[],

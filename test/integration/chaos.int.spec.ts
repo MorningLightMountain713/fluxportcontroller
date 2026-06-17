@@ -228,4 +228,69 @@ describe("consensus chaos (real containers: kill / partition / loss)", () => {
       }
     }
   );
+
+  it(
+    "same-IP membership loss: a deaf node is excluded on a view change, then self-heals and reclaims its port",
+    { timeout: 5 * T },
+    async () => {
+      // user-IPAM subnet so the victim can be reconnected at its OWN (same) IP, and
+      // a querier so the bridge FILTERS multicast by membership — without it the
+      // bridge floods and a dropped membership is silently harmless (no gap).
+      const env: ConsensusEnv = await createConsensusEnv({
+        nodes: NODES,
+        subnet: "10.88.0.0/24",
+        querier: true
+      });
+      try {
+        const before = allocByNid(await converge(env.nodes, NODES, "initial"));
+        const victim = largestNid(env.nodes);
+        const victimNid = victim.expectedNid!;
+        const victimPort = before[victimNid];
+        assert.equal(typeof victimPort, "number", "victim had no port to start");
+
+        // Destroy + recreate the victim's interface at the SAME IP: a genuine
+        // NETDEV_UNREGISTER/REGISTER (new ifindex/in_dev) that drops the socket's
+        // multicast membership the kernel will NOT auto-restore onto a new
+        // interface. The unicast token still reaches the victim, so it stays in the
+        // ring HOLDING ITS PORT — multicast-deaf but latent: in steady state there
+        // is no multicast traffic to miss, and no detector fires.
+        await env.recreateInterface(victim);
+
+        // Force a view change: a node joins. The deaf victim can't hear the GATHER,
+        // so it is excluded, its stale token dies, and it collapses to a lone ring.
+        // THAT collapse (at an unchanged address) is what the fix catches: it
+        // rebinds in place (re-issuing addMembership on the new interface), rejoins,
+        // and reclaims its exact port. Without the fix the collapse hits the
+        // unchanged-address no-op and the node is stuck deaf forever.
+        //
+        // The joiner's nid sorts above the victim's (the largest original), so the
+        // victim wins any contention for its prior port — reclaim is deterministic.
+        const joiner = await env.addNode("z-joiner");
+        const joinerNid = joiner.expectedNid!;
+        const expected = NODES + 1;
+
+        const after = allocByNid(await converge(env.nodes, expected, "after-view-change"));
+        for (const nid of Object.keys(before)) {
+          assert.equal(
+            after[nid],
+            before[nid],
+            `${nid} changed port across the membership-loss episode`
+          );
+        }
+        assert.equal(after[victimNid], victimPort, "deaf node did not reclaim its port");
+        assert.equal(typeof after[joinerNid], "number", "joiner never got a port");
+
+        // Prove the fix engaged rather than the node surviving by luck: it must have
+        // rebound in place on its unchanged address.
+        const logs = await victim.tailLogs(200);
+        assert.match(
+          logs,
+          /rebinding in place/,
+          "deaf node never rebound in place after the view change"
+        );
+      } finally {
+        await env.teardown();
+      }
+    }
+  );
 });
