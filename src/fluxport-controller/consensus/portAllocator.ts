@@ -26,6 +26,52 @@ import { Clock } from "./clock";
 import { Nid } from "./messages";
 import { Membership, MembershipConfig, View } from "./membership";
 
+/**
+ * The slice of a consensus group the allocator drives. Satisfied by a `Group`
+ * (the Consensus facade) and, via a thin adapter, by a `Membership` built
+ * directly from a transport — so the allocator works either as a Consensus
+ * consumer or standalone (the latter is what its own unit tests construct).
+ */
+export interface AllocatorGroup {
+  bindHooks(hooks: {
+    onDeliver: (payload: unknown, seq: number) => void;
+    onViewChange: (view: View) => void;
+  }): void;
+  broadcast(payload: unknown): void;
+  readonly members: Nid[];
+  readonly viewId: string;
+  start(): void;
+  bootstrap(): void;
+  stop(): void;
+}
+
+/** Adapt a directly-built Membership to the AllocatorGroup the allocator drives. */
+class MembershipGroup implements AllocatorGroup {
+  constructor(private readonly membership: Membership) {}
+  bindHooks(): void {
+    // no-op: a MembershipGroup's hooks are fixed at Membership construction.
+  }
+  broadcast(payload: unknown): void {
+    this.membership.broadcast(payload);
+  }
+  get members(): Nid[] {
+    return this.membership.currentMembers;
+  }
+  get viewId(): string {
+    const r = this.membership.currentRing;
+    return `${r.rep}:${r.seq}`;
+  }
+  start(): void {
+    this.membership.start();
+  }
+  bootstrap(): void {
+    this.membership.bootstrap();
+  }
+  stop(): void {
+    this.membership.stop();
+  }
+}
+
 export type AllocatorPhase = "JOINING" | "CLAIMING" | "OWNED" | "WAITING";
 
 interface ClaimPayload {
@@ -64,11 +110,17 @@ export interface PortAllocatorHooks {
 }
 
 export interface PortAllocatorOptions {
-  self: Nid; // transport address (ring identity)
-  transport: Transport;
-  clock: Clock;
+  self: Nid; // transport address (ring identity); the identity default
   config: PortAllocatorConfig;
   hooks?: PortAllocatorHooks;
+  /**
+   * Consensus consumer path: an already-joined group to drive. When omitted, the
+   * allocator builds its own Membership from `transport`/`clock` (standalone).
+   */
+  group?: AllocatorGroup;
+  /** Standalone path: required when `group` is absent. */
+  transport?: Transport;
+  clock?: Clock;
 }
 
 function fnv1a(id: Nid, port: number): number {
@@ -84,7 +136,7 @@ function fnv1a(id: Nid, port: number): number {
 export class PortAllocator {
   readonly self: Nid;
   readonly identity: Nid;
-  private readonly membership: Membership;
+  private readonly group: AllocatorGroup;
   private readonly ports: number[];
   private readonly priority: number;
   private readonly hash: (id: Nid, port: number) => number;
@@ -106,26 +158,35 @@ export class PortAllocator {
     this.hash = opts.config.hash ?? fnv1a;
     this.hooks = opts.hooks ?? {};
     this.desiredPort = opts.config.priorPort ?? null;
-    this.membership = new Membership({
-      self: opts.self,
-      transport: opts.transport,
-      clock: opts.clock,
-      config: opts.config,
-      hooks: {
-        onDeliver: (payload) => this.onDeliver(payload as AllocPayload),
-        onViewChange: (view) => this.onViewChange(view)
-      }
+    this.group =
+      opts.group ??
+      new MembershipGroup(
+        new Membership({
+          self: opts.self,
+          transport: opts.transport!,
+          clock: opts.clock!,
+          config: opts.config,
+          hooks: {
+            onDeliver: (payload) => this.onDeliver(payload as AllocPayload),
+            onViewChange: (view) => this.onViewChange(view)
+          }
+        })
+      );
+    // Consumer path: the injected group forwards delivery/view-change to us.
+    this.group.bindHooks({
+      onDeliver: (payload) => this.onDeliver(payload as AllocPayload),
+      onViewChange: (view) => this.onViewChange(view)
     });
   }
 
   start(): void {
-    this.membership.start();
+    this.group.start();
   }
   bootstrap(): void {
-    this.membership.bootstrap();
+    this.group.bootstrap();
   }
   stop(): void {
-    this.membership.stop();
+    this.group.stop();
   }
 
   get port(): number | null {
@@ -135,12 +196,11 @@ export class PortAllocator {
     return this.phase;
   }
   get currentMembers(): Nid[] {
-    return this.membership.currentMembers;
+    return this.group.members;
   }
   /** Current ring identifier (for tests: are all nodes in the same view?). */
   get viewId(): string {
-    const r = this.membership.currentRing;
-    return `${r.rep}:${r.seq}`;
+    return this.group.viewId;
   }
   /** Read-only allocation snapshot {port: owner identity} (for tests/observability). */
   snapshot(): Record<number, Nid> {
@@ -246,7 +306,7 @@ export class PortAllocator {
       port: pick,
       priority: this.priority
     };
-    this.membership.broadcast(claim);
+    this.group.broadcast(claim);
   }
 
   private confirm(port: number): void {

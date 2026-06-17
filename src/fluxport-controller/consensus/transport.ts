@@ -21,6 +21,65 @@ import { Clock } from "./clock";
 export type MessageHandler = (msg: ProtocolMessage, from: string) => void;
 export type ErrorHandler = (err: NodeJS.ErrnoException) => void;
 
+/**
+ * What a `GroupTransport` needs from the shared `Consensus` core: the live real
+ * transport (sends + localAddress + errors) and a demux registry it routes its
+ * own inbound through, keyed by groupId. Kept here to avoid a transport→consensus
+ * import cycle.
+ */
+export interface SharedTransportHost {
+  /** The real transport currently owning the socket (swapped on a heal). */
+  readonly realTransport: Transport;
+  /** Register/replace this group's inbound handler in the demux. */
+  registerGroup(groupId: string, handler: MessageHandler): void;
+  /** Remove this group's inbound handler from the demux. */
+  unregisterGroup(groupId: string): void;
+  /** Subscribe to shared transport errors (all groups share one socket). */
+  onSharedError(handler: ErrorHandler): void;
+}
+
+/**
+ * A per-group view of the shared real transport. Sends delegate to the real
+ * transport (messages are already groupId-stamped by the consensus modules), but
+ * inbound is routed via the Consensus demux so only this group's traffic reaches
+ * its handler. It does NOT own the socket lifecycle — `start` is a no-op and
+ * `stop` only detaches this group, leaving the shared socket up for the others.
+ */
+export class GroupTransport implements Transport {
+  constructor(
+    private readonly groupId: string,
+    private readonly host: SharedTransportHost
+  ) {}
+
+  get localAddress(): string {
+    return this.host.realTransport.localAddress;
+  }
+
+  start(): Promise<void> {
+    return Promise.resolve(); // Consensus owns the shared socket lifecycle
+  }
+
+  stop(): void {
+    this.host.unregisterGroup(this.groupId); // detach only this group
+  }
+
+  sendMulticast(msg: ProtocolMessage): void {
+    this.host.realTransport.sendMulticast(msg);
+  }
+
+  sendUnicast(msg: ProtocolMessage, to: string): void {
+    this.host.realTransport.sendUnicast(msg, to);
+  }
+
+  onMessage(handler: MessageHandler): void {
+    this.host.registerGroup(this.groupId, handler);
+  }
+
+  onError(handler: ErrorHandler): void {
+    this.host.onSharedError(handler);
+  }
+}
+
 export interface Transport {
   readonly localAddress: string;
   start(): Promise<void>;
