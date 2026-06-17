@@ -28,11 +28,15 @@ import {
   McastMessage,
   JoinMessage,
   CommitProposeMessage,
-  CommitReplyMessage
+  CommitReplyMessage,
+  DEFAULT_GROUP_ID
 } from "./messages";
 import { sortMembers, successorOf, representativeOf } from "./ring";
 
 export interface TokenRingConfig {
+  /** Named consensus group; defaults to DEFAULT_GROUP_ID. Inherited down the
+   *  stack so one config scopes the whole ring/ordering/membership chain. */
+  groupId?: string;
   /** Minimum time the token is held before forwarding (idle pacing). */
   tokenRotationTarget: number;
   /** If the token hasn't returned within this, retransmit to the successor. */
@@ -72,6 +76,7 @@ export interface TokenRingOptions {
 
 export class TokenRing {
   readonly self: Nid;
+  readonly groupId: string;
   private readonly transport: Transport;
   private readonly clock: Clock;
   private readonly config: TokenRingConfig;
@@ -91,6 +96,7 @@ export class TokenRing {
 
   constructor(opts: TokenRingOptions) {
     this.self = opts.self;
+    this.groupId = opts.config.groupId ?? DEFAULT_GROUP_ID;
     this.transport = opts.transport;
     this.clock = opts.clock;
     this.config = opts.config;
@@ -161,6 +167,7 @@ export class TokenRing {
     if (representativeOf(this.members) !== this.self) return;
     this.receiveToken({
       kind: "TOKEN",
+      groupId: this.groupId,
       ringId: this.ringId,
       tokenSeq: 0,
       seq: 0,
@@ -174,6 +181,10 @@ export class TokenRing {
 
   private handleMessage(msg: ProtocolMessage, from: string): void {
     if (!this.running) return;
+
+    // Another group sharing this socket: silently ignore. A different groupId is
+    // NOT a foreign ring (no reconfiguration) — it is simply not our traffic.
+    if ((msg.groupId ?? DEFAULT_GROUP_ID) !== this.groupId) return;
 
     // Membership-plane messages are delivered regardless of ring — they are how
     // a new view is formed when rings differ.

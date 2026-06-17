@@ -17,7 +17,7 @@
 
 import { Transport } from "./transport";
 import { Clock } from "./clock";
-import { Nid, McastMessage, TokenMessage } from "./messages";
+import { Nid, McastMessage, TokenMessage, DEFAULT_GROUP_ID } from "./messages";
 import { TokenRing, TokenRingConfig, TokenRingHooks } from "./tokenRing";
 
 export interface OrderedBroadcastConfig extends TokenRingConfig {
@@ -47,6 +47,7 @@ export class OrderedBroadcast {
   readonly tokenRing: TokenRing;
   private readonly transport: Transport;
   private readonly config: OrderedBroadcastConfig;
+  private readonly groupId: string;
   private readonly onDeliver: OrderedBroadcastHooks["onDeliver"];
 
   private readonly sendQueue: unknown[] = [];
@@ -59,6 +60,7 @@ export class OrderedBroadcast {
     this.self = opts.self;
     this.transport = opts.transport;
     this.config = opts.config;
+    this.groupId = opts.config.groupId ?? DEFAULT_GROUP_ID;
     this.onDeliver = opts.hooks.onDeliver;
     this.tokenRing = new TokenRing({
       self: opts.self,
@@ -160,6 +162,7 @@ export class OrderedBroadcast {
       const seq = ++token.seq;
       const msg: McastMessage = {
         kind: "MCAST",
+        groupId: this.groupId,
         ringId,
         senderNid: this.self,
         seq,

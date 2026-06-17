@@ -40,7 +40,8 @@ import {
   JoinMessage,
   CommitProposeMessage,
   CommitReplyMessage,
-  MemberState
+  MemberState,
+  DEFAULT_GROUP_ID
 } from "./messages";
 import { sortMembers, representativeOf } from "./ring";
 import { OrderedBroadcast, OrderedBroadcastConfig } from "./orderedBroadcast";
@@ -77,6 +78,7 @@ const ringKey = (r: RingId): string => `${r.rep}:${r.seq}`;
 
 export class Membership {
   readonly self: Nid;
+  readonly groupId: string;
   private readonly transport: Transport;
   private readonly clock: Clock;
   private readonly config: MembershipConfig;
@@ -103,6 +105,7 @@ export class Membership {
 
   constructor(opts: MembershipOptions) {
     this.self = opts.self;
+    this.groupId = opts.config.groupId ?? DEFAULT_GROUP_ID;
     this.transport = opts.transport;
     this.clock = opts.clock;
     this.config = opts.config;
@@ -201,6 +204,7 @@ export class Membership {
   private sendJoin(procSet: Nid[], gathering: boolean): void {
     const msg: JoinMessage = {
       kind: "JOIN",
+      groupId: this.groupId,
       ringId: this.currentRing,
       senderNid: this.self,
       gathering,
@@ -211,6 +215,8 @@ export class Membership {
   }
 
   private onJoin(msg: JoinMessage): void {
+    // Another group's announce/JOIN is not a merge candidate for ours.
+    if ((msg.groupId ?? DEFAULT_GROUP_ID) !== this.groupId) return;
     this.maxSeenSeq = Math.max(this.maxSeenSeq, msg.ringId.seq);
 
     if (this.state === "OPERATIONAL") {
@@ -294,6 +300,7 @@ export class Membership {
     if (!this.commitRing) return;
     const msg: CommitProposeMessage = {
       kind: "COMMIT_PROPOSE",
+      groupId: this.groupId,
       ringId: this.commitRing,
       phase: this.commitPhase,
       originator: this.self,
@@ -319,6 +326,7 @@ export class Membership {
 
   /** Representative: collect a member's reply; advance when all have replied. */
   private onCommitReply(msg: CommitReplyMessage): void {
+    if ((msg.groupId ?? DEFAULT_GROUP_ID) !== this.groupId) return; // not our commit
     if (!this.commitRing || ringKey(msg.ringId) !== ringKey(this.commitRing)) return;
     if (msg.phase !== this.commitPhase) return; // stale-phase reply
     if (msg.phase === "collect") {
@@ -354,6 +362,7 @@ export class Membership {
 
   /** Member (non-representative): handle the representative's proposal. */
   private onCommitPropose(msg: CommitProposeMessage): void {
+    if ((msg.groupId ?? DEFAULT_GROUP_ID) !== this.groupId) return; // not our commit
     this.maxSeenSeq = Math.max(this.maxSeenSeq, msg.ringId.seq);
     if (msg.originator === this.self) return; // the representative drives its own commit
 
@@ -385,6 +394,7 @@ export class Membership {
     if (!this.commitRing) return;
     const msg: CommitReplyMessage = {
       kind: "COMMIT_REPLY",
+      groupId: this.groupId,
       ringId: this.commitRing,
       phase,
       senderNid: this.self,

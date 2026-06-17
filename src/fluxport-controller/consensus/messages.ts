@@ -8,13 +8,21 @@
  * dropped so a coordinated network bump cannot be corrupted by stragglers.
  */
 
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 /** A separator unlikely to occur inside JSON-encoded payloads. */
 export const SEPARATOR = "FPC";
 
 /** Stable node identity: the collateral outpoint "txhash:outidx". */
 export type Nid = string;
+
+/**
+ * The named consensus group a message belongs to. Independent groups (each with
+ * its own ring, ordering and membership) can share one multicast socket; a
+ * message is only ours when its `groupId` matches. Absent on the wire ⇒ this
+ * default, so a single-group deployment behaves exactly as before.
+ */
+export const DEFAULT_GROUP_ID = "default";
 
 /** Identifies a membership configuration (the ring). */
 export interface RingId {
@@ -31,6 +39,12 @@ export type MessageKind =
 
 interface Envelope {
   kind: MessageKind;
+  /**
+   * Which named consensus group this message is scoped to. Always stamped on
+   * outgoing messages; optional so a peer that predates the field (or absent on
+   * the wire) decodes as the default group rather than being rejected.
+   */
+  groupId?: string;
   ringId: RingId;
 }
 
