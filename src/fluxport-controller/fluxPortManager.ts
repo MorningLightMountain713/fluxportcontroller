@@ -22,16 +22,12 @@
  * transparently restore reception when the bound address is removed and restored
  * to the SAME value, or the interface is recreated (a bare link down/up, by
  * contrast, the kernel self-heals — it retains and re-announces the membership).
- * Two event-driven signals trigger a heal — a transport socket error (the fast
- * path, e.g. a send raising EADDRNOTAVAIL) and the consensus collapsing to a lone
- * ring (the reliable path: a deaf node still reforms a one-member ring). A heal
- * re-resolves the local address and rebuilds the transport + allocator — same nid,
- * so the node rejoins and reclaims its port (the proven address-change / same-nid
- * path) — when the address CHANGED, or, on an unchanged address, when we have
- * actually gone deaf (the ring collapsed to just us), which rebinds in place to
- * re-establish the dropped group membership. It is a no-op for a transient blip on
- * a still-healthy multi-member ring and for a genuinely-lone node, so both
- * detectors can fire liberally without harm.
+ * That heal is a NODE-LEVEL concern over the one shared socket, so it lives in
+ * `Consensus`, not here: this manager just hands Consensus two seams it already
+ * owns — `resolveLocalAddress` (re-resolve the LAN IP via fresh UPnP discovery)
+ * and `createTransport(localAddress)` (a fresh multicast socket) — and re-emits
+ * Consensus's `rebound { from, to }` as its own. The persistent allocator's sticky
+ * preference reclaims the held port on the rejoin.
  *
  * Every external dependency is injectable so the whole flow is testable over the
  * in-memory virtual network with no sockets, UPnP, or HTTP.
@@ -46,7 +42,6 @@ import { Clock, SystemClock } from "./consensus/clock";
 import { Transport, MulticastTransport } from "./consensus/transport";
 import { Consensus, Group } from "./consensus/consensus";
 import { PortAllocator } from "./consensus/portAllocator";
-import { View } from "./consensus/membership";
 import { logController } from "./log";
 
 /** The single consensus group this manager runs the port allocation over. */
@@ -169,13 +164,7 @@ export class FluxPortManager extends EventEmitter {
   private consensus: Consensus | null = null;
   private allocator: PortAllocator | null = null;
 
-  // self-heal state
-  private localAddress: string | null = null; // the LAN IP currently bound
   private cachedPriority = Number.MAX_SAFE_INTEGER;
-  private lastConfirmedPort: number | null = null; // for reclaim across a rebind
-  private lastMemberCount = 0; // to detect a multi -> singleton collapse
-  private healing = false;
-  private stopped = false;
 
   constructor(outPoint: OutPoint, options: FluxPortManagerOptions = {}) {
     super();
@@ -228,7 +217,6 @@ export class FluxPortManager extends EventEmitter {
 
   async start(): Promise<boolean> {
     try {
-      this.stopped = false;
       const publicIp = await this.getPublicIp();
 
       const gateway = await this.upnpClient.getGateway();
@@ -264,7 +252,6 @@ export class FluxPortManager extends EventEmitter {
   }
 
   stop(): void {
-    this.stopped = true;
     this.consensus?.stop();
     try {
       this.upnpClient.close?.();
@@ -277,26 +264,35 @@ export class FluxPortManager extends EventEmitter {
 
   /**
    * Build the shared `Consensus`, join the single `ports` group, and wire the
-   * `PortAllocator` to it. Consensus owns the socket and drives start/bootstrap;
-   * a later heal swaps the socket via `consensus.rebuild` while this allocator
-   * persists (its sticky `desiredPort` reclaims the held port on the rejoin).
+   * `PortAllocator` to it. Consensus owns the socket, drives start/bootstrap, and
+   * owns the transport self-heal — it rebuilds the socket (via the `createTransport`
+   * + `resolveLocalAddress` seams handed to it) and all groups rejoin; this manager
+   * just re-emits Consensus's `rebound`. The persistent allocator's sticky
+   * `desiredPort` reclaims the held port on the rejoin.
    */
   private async buildAndStart(
     localAddress: string,
     priorPort: number | null
   ): Promise<void> {
-    this.localAddress = localAddress;
-    // The imminent bootstrap installs a singleton view; reset so it isn't read as
-    // a multi -> singleton collapse (which would re-trigger a heal).
-    this.lastMemberCount = 1;
-
     const transport = this.createTransport(
       localAddress,
       this.multicastGroup,
       this.port
     );
-    const consensus = new Consensus(transport, this.clock);
+    const consensus = new Consensus(transport, this.clock, {
+      localAddress,
+      resolveLocalAddress: this.resolveLocalAddress,
+      // Adapt the node-level seam (address only) to this manager's group+port-aware
+      // transport factory.
+      createTransport: (addr) =>
+        this.createTransport(addr, this.multicastGroup, this.port)
+    });
     this.consensus = consensus;
+
+    // Consensus owns the node-level self-heal; surface its rebind as our own event.
+    consensus.on("rebound", (e: { from: string | null; to: string }) =>
+      this.emit("rebound", e)
+    );
 
     const config = {
       ...this.timing,
@@ -318,100 +314,12 @@ export class FluxPortManager extends EventEmitter {
       config,
       group,
       hooks: {
-        onPortConfirmed: (port) => {
-          this.lastConfirmedPort = port;
-          this.emit("portConfirmed", port);
-        },
-        onWaiting: () => this.emit("noPortAvailable"),
-        onViewChange: (view) => this.onViewChange(view)
+        onPortConfirmed: (port) => this.emit("portConfirmed", port),
+        onWaiting: () => this.emit("noPortAvailable")
       }
     });
 
-    // A post-start socket error on the shared socket drives the self-heal decision.
-    consensus.onSharedError((err) => this.onTransportError(err));
-
     await consensus.start();
-  }
-
-  // ---- self-heal on a live IP change ----
-
-  /** Reliable detector: a collapse to a one-member view means we've gone deaf. */
-  private onViewChange(view: View): void {
-    const wasMulti = this.lastMemberCount > 1;
-    this.lastMemberCount = view.members.length;
-    if (view.members.length === 1 && wasMulti) {
-      this.triggerHeal("isolated");
-    }
-  }
-
-  /** Fast detector: a post-start socket error (e.g. our bound IP vanished). */
-  private onTransportError(err: NodeJS.ErrnoException): void {
-    logger.warn(`Transport error (${err.code ?? err.message}); re-validating address`);
-    this.triggerHeal(`transport:${err.code ?? "error"}`);
-  }
-
-  private triggerHeal(reason: string): void {
-    if (this.stopped || this.healing) return;
-    this.healing = true;
-    void this.heal(reason).finally(() => {
-      this.healing = false;
-    });
-  }
-
-  /**
-   * Re-resolve our LAN address and rebuild the shared transport (same nid, so we
-   * rejoin and reclaim our port) when either the address CHANGED, or it is
-   * unchanged but we have gone deaf — the ring collapsed to a lone member, so a
-   * same-IP membership loss (the bound IP removed and restored, or the interface
-   * recreated) is the cause and rebinding in place re-establishes the dropped
-   * group membership. A no-op for a transient blip on a still-healthy
-   * (multi-member) ring and for a genuinely-lone node, so both detectors can fire
-   * liberally without harm.
-   *
-   * The DECISION lives here; the mechanical socket swap (rejoin every group on the
-   * new transport) is `consensus.rebuild`. The persistent allocator's sticky
-   * preference reclaims the held port on the fresh ring.
-   */
-  private async heal(reason: string): Promise<void> {
-    let newAddress: string;
-    try {
-      newAddress = await this.resolveLocalAddress();
-    } catch (err) {
-      logger.warn(`Heal (${reason}) address re-resolve failed: ${err}`);
-      return;
-    }
-    if (this.stopped || !newAddress || !this.consensus) return;
-
-    // A changed address must rebuild (the ring is keyed by address). An unchanged
-    // address only rebuilds if we have actually gone deaf — consensus collapsed to
-    // a lone ring — which cures a same-IP membership loss the kernel does not
-    // transparently recover; otherwise it is a harmless no-op (a transient blip on
-    // a healthy ring, or a genuinely-lone node).
-    const addressChanged = newAddress !== this.localAddress;
-    const wentDeaf = this.members.length <= 1;
-    if (!addressChanged && !wentDeaf) return;
-
-    const from = this.localAddress;
-    // The held port is reclaimed by the persistent allocator's sticky preference;
-    // log it for observability. assignedPort is transiently null if the heal fired
-    // mid view-change (the isolation path), so fall back to the last confirmed.
-    const heldPort = this.assignedPort ?? this.lastConfirmedPort;
-    logger.info(
-      addressChanged
-        ? `Heal (${reason}): local address ${from} -> ${newAddress}; rebinding (port ${heldPort})`
-        : `Heal (${reason}): rebinding in place on ${newAddress} after a membership loss (port ${heldPort})`
-    );
-
-    this.localAddress = newAddress;
-    // The imminent re-bootstrap installs a singleton view; reset so it isn't read
-    // as a multi -> singleton collapse (which would re-trigger a heal).
-    this.lastMemberCount = 1;
-    // Defer building the new transport until Consensus has closed the old socket,
-    // so an in-place rebind can re-bind the same address.
-    await this.consensus.rebuild(() =>
-      this.createTransport(newAddress, this.multicastGroup, this.port)
-    );
-    this.emit("rebound", { from, to: newAddress });
   }
 
   // ---- default real-world resolvers (injectable above) ----
