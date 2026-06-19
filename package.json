@@ -16,7 +16,7 @@
     "build": "tsc",
     "prepare": "npm run build",
     "watch": "tsc --watch",
-    "unittest": "node --import tsx --test test/unit/*.spec.ts test/unit/consensus/*.spec.ts",
+    "unittest": "node --import tsx --test test/unit/*.spec.ts test/unit/consensus/*.spec.ts test/unit/upnp/*.spec.ts",
     "inttest": "node --import tsx --test test/integration/*.int.spec.ts",
     "inttest:chaos": "node --import tsx --test test/integration/chaos.int.spec.ts",
     "start": "node --import tsx test_docker_entrypoint.ts"
