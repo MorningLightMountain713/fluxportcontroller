@@ -3,7 +3,7 @@
 import os from "node:os";
 import { createServer } from "node:http";
 import axios from "axios";
-import { FluxPortManager, FluxPortManagerOptions, logController } from "./src";
+import { FluxNodeAgent, FluxNodeAgentOptions, logController } from "./src";
 
 logController.addLoggerTransport("console");
 
@@ -27,7 +27,7 @@ const nid = `${txhash}:${outidx}`;
 const statusPort = process.env.STATUS_PORT ? +process.env.STATUS_PORT : 33334;
 const reportUrl = process.env.REPORT_URL || null;
 
-const options: FluxPortManagerOptions = {
+const options: FluxNodeAgentOptions = {
   multicastGroup: process.env.MULTICAST_GROUP || "239.16.32.15",
   port: process.env.PORT ? +process.env.PORT : 33333
 };
@@ -40,7 +40,7 @@ if (harness) {
   });
 }
 
-const manager = new FluxPortManager({ txhash, outidx }, options);
+const manager = new FluxNodeAgent({ txhash, outidx }, options);
 
 let confirmedPort: number | null = null;
 
