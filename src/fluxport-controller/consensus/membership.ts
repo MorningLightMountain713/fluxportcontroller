@@ -64,6 +64,10 @@ export interface View {
 export interface MembershipHooks {
   onDeliver: (payload: unknown, seq: number) => void;
   onViewChange: (view: View) => void;
+  /** Fired (off the critical path) when this node holds this group's token — the
+   *  generic turn-taking baton. Must not block or throw; the token rotates
+   *  regardless (it shares the dispatch path with delivery). */
+  onTokenGranted?: () => void;
 }
 
 export interface MembershipOptions {
@@ -119,6 +123,7 @@ export class Membership {
         onDeliver: opts.hooks.onDeliver,
         onTokenLost: () => this.trigger("tokenLost"),
         onForeignMessage: () => this.trigger("foreign"),
+        onTokenGranted: opts.hooks.onTokenGranted,
         onJoin: (msg) => this.onJoin(msg),
         onCommitPropose: (msg) => this.onCommitPropose(msg),
         onCommitReply: (msg) => this.onCommitReply(msg)
@@ -152,6 +157,11 @@ export class Membership {
 
   get currentMembers(): Nid[] {
     return this.ob.tokenRing.currentMembers;
+  }
+  /** Ring-health evidence: peer multicasts heard on this group (self excluded),
+   *  monotonic. See `TokenRing.multicastReceivedCount`. */
+  get multicastReceivedCount(): number {
+    return this.ob.tokenRing.multicastReceivedCount;
   }
   get currentRing(): RingId {
     return this.ob.tokenRing.ring ?? { rep: this.self, seq: 1 };

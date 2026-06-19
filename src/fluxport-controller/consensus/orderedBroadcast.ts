@@ -29,6 +29,7 @@ export interface OrderedBroadcastHooks {
   onDeliver: (payload: unknown, seq: number) => void;
   onTokenLost?: () => void;
   onForeignMessage?: TokenRingHooks["onForeignMessage"];
+  onTokenGranted?: TokenRingHooks["onTokenGranted"];
   onJoin?: TokenRingHooks["onJoin"];
   onCommitPropose?: TokenRingHooks["onCommitPropose"];
   onCommitReply?: TokenRingHooks["onCommitReply"];
@@ -72,6 +73,7 @@ export class OrderedBroadcast {
         onMcast: (msg) => this.onMcast(msg),
         onTokenLost: opts.hooks.onTokenLost,
         onForeignMessage: opts.hooks.onForeignMessage,
+        onTokenGranted: opts.hooks.onTokenGranted,
         onJoin: opts.hooks.onJoin,
         onCommitPropose: opts.hooks.onCommitPropose,
         onCommitReply: opts.hooks.onCommitReply

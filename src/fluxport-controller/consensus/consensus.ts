@@ -49,6 +49,10 @@ const logger = logController.getLogger();
 export interface GroupHooks {
   onDeliver: (payload: unknown, seq: number) => void;
   onViewChange: (view: View) => void;
+  /** Fired (off the critical path) when this node holds this group's token — the
+   *  generic turn-taking baton. Must not block or throw; the token rotates
+   *  regardless (it shares the dispatch path with delivery). */
+  onTokenGranted?: () => void;
 }
 
 export interface GroupOptions {
@@ -84,11 +88,29 @@ export class Group {
 
   /** internal: the Membership forwards delivery here so hooks stay rebindable. */
   deliver(payload: unknown, seq: number): void {
-    this.hooks.onDeliver(payload, seq);
+    this.safely("onDeliver", () => this.hooks.onDeliver(payload, seq));
   }
   /** internal: the Membership forwards view changes here. */
   changeView(view: View): void {
-    this.hooks.onViewChange(view);
+    this.safely("onViewChange", () => this.hooks.onViewChange(view));
+  }
+  /** internal: the Membership forwards token grants here so hooks stay rebindable. */
+  grantToken(): void {
+    this.safely("onTokenGranted", () => this.hooks.onTokenGranted?.());
+  }
+
+  /**
+   * Run a consumer hook in isolation: a feature's throw is logged and contained
+   * here at the Group boundary, never propagated back into the consensus dispatch
+   * path (where it would escape the socket 'message' / rotation-timer callbacks and
+   * crash the node). One feature's bug must not take down the shared ring.
+   */
+  private safely(hook: string, fn: () => void): void {
+    try {
+      fn();
+    } catch (err) {
+      logger.warn(`Group "${this.groupId}" ${hook} hook threw (ignored): ${err}`);
+    }
   }
 
   broadcast(payload: unknown): void {
@@ -100,6 +122,12 @@ export class Group {
   }
   get representative(): Nid | null {
     return representativeOf(this.membership.currentMembers);
+  }
+  /** Ring-health evidence: peer multicasts heard on this group (self excluded),
+   *  monotonic. Correlate across `onTokenGranted` laps to detect a deaf-but-latent
+   *  node — grants keep arriving (unicast token) while this count stalls. */
+  get multicastReceivedCount(): number {
+    return this.membership.multicastReceivedCount;
   }
   get viewId(): string {
     const r: RingId = this.membership.currentRing;
@@ -227,7 +255,8 @@ export class Consensus extends EventEmitter implements SharedTransportHost {
         onViewChange: (view) => {
           this.observeView(joined, view);
           joined.group.changeView(view);
-        }
+        },
+        onTokenGranted: () => joined.group.grantToken()
       }
     });
   }

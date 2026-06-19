@@ -56,6 +56,11 @@ export interface TokenRingHooks {
   onForeignMessage?: (msg: ProtocolMessage, from: string) => void;
   onReceiveToken?: (token: TokenMessage) => void;
   onForward?: (token: TokenMessage, to: Nid) => void;
+  /** Fired (off the critical path) when this node receives/holds the token — the
+   *  generic turn-taking baton a consumer can pace work on. The handler MUST NOT
+   *  block or throw (it shares the dispatch path with delivery): the token forwards
+   *  on its own rotation timer regardless of what the consumer does with its turn. */
+  onTokenGranted?: () => void;
   /** Phase 3 hook: mutate the token (assign seqs, service rtr, update aru) while held. */
   processToken?: (token: TokenMessage) => void;
   /** Phase 3 hook: an in-ring application multicast was received. */
@@ -87,6 +92,7 @@ export class TokenRing {
   private running = false;
   private holdsToken = false;
   private lastToken: TokenMessage | null = null;
+  private multicastReceived = 0;
 
   private lossTimer: TimerId | null = null;
   private retransmitTimer: TimerId | null = null;
@@ -112,6 +118,13 @@ export class TokenRing {
   }
   get holding(): boolean {
     return this.holdsToken;
+  }
+  /** Count of multicast messages received from peers (own looped-back sends
+   *  excluded) — the "I can still hear the segment" evidence for ring-health.
+   *  Monotonic; consumers correlate it across `onTokenGranted` laps (a deaf-but-
+   *  latent node keeps getting the unicast token but this count stalls). */
+  get multicastReceivedCount(): number {
+    return this.multicastReceived;
   }
   get successor(): Nid {
     return successorOf(this.self, this.members);
@@ -186,6 +199,12 @@ export class TokenRing {
     // NOT a foreign ring (no reconfiguration) — it is simply not our traffic.
     if ((msg.groupId ?? DEFAULT_GROUP_ID) !== this.groupId) return;
 
+    // Ring-health evidence: any multicast from a PEER (every kind but the unicast
+    // TOKEN) proves this node can still hear the multicast plane. Own looped-back
+    // sends are excluded, so a deaf-but-latent node — unicast token still arriving,
+    // multicast gone — shows a stalled count.
+    if (msg.kind !== "TOKEN" && from !== this.self) this.multicastReceived += 1;
+
     // Membership-plane messages are delivered regardless of ring — they are how
     // a new view is formed when rings differ.
     if (msg.kind === "JOIN") {
@@ -241,6 +260,10 @@ export class TokenRing {
     this.forwardTimer = this.clock.setTimer(this.config.tokenRotationTarget, () =>
       this.forwardToken()
     );
+
+    // Grant the baton AFTER the forward timer is armed, so a (non-blocking)
+    // consumer's turn can never delay rotation: the token forwards regardless.
+    this.hooks.onTokenGranted?.();
   }
 
   private forwardToken(): void {
