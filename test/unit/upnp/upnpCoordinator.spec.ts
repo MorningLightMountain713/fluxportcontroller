@@ -61,6 +61,7 @@ class FakeUpnpClient implements UpnpClientLike {
   getCalls: MappingQuery[] = [];
   getMappingsCalls = 0;
   createCalls: NewMapping[] = [];
+  removeCalls: MappingQuery[] = [];
   /** Default getMapping result for a port NOT tracked in `byPort` — single-port tests
    *  set this directly. */
   mapping: UpnpMapping | null = null;
@@ -86,6 +87,12 @@ class FakeUpnpClient implements UpnpClientLike {
   /** createMapping rejects for any port in this set (an un-mappable port: conflict /
    *  ACL) — models a port that persistently fails its write while others succeed. */
   failCreatePorts = new Set<number>();
+  /** removeMapping rejects for any port in this set (a delete that persistently fails). */
+  failRemovePorts = new Set<number>();
+  /** When set to a port, getMapping for THAT port suspends until releaseGet() is called —
+   *  lets a test interleave a state mutation (e.g. a re-desire) mid-await. */
+  gateGetPort: number | null = null;
+  private gateResolve: (() => void) | null = null;
 
   async getGateway(): Promise<UpnpInfoLike> {
     throw new Error("unused");
@@ -104,8 +111,18 @@ class FakeUpnpClient implements UpnpClientLike {
   }
   async getMapping(q: MappingQuery): Promise<UpnpMapping | null> {
     this.getCalls.push(q);
+    if (this.gateGetPort === q.public) {
+      await new Promise<void>((resolve) => {
+        this.gateResolve = resolve;
+      });
+    }
     if (this.byPort.has(q.public)) return this.byPort.get(q.public) ?? null;
     return this.mapping;
+  }
+  /** Release a getMapping suspended by gateGetPort (resolves it with current state). */
+  releaseGet(): void {
+    this.gateResolve?.();
+    this.gateResolve = null;
   }
   async createMapping(m: NewMapping): Promise<void> {
     this.createCalls.push(m);
@@ -126,8 +143,11 @@ class FakeUpnpClient implements UpnpClientLike {
       });
     }
   }
-  async removeMapping(): Promise<void> {
-    throw new Error("unused");
+  async removeMapping(q: MappingQuery): Promise<void> {
+    this.removeCalls.push(q);
+    if (this.failRemovePorts.has(q.public)) throw new Error(`remove failed for ${q.public}`);
+    // A real router drops the entry: the next read for this port returns null.
+    this.byPort.set(q.public, null);
   }
 }
 
@@ -181,6 +201,7 @@ function makeCoordinator(
     tokenStallMs?: number;
     selfCheckCycleMs?: number;
     selfCheckWindows?: number;
+    orphanConfirmPasses?: number;
     start?: boolean;
     onMappingFailed?: (port: number, reason: string) => void;
   }
@@ -206,6 +227,7 @@ function makeCoordinator(
     tokenStallMs: opts.tokenStallMs ?? 1_000_000, // effectively off unless overridden
     selfCheckCycleMs: opts.selfCheckCycleMs ?? 10,
     selfCheckWindows: opts.selfCheckWindows ?? 1,
+    orphanConfirmPasses: opts.orphanConfirmPasses,
     hooks: { onMappingFailed: opts.onMappingFailed }
   });
   if (opts.start !== false) coordinator.start();
@@ -477,7 +499,7 @@ describe("UpnpCoordinator (desired port SET)", () => {
     }
   });
 
-  it("stops maintaining a port once it is dropped from the set", async () => {
+  it("prunes a port dropped from the set (read-before-delete) and never re-maps it", async () => {
     const w = makeWorld();
     const node = w.makeNode("10.0.0.11");
     const client = new FakeUpnpClient();
@@ -485,7 +507,8 @@ describe("UpnpCoordinator (desired port SET)", () => {
     const { coordinator } = makeCoordinator(node, w.clock, {
       self: "nidA",
       localAddress: "10.0.0.11",
-      client
+      client,
+      orphanConfirmPasses: 0 // prune promptly so the delete is observed without the grace
     });
     coordinator.setDesiredPortSet([16111, 16222]);
 
@@ -497,21 +520,28 @@ describe("UpnpCoordinator (desired port SET)", () => {
       "both ports mapped while desired"
     );
 
-    // Drop 16222 from the desired set: from now on it must never be touched again.
+    // Drop 16222: it is now an orphan — its OWN mapping is pruned on a later turn, and it
+    // is never re-mapped. 16111 stays maintained.
     coordinator.setDesiredPortSet([16111]);
     client.getCalls.length = 0;
     client.createCalls.length = 0;
     await runLaps(w.clock);
 
-    assert.ok(
-      client.getCalls.every((q) => q.public !== 16222),
-      "the dropped port is no longer checked"
+    assert.deepEqual(
+      client.removeCalls.map((q) => q.public),
+      [16222],
+      "the dropped port's own mapping was deleted, exactly once"
     );
     assert.ok(
       client.getCalls.some((q) => q.public === 16111),
-      "the still-desired port is still checked"
+      "the still-desired port is still maintained (read-before-write)"
     );
-    assert.equal(client.createCalls.length, 0, "and nothing was re-mapped (16111 stayed healthy)");
+    assert.equal(
+      client.createCalls.length,
+      0,
+      "nothing was re-mapped — neither the healthy 16111 nor the pruned 16222"
+    );
+    assert.deepEqual(coordinator.pendingUnmaps, [], "the orphan queue drained");
   });
 
   it("shares the permanent-lease latch across every port (one 725 covers the whole set)", async () => {
@@ -992,13 +1022,22 @@ describe("UpnpCoordinator (5b leader-check)", () => {
  *  settable multicast count and a captured token-grant hook to "deliver" batons. */
 class FakeGroup {
   private granted: () => void = () => {};
+  private delivered: (payload: unknown) => void = () => {};
   multicast = 0; // the controllable ring-health evidence
   rep: string | null = null;
   memberList: string[] = [];
   broadcasts: unknown[] = [];
 
-  bindHooks(hooks: { onTokenGranted?: () => void }): void {
+  bindHooks(hooks: {
+    onTokenGranted?: () => void;
+    onDeliver?: (payload: unknown) => void;
+  }): void {
     if (hooks.onTokenGranted) this.granted = hooks.onTokenGranted;
+    if (hooks.onDeliver) this.delivered = hooks.onDeliver;
+  }
+  /** Deliver an ordered-broadcast payload (e.g. a leader's OBSERVED) to the coordinator. */
+  deliver(payload: unknown): void {
+    this.delivered(payload);
   }
   broadcast(payload: unknown): void {
     this.broadcasts.push(payload);
@@ -1639,6 +1678,510 @@ describe("UpnpCoordinator (leader-set adaptive back-off)", () => {
       leadClient.createCalls.map((c) => c.public),
       [16110],
       "and the leader still repaired its OWN port despite the failed enumerate"
+    );
+  });
+});
+
+/**
+ * UpnpCoordinator (orphan cleanup) — a node prunes its OWN mappings that are no longer
+ * desired (an uninstalled app, a reassigned port). Strict-mode delete is self-only, so a
+ * node only ever deletes a mapping pointing at ITSELF; the delete is paced exactly like a
+ * repair (token-gated, read-before-delete, one SOAP in flight). Orphans surface two ways:
+ * a port DROPPED from the desired set (any mode) and a LEFTOVER spotted in the leader's
+ * OBSERVED whole-table broadcast (leader-check, e.g. a mapping from before a restart).
+ *
+ * Most tests drive the same FakeGroup seam the 5c block uses — it now also exposes a
+ * deliver() for ordered-broadcast payloads (a leader's OBSERVED) — so each cleanup pass
+ * is controlled exactly; the broadcast/delivery transport itself is already proven by 5b.
+ * One end-to-end test runs a real 2-node ring for fidelity.
+ */
+describe("UpnpCoordinator (orphan cleanup)", () => {
+  const OBSERVED_TYPE = "UPNP_OBSERVED";
+  const observed = (by: string, mappings: UpnpMapping[]): unknown => ({
+    type: OBSERVED_TYPE,
+    by,
+    mappings
+  });
+
+  /** Build a coordinator over a FakeGroup seam as a NON-leader (rep != self) so a baton
+   *  runs the non-leader checkAndRepair (repair + orphan cleanup) path deterministically.
+   *  self is "nidA" and localAddress "10.0.0.11" (a leader "leaderNid" broadcasts to us). */
+  const seam = (
+    clock: ManualClock,
+    opts: {
+      client?: FakeUpnpClient;
+      orphanConfirmPasses?: number;
+      orphanMaxDeleteAttempts?: number;
+      rate?: number;
+      capacity?: number;
+      onMappingFailed?: (port: number, reason: string) => void;
+    } = {}
+  ): { coordinator: UpnpCoordinator; group: FakeGroup; client: FakeUpnpClient } => {
+    const group = new FakeGroup();
+    group.rep = "leaderNid"; // someone else leads -> this node is a non-leader
+    const client = opts.client ?? new FakeUpnpClient();
+    const coordinator = new UpnpCoordinator({
+      self: "nidA",
+      group: group as unknown as Group,
+      client,
+      clock,
+      localAddress: "10.0.0.11",
+      rate: opts.rate ?? 1000,
+      capacity: opts.capacity ?? 1000,
+      enterLaps: 3,
+      leaveLaps: 5,
+      tokenStallMs: 1_000_000,
+      selfCheckCycleMs: 1_000_000, // slot off — cleanup is driven via batons in LEADER_CHECK
+      selfCheckWindows: 1,
+      orphanConfirmPasses: opts.orphanConfirmPasses,
+      orphanMaxDeleteAttempts: opts.orphanMaxDeleteAttempts,
+      hooks: { onMappingFailed: opts.onMappingFailed }
+    });
+    return { coordinator, group, client };
+  };
+
+  /** Drive K=3 clean laps so the seam node enters LEADER_CHECK (batons then run repair +
+   *  cleanup). The mode flips synchronously in sampleLap; settle drains any async work. */
+  const enterLeaderCheck = async (
+    coordinator: UpnpCoordinator,
+    group: FakeGroup
+  ): Promise<void> => {
+    for (let i = 0; i < 3; i++) {
+      group.multicast += 1;
+      group.baton();
+    }
+    await settle();
+    assert.equal(coordinator.currentMode, "LEADER_CHECK", "entered LEADER_CHECK on clean laps");
+  };
+
+  /** One cleanup pass: a clean baton, a small clock advance (so a time-based rate budget
+   *  can refill), then settle the async repair/cleanup. */
+  const pass = async (group: FakeGroup, clock: ManualClock, ms = 10): Promise<void> => {
+    group.multicast += 1;
+    group.baton();
+    clock.advance(ms);
+    await settle();
+  };
+
+  it("prunes its own leftover seen in the leader's OBSERVED broadcast", async () => {
+    const clock = new ManualClock();
+    const client = new FakeUpnpClient();
+    // 16127 is desired & healthy; 16999 is a leftover from a prior life — a Flux mapping
+    // pointing at us on a port we no longer desire. The router still holds both.
+    client.byPort.set(16127, healthyMapping(16127, "10.0.0.11"));
+    client.byPort.set(16999, healthyMapping(16999, "10.0.0.11"));
+    const { coordinator, group } = seam(clock, { client, orphanConfirmPasses: 0 });
+    coordinator.setDesiredPortSet([16127]);
+    coordinator.start();
+    await enterLeaderCheck(coordinator, group);
+
+    group.deliver(
+      observed("leaderNid", [
+        healthyMapping(16127, "10.0.0.11"),
+        healthyMapping(16999, "10.0.0.11")
+      ])
+    );
+    assert.deepEqual(coordinator.pendingUnmaps, [16999], "the leftover was queued for prune");
+
+    await pass(group, clock);
+
+    assert.deepEqual(
+      client.removeCalls.map((q) => q.public),
+      [16999],
+      "deleted only the undesired leftover"
+    );
+    assert.deepEqual(coordinator.pendingUnmaps, [], "the orphan queue drained");
+    assert.equal(client.createCalls.length, 0, "never re-created anything (16127 stayed healthy)");
+  });
+
+  it("never deletes a mapping owned by another host (a departed node's orphan)", async () => {
+    const clock = new ManualClock();
+    const { coordinator, group, client } = seam(clock, { orphanConfirmPasses: 0 });
+    client.byPort.set(16127, healthyMapping(16127, "10.0.0.11"));
+    coordinator.setDesiredPortSet([16127]);
+    coordinator.start();
+    await enterLeaderCheck(coordinator, group);
+
+    // A Flux orphan on 16999, but it points at 10.0.0.99 — not us. Strict-mode delete is
+    // self-only, so it is not ours to prune (and could not be deleted anyway).
+    group.deliver(observed("leaderNid", [healthyMapping(16999, "10.0.0.99")]));
+    assert.deepEqual(coordinator.pendingUnmaps, [], "another host's orphan is never queued");
+
+    await pass(group, clock);
+    await pass(group, clock);
+    assert.equal(client.removeCalls.length, 0, "and it is never deleted");
+  });
+
+  it("never deletes a non-Flux mapping on one of our own ports", async () => {
+    const clock = new ManualClock();
+    const { coordinator, group, client } = seam(clock, { orphanConfirmPasses: 0 });
+    client.byPort.set(16127, healthyMapping(16127, "10.0.0.11"));
+    coordinator.setDesiredPortSet([16127]);
+    coordinator.start();
+    await enterLeaderCheck(coordinator, group);
+
+    // A manual port forward on 16999 pointing at us, OUTSIDE the Flux namespace — cleanup
+    // must never touch a mapping it does not own by description.
+    group.deliver(
+      observed("leaderNid", [{ ...healthyMapping(16999, "10.0.0.11"), description: "BitTorrent" }])
+    );
+    assert.deepEqual(coordinator.pendingUnmaps, [], "a non-Flux mapping is never an orphan candidate");
+
+    await pass(group, clock);
+    assert.equal(client.removeCalls.length, 0, "and is never deleted");
+  });
+
+  it("does not prune anything until a desired set has been declared (startup latch)", async () => {
+    const clock = new ManualClock();
+    const { coordinator, group, client } = seam(clock, { orphanConfirmPasses: 0 });
+    coordinator.start();
+    await enterLeaderCheck(coordinator, group);
+
+    // No desired set fed yet: a leftover in OBSERVED must NOT be treated as an orphan (the
+    // empty set is "not configured yet", not "I want nothing mapped").
+    group.deliver(observed("leaderNid", [healthyMapping(16127, "10.0.0.11")]));
+    assert.deepEqual(coordinator.pendingUnmaps, [], "no pruning before the desired set is known");
+
+    // Once FluxOS declares the desired set, a genuinely-undesired leftover IS an orphan.
+    coordinator.setDesiredPortSet([16127]);
+    client.byPort.set(16127, healthyMapping(16127, "10.0.0.11"));
+    client.byPort.set(16999, healthyMapping(16999, "10.0.0.11"));
+    group.deliver(
+      observed("leaderNid", [
+        healthyMapping(16127, "10.0.0.11"),
+        healthyMapping(16999, "10.0.0.11")
+      ])
+    );
+    assert.deepEqual(
+      coordinator.pendingUnmaps,
+      [16999],
+      "after the set is declared, the undesired leftover is an orphan"
+    );
+  });
+
+  it("serves a confirm grace before pruning a dropped port", async () => {
+    const clock = new ManualClock();
+    const { coordinator, group, client } = seam(clock); // default grace = 2
+    client.byPort.set(16127, healthyMapping(16127, "10.0.0.11"));
+    coordinator.setDesiredPortSet([16127]);
+    coordinator.start();
+    await enterLeaderCheck(coordinator, group);
+
+    coordinator.setDesiredPortSet([]); // drop -> queued, but held through the confirm grace
+    assert.deepEqual(coordinator.pendingUnmaps, [16127], "queued on drop");
+
+    await pass(group, clock); // grace pass 1
+    await pass(group, clock); // grace pass 2
+    assert.equal(client.removeCalls.length, 0, "not deleted during the confirm grace");
+    assert.deepEqual(coordinator.pendingUnmaps, [16127], "still queued");
+
+    await pass(group, clock); // confirmed -> delete
+    assert.deepEqual(
+      client.removeCalls.map((q) => q.public),
+      [16127],
+      "deleted once the confirm grace elapsed"
+    );
+    assert.deepEqual(coordinator.pendingUnmaps, [], "queue drained");
+  });
+
+  it("never prunes a port dropped then re-added (drop-then-re-add)", async () => {
+    const clock = new ManualClock();
+    const { coordinator, group, client } = seam(clock, { orphanConfirmPasses: 0 });
+    client.byPort.set(16127, healthyMapping(16127, "10.0.0.11"));
+    coordinator.setDesiredPortSet([16127]);
+    coordinator.start();
+    await enterLeaderCheck(coordinator, group);
+
+    coordinator.setDesiredPortSet([]); // drop -> queued
+    assert.deepEqual(coordinator.pendingUnmaps, [16127], "queued on drop");
+    coordinator.setDesiredPortSet([16127]); // re-add -> candidacy cancelled at once
+    assert.deepEqual(coordinator.pendingUnmaps, [], "re-add cancels the orphan candidacy");
+
+    await pass(group, clock);
+    await pass(group, clock);
+    assert.equal(client.removeCalls.length, 0, "the re-added port is never deleted");
+  });
+
+  it("read-before-delete: a port a peer reclaimed since is not deleted", async () => {
+    const clock = new ManualClock();
+    const { coordinator, group, client } = seam(clock, { orphanConfirmPasses: 0 });
+    client.byPort.set(16127, healthyMapping(16127, "10.0.0.11"));
+    client.byPort.set(16999, healthyMapping(16999, "10.0.0.11")); // ours while desired
+    coordinator.setDesiredPortSet([16127, 16999]);
+    coordinator.start();
+    await enterLeaderCheck(coordinator, group);
+
+    // Drop 16999 -> queued as our orphan. But before we delete it, a peer reclaims the
+    // port: the router now shows it pointing at 10.0.0.22. Read-before-delete must see it
+    // is no longer ours and leave it alone (strict mode would 606 us anyway).
+    coordinator.setDesiredPortSet([16127]);
+    assert.deepEqual(coordinator.pendingUnmaps, [16999], "queued on drop");
+    client.byPort.set(16999, healthyMapping(16999, "10.0.0.22"));
+
+    await pass(group, clock);
+
+    assert.equal(client.removeCalls.length, 0, "did not delete a mapping that is no longer ours");
+    assert.deepEqual(coordinator.pendingUnmaps, [], "and dropped it from the queue");
+  });
+
+  it("a persistently-failing unmap does not starve the other orphans (rotating cursor)", async () => {
+    const clock = new ManualClock();
+    const client = new FakeUpnpClient();
+    client.byPort.set(16127, healthyMapping(16127, "10.0.0.11"));
+    client.byPort.set(16500, healthyMapping(16500, "10.0.0.11"));
+    client.byPort.set(16600, healthyMapping(16600, "10.0.0.11"));
+    client.failRemovePorts = new Set([16500]); // 16500's delete ALWAYS fails (sinks a token)
+    const failed: Array<{ port: number; reason: string }> = [];
+    const { coordinator, group } = seam(clock, {
+      client,
+      orphanConfirmPasses: 0,
+      orphanMaxDeleteAttempts: 100, // keep 16500 queued the whole test — isolate the cursor
+      rate: 1000, // refills the bucket each pass...
+      capacity: 1, // ...but only ONE token at a time, so one delete attempt per pass
+      onMappingFailed: (port, reason) => failed.push({ port, reason })
+    });
+    coordinator.setDesiredPortSet([16127, 16500, 16600]);
+    coordinator.start();
+    await enterLeaderCheck(coordinator, group);
+
+    // Drop both app ports: both are orphans. 16500's delete always fails and sinks the
+    // lone token; with a FIXED walk it would be attempted first every pass and 16600 would
+    // never be deleted — the rotating cursor must let the tail orphan through. (The retry
+    // bound is set high here so this test isolates cursor fairness; the bound is tested
+    // separately below.)
+    coordinator.setDesiredPortSet([16127]);
+    for (let i = 0; i < 8; i++) await pass(group, clock);
+
+    assert.ok(
+      failed.some((f) => f.port === 16500),
+      "the failing unmap surfaced via onMappingFailed"
+    );
+    assert.ok(
+      client.removeCalls.some((q) => q.public === 16600),
+      "the deletable tail orphan WAS pruned despite the token sink (cursor rotated)"
+    );
+    assert.ok(
+      coordinator.pendingUnmaps.includes(16500),
+      "the un-deletable orphan stays queued (retried), not silently dropped"
+    );
+  });
+
+  it("serves repairs before orphan deletes under a tight budget", async () => {
+    const clock = new ManualClock();
+    const client = new FakeUpnpClient();
+    client.reflectCreates = true;
+    client.byPort.set(16127, healthyMapping(16127, "10.0.0.11"));
+    client.byPort.set(16500, healthyMapping(16500, "10.0.0.11"));
+    const { coordinator, group } = seam(clock, {
+      client,
+      orphanConfirmPasses: 0,
+      rate: 0,
+      capacity: 1 // exactly ONE token ever
+    });
+    coordinator.setDesiredPortSet([16127, 16500]);
+    coordinator.start();
+    await enterLeaderCheck(coordinator, group);
+
+    // Now make 16127 (still desired) need a re-map AND drop 16500 to an orphan. With one
+    // token total, the repair must win it — a wanted port up beats a dead one removed.
+    coordinator.setDesiredPortSet([16127]);
+    client.byPort.set(16127, null);
+    for (let i = 0; i < 5; i++) await pass(group, clock);
+
+    assert.deepEqual(
+      client.createCalls.map((c) => c.public),
+      [16127],
+      "the repair won the only token"
+    );
+    assert.equal(client.removeCalls.length, 0, "the orphan delete was not served (repairs first)");
+    assert.ok(
+      coordinator.pendingUnmaps.includes(16500),
+      "the orphan stays queued for when the budget allows"
+    );
+  });
+
+  it("does not delete a port re-desired DURING the awaited unmap (in-flight re-desire race)", async () => {
+    const clock = new ManualClock();
+    const client = new FakeUpnpClient();
+    client.byPort.set(16127, healthyMapping(16127, "10.0.0.11"));
+    client.byPort.set(16999, healthyMapping(16999, "10.0.0.11"));
+    const { coordinator, group } = seam(clock, { client, orphanConfirmPasses: 0 });
+    coordinator.setDesiredPortSet([16127, 16999]);
+    coordinator.start();
+    await enterLeaderCheck(coordinator, group);
+
+    // Drop 16999 -> queued. Gate its read-before-delete so the unmap parks mid-await.
+    coordinator.setDesiredPortSet([16127]);
+    assert.deepEqual(coordinator.pendingUnmaps, [16999], "queued on drop");
+    client.gateGetPort = 16999;
+
+    // Fire the cleanup baton; unmapPort(16999) suspends at the gated getMapping.
+    group.multicast += 1;
+    group.baton();
+    await settle();
+
+    // FluxOS re-desires 16999 WHILE the unmap is suspended (the realistic interleave —
+    // setDesiredPortSet runs on the same loop, concurrent with the awaited SOAP read).
+    coordinator.setDesiredPortSet([16127, 16999]);
+    // Release the read; the unmap must now ABORT the delete — 16999 is wanted again.
+    client.gateGetPort = null;
+    client.releaseGet();
+    await settle();
+
+    assert.equal(client.removeCalls.length, 0, "the re-desired live port was NOT torn down");
+    assert.ok(coordinator.desired.includes(16999), "16999 is desired again");
+    assert.ok(client.byPort.get(16999) != null, "and its mapping is still on the router");
+  });
+
+  it("bounds retries on a permanently-failing unmap, then re-surfaces it via a later OBSERVED", async () => {
+    const clock = new ManualClock();
+    const client = new FakeUpnpClient();
+    client.byPort.set(16500, healthyMapping(16500, "10.0.0.11"));
+    client.failRemovePorts = new Set([16500]); // its delete ALWAYS fails
+    const failed: Array<{ port: number; reason: string }> = [];
+    const { coordinator, group } = seam(clock, {
+      client,
+      orphanConfirmPasses: 0,
+      orphanMaxDeleteAttempts: 3,
+      onMappingFailed: (port, reason) => failed.push({ port, reason })
+    });
+    coordinator.setDesiredPortSet([16500]);
+    coordinator.start();
+    await enterLeaderCheck(coordinator, group);
+
+    coordinator.setDesiredPortSet([]); // drop -> orphan
+    assert.deepEqual(coordinator.pendingUnmaps, [16500], "queued on drop");
+
+    // It keeps failing; after the attempt cap it is dropped (the orphan lingers — accepted).
+    for (let i = 0; i < 6; i++) await pass(group, clock);
+    assert.equal(
+      failed.filter((f) => f.port === 16500).length,
+      3,
+      "retried exactly the capped number of times, not forever"
+    );
+    assert.deepEqual(coordinator.pendingUnmaps, [], "dropped after the cap — no perpetual token sink");
+
+    // A later leader OBSERVED still showing the leftover re-surfaces it (a spaced retry).
+    group.deliver(observed("leaderNid", [healthyMapping(16500, "10.0.0.11")]));
+    assert.deepEqual(
+      coordinator.pendingUnmaps,
+      [16500],
+      "re-surfaced by a fresh OBSERVED for a spaced retry"
+    );
+  });
+
+  it("in SELF_CHECK, ignores an OBSERVED-seeded leftover (trusts nobody; discovery needs leader-check)", async () => {
+    const clock = new ManualClock();
+    const { coordinator, group, client } = seam(clock, { orphanConfirmPasses: 0 });
+    client.byPort.set(16999, healthyMapping(16999, "10.0.0.11"));
+    coordinator.setDesiredPortSet([16127]);
+    coordinator.start();
+    // Deliberately do NOT enter LEADER_CHECK — stay in the startup SELF_CHECK.
+    assert.equal(coordinator.currentMode, "SELF_CHECK", "still self-check");
+
+    group.deliver(observed("leaderNid", [healthyMapping(16999, "10.0.0.11")]));
+    assert.deepEqual(
+      coordinator.pendingUnmaps,
+      [],
+      "a self-check node does not act on a peer's broadcast for leftover discovery"
+    );
+  });
+
+  it("prunes a realistic Flux_App_<name> leftover but spares a near-miss non-namespace description", async () => {
+    const clock = new ManualClock();
+    const client = new FakeUpnpClient();
+    client.byPort.set(16127, healthyMapping(16127, "10.0.0.11"));
+    // A realistic uninstalled-app leftover, and a near-miss whose description merely
+    // CONTAINS "Flux" but is not in the namespace (must be spared — the match is anchored).
+    client.byPort.set(16800, { ...healthyMapping(16800, "10.0.0.11"), description: "Flux_App_someapp" });
+    client.byPort.set(16801, { ...healthyMapping(16801, "10.0.0.11"), description: "MyFluxThing" });
+    const { coordinator, group } = seam(clock, { client, orphanConfirmPasses: 0 });
+    coordinator.setDesiredPortSet([16127]);
+    coordinator.start();
+    await enterLeaderCheck(coordinator, group);
+
+    group.deliver(
+      observed("leaderNid", [
+        { ...healthyMapping(16800, "10.0.0.11"), description: "Flux_App_someapp" },
+        { ...healthyMapping(16801, "10.0.0.11"), description: "MyFluxThing" }
+      ])
+    );
+    assert.deepEqual(coordinator.pendingUnmaps, [16800], "only the Flux-namespace leftover is an orphan");
+
+    await pass(group, clock);
+    assert.deepEqual(
+      client.removeCalls.map((q) => q.public),
+      [16800],
+      "pruned the Flux_App_ leftover"
+    );
+    assert.ok(
+      client.removeCalls.every((q) => q.public !== 16801),
+      "spared the non-namespace mapping"
+    );
+  });
+
+  it("end-to-end: each node prunes its OWN leftover (peer via broadcast, leader via its own enumerate)", async () => {
+    const w = makeWorld();
+    const lead = w.makeNode("10.0.0.10");
+    const peer = w.makeNode("10.0.0.20");
+    const leadClient = new FakeUpnpClient();
+    const peerClient = new FakeUpnpClient();
+    // The leader enumerates a table with each node's healthy desired port AND two Flux
+    // leftovers: 16998 pointing at the LEADER itself, 16999 pointing at the PEER (both
+    // uninstalled apps from before). Each owner must prune its OWN leftover only.
+    leadClient.table = [
+      healthyMapping(16110, "10.0.0.10"),
+      healthyMapping(16998, "10.0.0.10"), // the LEADER's own leftover (undesired)
+      healthyMapping(16222, "10.0.0.20"),
+      healthyMapping(16999, "10.0.0.20") // the PEER's leftover (undesired)
+    ];
+    leadClient.mapping = healthyMapping(16110, "10.0.0.10");
+    leadClient.byPort.set(16110, healthyMapping(16110, "10.0.0.10")); // leader read-before-write
+    leadClient.byPort.set(16998, healthyMapping(16998, "10.0.0.10")); // leader read-before-delete
+    peerClient.byPort.set(16222, healthyMapping(16222, "10.0.0.20"));
+    peerClient.byPort.set(16999, healthyMapping(16999, "10.0.0.20")); // peer read-before-delete
+
+    const lc = makeCoordinator(lead, w.clock, {
+      self: "10.0.0.10",
+      localAddress: "10.0.0.10",
+      client: leadClient,
+      orphanConfirmPasses: 0
+    });
+    lc.coordinator.setDesiredPortSet([16110]);
+    const pc = makeCoordinator(peer, w.clock, {
+      self: "10.0.0.20",
+      localAddress: "10.0.0.20",
+      client: peerClient,
+      freshLaps: 50,
+      orphanConfirmPasses: 0
+    });
+    pc.coordinator.setDesiredPortSet([16222]);
+
+    await lead.start();
+    await peer.start();
+    // Drive until the ring forms, the leader broadcasts, and both prune their own leftover.
+    for (let i = 0; i < 160; i++) {
+      w.clock.advance(20);
+      await settle();
+    }
+
+    assert.equal(lc.coordinator.isLeader, true, "lowest address leads");
+    assert.ok(
+      peerClient.removeCalls.some((q) => q.public === 16999),
+      "the peer pruned its own leftover, spotted in the leader's broadcast"
+    );
+    assert.ok(
+      leadClient.removeCalls.some((q) => q.public === 16998),
+      "the leader pruned its OWN leftover, discovered via its own enumerate"
+    );
+    assert.ok(
+      leadClient.removeCalls.every((q) => q.public !== 16110) &&
+        peerClient.removeCalls.every((q) => q.public !== 16222),
+      "neither node ever deleted its still-desired port"
+    );
+    assert.ok(
+      leadClient.removeCalls.every((q) => q.public !== 16222 && q.public !== 16999),
+      "the leader never deleted a peer-owned mapping (strict-mode self-only)"
     );
   });
 });

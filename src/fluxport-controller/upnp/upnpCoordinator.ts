@@ -51,7 +51,21 @@
  * repeating wall-clock cycle, identical-by-construction spread of the cohort, so a
  * brand-new or partitioned node has an autonomous repair cadence with no peer/list.
  *
- * This slice does NOT do lease probing or orphan cleanup — later.
+ * ORPHAN CLEANUP — a mapping this node once created but no longer wants (an app was
+ * uninstalled, a port reassigned) becomes an ORPHAN on the router: dead weight that
+ * lingers on a permanent-lease router (finite leases self-expire, so this only earns
+ * its keep on ttl:0 routers). Strict-mode delete is self-only, so each node prunes its
+ * OWN orphans — it never deletes another node's (it could not anyway). A port is an
+ * orphan when a mapping points at THIS node (private.host === localAddress), is in the
+ * Flux namespace (by description), and is NOT in the desired set. Orphans are found two
+ * ways: a port DROPPED from the desired set (known immediately, works in any mode) and,
+ * in leader-check, a LEFTOVER spotted in the leader's OBSERVED whole-table broadcast
+ * (catches mappings from before a restart, which the node has no memory of). The delete
+ * is just another paced router write — token-gated, read-before-delete, through the one
+ * serialized client, on this node's turn — so cleanup never storms the router, and
+ * repairs are served first so a tight budget keeps a wanted port up before removing a
+ * dead one. A confirm delay plus a "desired set has been fed at least once" latch guard
+ * against deleting a live mapping before FluxOS has declared what it wants.
  */
 
 import { Group } from "../consensus/consensus";
@@ -92,6 +106,30 @@ const DEFAULT_BACKOFF_FACTOR = 0.5;
 const DEFAULT_RECOVER_FACTOR = 1.5;
 /** Fraction of the baseline the back-off may floor to (never pace to a standstill). */
 const DEFAULT_FLOOR_DIVISOR = 8;
+
+/** Consecutive cleanup passes a port must stay an orphan before its mapping is deleted.
+ *  A small grace so a just-created-but-not-yet-desired mapping (FluxOS still declaring
+ *  its desired set) is never pruned out from under itself. */
+const DEFAULT_ORPHAN_CONFIRM_PASSES = 2;
+
+/** Consecutive FAILED unmap attempts before a candidate is dropped — a bounded retry,
+ *  distinct from repairs (which retry a WANTED port forever). A lingering orphan is
+ *  acceptable (design §3); a doomed delete retried every pass is pure waste, so we give
+ *  up after the cap and let a later OBSERVED re-surface it if still present, which spaces
+ *  the retries far apart instead of one per turn. */
+const DEFAULT_ORPHAN_MAX_DELETE_ATTEMPTS = 4;
+
+/** Matches the Flux mapping namespace (`Flux`, `Flux_App_<name>`, `Flux_Test_App`,
+ *  `Flux_Prelaunch_App_`). Orphan cleanup only ever deletes within it, so a manual /
+ *  third-party port forward on the same router is never touched. */
+const FLUX_DESCRIPTION = /^Flux/i;
+
+/** Per-candidate orphan state: confirm passes served so far (the grace before deleting)
+ *  and consecutive failed delete attempts (the bound before giving up). */
+interface OrphanState {
+  confirms: number;
+  failures: number;
+}
 
 /**
  * Same hashing pattern the port allocator uses (deterministic, identical on every
@@ -147,6 +185,16 @@ export interface UpnpCoordinatorDeps {
   selfCheckCycleMs?: number;
   /** Slots per cycle; this node fires once per cycle at `fnv1a(self) % windows`. */
   selfCheckWindows?: number;
+  /** Consecutive cleanup passes a port must stay an orphan before it is unmapped. */
+  orphanConfirmPasses?: number;
+  /** Consecutive failed unmap attempts before an orphan candidate is dropped (bounded
+   *  retry). Default 4. */
+  orphanMaxDeleteAttempts?: number;
+  /** onMappingFailed surfaces BOTH a failed create AND a failed orphan delete for the
+   *  port; the reason is the client's raw error text, so create vs delete is
+   *  distinguishable only if the SOAP client's message says so, not by the coordinator. A
+   *  delete failure is benign — the mapping just lingers; the unmap is retried, then
+   *  bounded (dropped after a few attempts, re-surfaced by a later OBSERVED if present). */
   hooks?: { onMappingFailed?: (port: number, reason: string) => void };
 }
 
@@ -166,6 +214,8 @@ export class UpnpCoordinator {
   private readonly tokenStallMs: number;
   private readonly selfCheckCycleMs: number;
   private readonly selfCheckWindows: number;
+  private readonly orphanConfirmPasses: number;
+  private readonly orphanMaxDeleteAttempts: number;
   private readonly onMappingFailed?: (port: number, reason: string) => void;
   private readonly rl: RateLimiter;
   // Adaptive back-off control: the constructor `rate` is the baseline the leader paces
@@ -176,6 +226,17 @@ export class UpnpCoordinator {
   private readonly recoverFactor: number;
 
   private desiredPorts: Set<number> = new Set();
+  // Orphan cleanup never runs until FluxOS has declared a desired set at least once, so
+  // an empty set at startup ("not told yet") is not mistaken for "I want nothing mapped".
+  private desiredEverSet = false;
+  // Ports whose OWN mapping should be deleted (no longer desired), each with its confirm
+  // grace + failed-attempt counters — deleted once it clears the grace, dropped once it
+  // exhausts the retry bound. Fed by a desired-set drop and by leftovers spotted in OBSERVED.
+  private orphanCandidates = new Map<number, OrphanState>();
+  // Rotating start offset for the orphan walk, the same fairness the repair cursor gives
+  // writes: a persistently-failing unmap cannot perpetually sink a tight token budget and
+  // starve the other orphans behind it.
+  private unmapCursor = 0;
   // Once this router has rejected a finite lease (SOAP 725) it never accepts one, so
   // we latch permanent and request ttl 0 for the rest of this node's life on it.
   private permanentLease = false;
@@ -222,6 +283,9 @@ export class UpnpCoordinator {
     this.tokenStallMs = deps.tokenStallMs ?? DEFAULT_TOKEN_STALL_MS;
     this.selfCheckCycleMs = deps.selfCheckCycleMs ?? DEFAULT_SELF_CHECK_CYCLE_MS;
     this.selfCheckWindows = deps.selfCheckWindows ?? DEFAULT_SELF_CHECK_WINDOWS;
+    this.orphanConfirmPasses = deps.orphanConfirmPasses ?? DEFAULT_ORPHAN_CONFIRM_PASSES;
+    this.orphanMaxDeleteAttempts =
+      deps.orphanMaxDeleteAttempts ?? DEFAULT_ORPHAN_MAX_DELETE_ATTEMPTS;
     this.slot = fnv1a(this.self, this.selfCheckWindows);
     this.onMappingFailed = deps.hooks?.onMappingFailed;
 
@@ -286,18 +350,38 @@ export class UpnpCoordinator {
 
   /**
    * The full set of ports this node should keep mapped (its Fluxports ∪ its apps'
-   * ports). Last-writer-wins: each call REPLACES the desired set, so a port dropped
-   * from the set is simply no longer maintained (its mapping is left to lease-expire
-   * or be cleaned up later — orphan cleanup is a later slice). FluxOS calls this each
-   * cycle with the current desired set.
+   * ports). Last-writer-wins: each call REPLACES the desired set. A port DROPPED from
+   * the set becomes an orphan candidate — its own mapping is paced-deleted on a later
+   * turn — while a port (re-)added is no longer an orphan, so any pending candidacy for
+   * it is cancelled at once (a drop-then-re-add never deletes). FluxOS calls this each
+   * cycle with the current desired set; the first call latches `desiredEverSet`, the
+   * gate that lets cleanup begin (so a not-yet-fed empty set never prunes anything).
    */
   setDesiredPortSet(ports: number[]): void {
-    this.desiredPorts = new Set(ports);
+    const next = new Set(ports);
+    // A port that just left the desired set is now an orphan to prune (count starts at 0
+    // so it still serves the confirm grace). Only meaningful once a set was previously
+    // declared — the first call has no prior "desired" to diff against.
+    if (this.desiredEverSet) {
+      for (const port of this.desiredPorts) {
+        if (!next.has(port) && !this.orphanCandidates.has(port)) {
+          this.orphanCandidates.set(port, { confirms: 0, failures: 0 });
+        }
+      }
+    }
+    // A (re-)desired port is by definition not an orphan — cancel any pending candidacy.
+    for (const port of next) this.orphanCandidates.delete(port);
+    this.desiredPorts = next;
+    this.desiredEverSet = true;
   }
 
   /** The ports this node is maintaining, ascending (test seam / observability). */
   get desired(): number[] {
     return [...this.desiredPorts].sort((a, b) => a - b);
+  }
+  /** Ports queued for orphan cleanup (own mapping pending delete), ascending (test seam). */
+  get pendingUnmaps(): number[] {
+    return [...this.orphanCandidates.keys()].sort((a, b) => a - b);
   }
   /** Which mode this node is in (test seam / observability). */
   get currentMode(): CoordinatorMode {
@@ -347,6 +431,36 @@ export class UpnpCoordinator {
     if (msg.by === this.self) return;
     this.lastObserved = msg.mappings;
     this.lapsSinceObserved = 0;
+    // The leader's whole-table view also reveals OUR leftovers — a Flux mapping pointing
+    // at us on a port we no longer desire (e.g. one from before a restart) — which we
+    // queue to prune on our turn. (The leader ignores its own broadcast here, but feeds
+    // the same queue from its own enumerate in scanAndBroadcast.)
+    this.noteObservedOrphans(msg.mappings);
+  }
+
+  /**
+   * Scan a whole-table view for THIS node's orphans — a Flux-namespace mapping pointing
+   * at us, on our protocol, for a port not in the desired set — and queue each to be
+   * unmapped. Gated two ways: only after a desired set has been declared (`desiredEverSet`,
+   * so a not-yet-fed node never treats its own live mappings as orphans), and only in
+   * LEADER_CHECK — SELF_CHECK trusts nobody, so leftover discovery (which relies on a
+   * peer's broadcast) waits for the ring; a self-check node still prunes its explicit
+   * desired-set drops, just not broadcast-discovered leftovers. Idempotent: an
+   * already-queued port keeps its counters; a re-desired one was already dropped.
+   */
+  private noteObservedOrphans(table: UpnpMapping[]): void {
+    if (!this.desiredEverSet || this.mode !== "LEADER_CHECK") return;
+    for (const m of table) {
+      if (
+        m.private.host === this.localAddress &&
+        m.protocol.toLowerCase() === this.protocol.toLowerCase() &&
+        FLUX_DESCRIPTION.test(m.description) &&
+        !this.desiredPorts.has(m.public.port) &&
+        !this.orphanCandidates.has(m.public.port)
+      ) {
+        this.orphanCandidates.set(m.public.port, { confirms: 0, failures: 0 });
+      }
+    }
   }
 
   /**
@@ -370,7 +484,7 @@ export class UpnpCoordinator {
       return;
     }
 
-    if (this.desiredPorts.size === 0) return;
+    if (this.desiredPorts.size === 0 && this.orphanCandidates.size === 0) return;
     // Count this node's turns since the last broadcast so it ages out of trust. One
     // observation covers the whole set, so this ages once per turn, not per port.
     this.lapsSinceObserved += 1;
@@ -455,9 +569,12 @@ export class UpnpCoordinator {
   }
 
   /** Slot fired: in SELF_CHECK only, run the SAME read-before-write over our whole
-   *  desired set — trusting NO broadcast (self-check trusts nobody). */
+   *  desired set (and prune any orphans) — trusting NO broadcast (self-check trusts
+   *  nobody). With no leader broadcast here, only desired-set DROPS surface as orphans;
+   *  leftover discovery needs the leader's whole-table OBSERVED (leader-check). */
   private onSlot(): void {
-    if (this.mode !== "SELF_CHECK" || this.desiredPorts.size === 0) return;
+    if (this.mode !== "SELF_CHECK") return;
+    if (this.desiredPorts.size === 0 && this.orphanCandidates.size === 0) return;
     void this.checkAndRepair(false);
   }
 
@@ -508,6 +625,9 @@ export class UpnpCoordinator {
           by: this.self,
           mappings
         } satisfies ObservedMsg);
+        // The leader ignores its OWN broadcast (onObserved), so feed its leftovers from
+        // the enumerate it just did — its own orphans get pruned like any other node's.
+        this.noteObservedOrphans(mappings);
         this.recoverRate(); // clean scan: ease the whole segment back toward baseline
       } catch (err) {
         // An enumerate failure is a whole-table read fault, not specific to one port,
@@ -559,24 +679,110 @@ export class UpnpCoordinator {
    */
   private async checkAndRepair(trustObserved: boolean): Promise<void> {
     if (this.repairing) return; // a prior pass is still working through the set
-    if (this.desiredPorts.size === 0) return;
+    if (this.desiredPorts.size === 0 && this.orphanCandidates.size === 0) return;
     this.repairing = true;
     try {
-      // Walk the set from a rotating offset so that when the rate budget is tighter
-      // than the number of ports needing a write (a router-reboot mass-repair, or one
-      // port that keeps failing to map and sinks a token each pass), the budget is
-      // shared across passes and every port is eventually reached — not perpetually
-      // starved behind an earlier one. Recomputed per call so a changed set is fine.
-      const ports = [...this.desiredPorts];
-      const start = this.repairCursor % ports.length;
-      this.repairCursor = (start + 1) % ports.length;
-      for (let i = 0; i < ports.length; i++) {
-        const port = ports[(start + i) % ports.length];
-        if (trustObserved && this.observedShowsHealthy(port)) continue;
-        await this.repairPort(port);
+      if (this.desiredPorts.size > 0) {
+        // Walk the set from a rotating offset so that when the rate budget is tighter
+        // than the number of ports needing a write (a router-reboot mass-repair, or one
+        // port that keeps failing to map and sinks a token each pass), the budget is
+        // shared across passes and every port is eventually reached — not perpetually
+        // starved behind an earlier one. Recomputed per call so a changed set is fine.
+        const ports = [...this.desiredPorts];
+        const start = this.repairCursor % ports.length;
+        this.repairCursor = (start + 1) % ports.length;
+        for (let i = 0; i < ports.length; i++) {
+          const port = ports[(start + i) % ports.length];
+          if (trustObserved && this.observedShowsHealthy(port)) continue;
+          await this.repairPort(port);
+        }
       }
+      // Then prune our own orphans, paced by the SAME budget. Repairs run first, so a
+      // tight budget always keeps a wanted port up before spending a token to remove a
+      // dead one — the asymmetry that matters (a missed orphan just lingers; a wrongly
+      // dropped repair breaks a live port).
+      await this.cleanupOrphans();
     } finally {
       this.repairing = false;
+    }
+  }
+
+  /**
+   * Delete THIS node's orphan mappings, one paced pass over the candidate queue. A
+   * candidate first serves a confirm grace (a few passes) so a mapping created just
+   * before FluxOS declares it desired is never pruned; once confirmed and still
+   * undesired it is unmapped read-before-delete and token-gated. A rotating start shares
+   * a tight budget fairly — the same guard the repair cursor gives writes — so a
+   * persistently-failing unmap can never starve the rest of the queue.
+   */
+  private async cleanupOrphans(): Promise<void> {
+    if (this.orphanCandidates.size === 0) return;
+    // Snapshot the keys so deletes / re-adds during the awaited pass do not perturb this
+    // walk; the live map is the source of truth for each port's current state below.
+    const ports = [...this.orphanCandidates.keys()];
+    const start = this.unmapCursor % ports.length;
+    this.unmapCursor = (start + 1) % ports.length;
+    for (let i = 0; i < ports.length; i++) {
+      const port = ports[(start + i) % ports.length];
+      const st = this.orphanCandidates.get(port);
+      if (st == null) continue; // removed mid-pass (re-desired / already pruned)
+      if (this.desiredPorts.has(port)) {
+        this.orphanCandidates.delete(port); // re-desired since queued — not an orphan
+        continue;
+      }
+      if (st.confirms < this.orphanConfirmPasses) {
+        st.confirms += 1; // serve the confirm grace first
+        continue;
+      }
+      await this.unmapPort(port);
+    }
+  }
+
+  /**
+   * Read-before-delete a SINGLE orphan: confirm a mapping for it still exists, still
+   * points at us, and is still in the Flux namespace before deleting (strict-mode delete
+   * is self-only, so a port a peer has since reclaimed is not ours to remove — drop it
+   * from the queue). The delete spends one rate token, else we keep the candidate and
+   * retry on a later turn. Wholly self-contained — never throws — so a delete fault never
+   * escapes into the token path; the candidate is kept (the cursor rotates so it cannot
+   * starve the rest) and the benign failure is surfaced via onMappingFailed.
+   */
+  private async unmapPort(port: number): Promise<void> {
+    try {
+      const existing = await this.client.getMapping({
+        public: port,
+        protocol: this.protocol
+      });
+      // A re-desire can have landed DURING the awaited read — setDesiredPortSet runs on the
+      // same loop, concurrent with our SOAP round-trip, and cancels the candidacy. Re-check
+      // at the LAST point before the committed delete (no further await before removeMapping)
+      // so a port wanted again is never torn down. cleanupOrphans guards synchronously before
+      // the await; this closes the in-flight window the synchronous guard cannot see.
+      if (this.desiredPorts.has(port)) {
+        this.orphanCandidates.delete(port);
+        return;
+      }
+      if (
+        existing == null ||
+        existing.private.host !== this.localAddress ||
+        !FLUX_DESCRIPTION.test(existing.description)
+      ) {
+        this.orphanCandidates.delete(port); // already gone, or no longer ours to delete
+        return;
+      }
+      if (!this.rl.acquire()) return; // no budget this pass; keep the candidate, retry later
+      await this.client.removeMapping({ public: port, protocol: this.protocol });
+      this.orphanCandidates.delete(port);
+    } catch (err) {
+      this.onMappingFailed?.(port, String(err));
+      // Bounded retry (unlike repairs, which retry a WANTED port forever): a delete that
+      // keeps failing while the entry still reads as ours is pure waste — a lingering orphan
+      // is acceptable (design §3). After the cap, drop it; a later OBSERVED re-surfaces it if
+      // still present, spacing retries far apart instead of one per turn.
+      const st = this.orphanCandidates.get(port);
+      if (st != null && ++st.failures >= this.orphanMaxDeleteAttempts) {
+        this.orphanCandidates.delete(port);
+      }
     }
   }
 
