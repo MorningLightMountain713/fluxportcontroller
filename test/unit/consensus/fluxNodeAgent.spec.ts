@@ -6,7 +6,7 @@ import {
 } from "@/fluxport-controller/consensus/transport";
 import { ManualClock } from "@/fluxport-controller/consensus/clock";
 import { FluxNodeAgent } from "@/fluxport-controller/fluxNodeAgent";
-import { UpnpClientLike } from "@/fluxport-controller/upnpClient";
+import { UpnpClientLike, UpnpMapping } from "@/fluxport-controller/upnpClient";
 import { NodeInfo } from "@/fluxport-controller/nodeList";
 
 /** Let the async heal chain (re-resolve + rebuild) settle; ManualClock drives the
@@ -263,5 +263,156 @@ describe("FluxNodeAgent", () => {
     assert.equal(w.transports.get("10.0.0.11"), originalTransport, "transport not rebuilt");
     assert.equal(a.assignedPort, portA, "port unchanged");
     assert.equal(a.members.length, 2, "still a 2-member view");
+  });
+});
+
+/**
+ * FluxNodeAgent (UPnP coordination) — the SECOND consensus group wired onto the same
+ * shared socket as `ports`. Validates §7.4: two groups co-exist, the slow-timing mode
+ * machine reaches LEADER_CHECK without flapping (announceInterval ≪ baton interval,
+ * tokenStallMs > baton interval), and each node maps its OWN assigned port on the shared
+ * router via the coordinator. The fine-grained coordinator behaviour is unit-tested in
+ * upnpCoordinator.spec.ts; this proves the agent wiring + the timing relationships hold.
+ */
+describe("FluxNodeAgent (UPnP coordination)", () => {
+  /** One real router behind which all nodes sit: a shared mapping table their per-node
+   *  clients read/write (createMapping is self-mapped by the coordinator to its own host). */
+  class SharedFakeRouter {
+    table = new Map<number, UpnpMapping>(); // public port -> mapping
+    clientFor(address: string): UpnpClientLike {
+      return {
+        getGateway: async () => ({
+          gateway: { description: "http://10.0.0.1:5000/rootDesc.xml" },
+          getLocalAddress: async () => address
+        }),
+        getMappings: async () => [...this.table.values()],
+        getMapping: async (q) => this.table.get(q.public) ?? null,
+        createMapping: async (m) => {
+          this.table.set(m.public, {
+            public: { host: "0.0.0.0", port: m.public },
+            private: { host: m.private.host, port: m.private.port },
+            protocol: m.protocol ?? "tcp",
+            enabled: true,
+            description: m.description ?? "Flux",
+            ttl: m.ttl ?? 14400
+          });
+        },
+        removeMapping: async (q) => {
+          this.table.delete(q.public);
+        },
+        close() {}
+      };
+    }
+  }
+
+  // Fast-but-correctly-PROPORTIONED upnp timing: announceInterval (20) ≪ the per-node
+  // baton interval (~|members| × tokenRotationTarget 30), so peer multicast advances
+  // between a node's batons — the 5c health gate. tokenStallMs (300) > that baton
+  // interval, so a normal slow rotation never trips a spurious SELF_CHECK.
+  const upnpTiming = {
+    tokenRotationTarget: 30,
+    tokenRetransmitTimeout: 120,
+    maxTokenRetransmits: 5,
+    tokenLossTimeout: 300,
+    maxMessagesPerToken: 8,
+    announceInterval: 20,
+    joinInterval: 10,
+    joinTimeout: 40,
+    commitTimeout: 1000
+  };
+  const upnpTuning = {
+    rate: 1000,
+    capacity: 1000,
+    enterLaps: 3,
+    leaveLaps: 5,
+    tokenStallMs: 300, // > the baton interval; validates no spurious stall-demotion
+    selfCheckCycleMs: 50, // short so a bootstrapping SELF_CHECK node still self-maps
+    selfCheckWindows: 1
+  };
+
+  it("runs the upnp group as a second consensus group: both nodes reach LEADER_CHECK (no flap) and map their own port", async () => {
+    const net = new VirtualNetwork();
+    const clock = new ManualClock();
+    const router = new SharedFakeRouter();
+    const make = (txhash: string, address: string): FluxNodeAgent =>
+      new FluxNodeAgent(
+        { txhash, outidx: "0" },
+        {
+          ...FAST_TIMING,
+          ports: [16197, 16187, 16177],
+          clock,
+          upnpClient: router.clientFor(address),
+          createTransport: (addr) => net.register(addr),
+          getPublicIp: async () => "1.2.3.4",
+          resolveNodeInfo: async () => ({ priorPort: null, priority: 100 }),
+          upnpTiming,
+          upnpTuning
+        }
+      );
+    const a = make("aaa", "10.0.0.11");
+    const b = make("bbb", "10.0.0.12");
+
+    assert.equal(await a.start(), true);
+    assert.equal(await b.start(), true);
+
+    // Drive long enough for: ports to converge, the upnp ring to form, both to climb to
+    // LEADER_CHECK, and each to map its own assigned port on the shared router.
+    const bothLeaderCheck = (): boolean =>
+      a.upnpMode === "LEADER_CHECK" && b.upnpMode === "LEADER_CHECK";
+    for (let i = 0; i < 300 && !bothLeaderCheck(); i++) {
+      clock.advance(20);
+      await settle();
+    }
+    assert.ok(bothLeaderCheck(), `both reached LEADER_CHECK (a=${a.upnpMode}, b=${b.upnpMode})`);
+
+    const pa = a.assignedPort;
+    const pb = b.assignedPort;
+    assert.ok(pa != null && pb != null && pa !== pb, `distinct ports: ${pa}, ${pb}`);
+
+    // Stability: once LEADER_CHECK, the mode must NOT flap back (the timing relationships
+    // hold — batons keep arriving inside tokenStallMs, multicast keeps advancing).
+    let flapped = false;
+    for (let i = 0; i < 120; i++) {
+      clock.advance(20);
+      await settle();
+      if (a.upnpMode !== "LEADER_CHECK" || b.upnpMode !== "LEADER_CHECK") flapped = true;
+    }
+    assert.equal(flapped, false, "mode did not flap once LEADER_CHECK was reached");
+
+    // Each node mapped its OWN assigned port on the shared router (self-map invariant).
+    assert.equal(router.table.get(pa!)?.private.host, "10.0.0.11", "A mapped its own port to itself");
+    assert.equal(router.table.get(pb!)?.private.host, "10.0.0.12", "B mapped its own port to itself");
+    assert.deepEqual(a.desiredUpnpPorts, [pa], "A's desired UPnP set is its assigned port");
+    assert.deepEqual(b.desiredUpnpPorts, [pb], "B's desired UPnP set is its assigned port");
+  });
+
+  it("can be disabled (enableUpnp:false): no upnp group, ports still converge", async () => {
+    const net = new VirtualNetwork();
+    const clock = new ManualClock();
+    const router = new SharedFakeRouter();
+    const make = (txhash: string, address: string): FluxNodeAgent =>
+      new FluxNodeAgent(
+        { txhash, outidx: "0" },
+        {
+          ...FAST_TIMING,
+          ports: [16197, 16187, 16177],
+          clock,
+          upnpClient: router.clientFor(address),
+          createTransport: (addr) => net.register(addr),
+          getPublicIp: async () => "1.2.3.4",
+          resolveNodeInfo: async () => ({ priorPort: null, priority: 100 }),
+          enableUpnp: false
+        }
+      );
+    const a = make("aaa", "10.0.0.11");
+    const b = make("bbb", "10.0.0.12");
+
+    await a.start();
+    await b.start();
+    clock.advance(1500);
+
+    assert.ok(a.assignedPort != null && b.assignedPort != null, "ports still converge");
+    assert.equal(a.upnpMode, null, "no upnp coordinator when disabled");
+    assert.equal(router.table.size, 0, "no UPnP mappings created when disabled");
   });
 });
