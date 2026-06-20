@@ -2,32 +2,34 @@
  * UPnP coordinator (slices 5a + 5b + 5c) — correctness floor, leader-check reads,
  * and the LEADER_CHECK/SELF_CHECK mode machine.
  *
- * Many Fluxnodes can sit behind ONE home router, each maintaining its own UPnP
- * port mapping. A consumer-grade miniupnpd is single-threaded and chokes if they
- * all hammer it, so the nodes take turns: each node keeps ONLY its own port mapped,
- * acting only on its paced turn (the consensus `onTokenGranted` baton) and only
- * when the group's shared RateLimiter budget permits.
+ * Many Fluxnodes can sit behind ONE home router, each maintaining its own SET of
+ * UPnP port mappings (its Fluxports plus its apps' ports). A consumer-grade
+ * miniupnpd is single-threaded and chokes if they all hammer it, so the nodes take
+ * turns: each node keeps ONLY its own ports mapped, acting only on its paced turn
+ * (the consensus `onTokenGranted` baton) and only when the group's shared
+ * RateLimiter budget permits.
  *
  * READ-BEFORE-WRITE is the correctness backstop. On its turn a node reads the
- * router's current mapping for its desired port and writes ONLY if the mapping is
- * missing, points at the wrong host (someone else's / a stale entry), or its lease
- * is running low. In steady state the mapping is already correct, so the common
- * path is a single read and ZERO router writes — that is what keeps a shared router
- * from being hammered. The RateLimiter is soft pacing on top; the read-before-write
+ * router's current mapping for EACH of its desired ports and writes ONLY if that
+ * mapping is missing, points at the wrong host (someone else's / a stale entry), or
+ * its lease is running low. In steady state every mapping is already correct, so the
+ * common path is one read per port and ZERO router writes — that is what keeps a
+ * shared router from being hammered. The RateLimiter is soft pacing on top (a token
+ * is spent per WRITE, so a multi-port repair is itself paced); the read-before-write
  * is the real guard (a brief rate over-issue is harmless because the write is still
  * idempotent against the router's actual state).
  *
  * Self-map-only: by construction the coordinator only ever creates a mapping for
- * its OWN `desiredPort` -> `localAddress`. There is no code path that maps or
- * deletes anything on another node's behalf.
+ * one of its OWN desired ports -> `localAddress`. There is no code path that maps
+ * or deletes anything on another node's behalf.
  *
  * LEADER-CHECK (5b) — the ~N-times read reduction. When the group is healthy, the
  * ring representative (lowest nid) enumerates the WHOLE router table once on its
- * baton and broadcasts it as UPNP_OBSERVED. A non-leader that sees its OWN port
- * already healthy in a FRESH broadcast skips its targeted read entirely, so in
- * steady state ONE enumerate covers the whole cohort instead of N targeted reads.
- * It is only an optimisation: with no fresh broadcast (no leader yet, a stale one,
- * or the broadcast showing the port missing/wrong/low) a non-leader falls straight
+ * baton and broadcasts it as UPNP_OBSERVED. A non-leader skips the targeted read for
+ * any desired port a FRESH broadcast already shows healthy, so in steady state ONE
+ * enumerate covers the whole cohort instead of N targeted reads. It is only an
+ * optimisation, decided PER PORT: a port with no fresh broadcast (no leader yet, a
+ * stale one, or the broadcast showing that port missing/wrong/low) falls straight
  * back to the 5a read-before-write floor, which remains the correctness guarantee.
  *
  * MODE MACHINE (5c) — a node is in exactly ONE mode and the choice is LOCAL (you
@@ -173,12 +175,16 @@ export class UpnpCoordinator {
   private readonly backoffFactor: number;
   private readonly recoverFactor: number;
 
-  private desiredPort: number | null = null;
+  private desiredPorts: Set<number> = new Set();
   // Once this router has rejected a finite lease (SOAP 725) it never accepts one, so
   // we latch permanent and request ttl 0 for the rest of this node's life on it.
   private permanentLease = false;
   // A repair runs async off the baton; guard so only one is in flight at a time.
   private repairing = false;
+  // Rotating start offset for the per-pass set walk, so a constrained rate budget is
+  // shared FAIRLY across passes — no port is perpetually stuck behind an earlier one
+  // that sinks the budget (e.g. an un-mappable port whose write keeps failing).
+  private repairCursor = 0;
   // The leader's enumerate+broadcast runs async off the baton; same one-at-a-time guard.
   private scanning = false;
   // The last router table a leader broadcast, and how many of THIS node's baton
@@ -278,13 +284,20 @@ export class UpnpCoordinator {
     }
   }
 
-  /** The port this node should keep mapped (its assigned Fluxport). Null clears it. */
-  setDesiredPort(port: number | null): void {
-    this.desiredPort = port;
+  /**
+   * The full set of ports this node should keep mapped (its Fluxports ∪ its apps'
+   * ports). Last-writer-wins: each call REPLACES the desired set, so a port dropped
+   * from the set is simply no longer maintained (its mapping is left to lease-expire
+   * or be cleaned up later — orphan cleanup is a later slice). FluxOS calls this each
+   * cycle with the current desired set.
+   */
+  setDesiredPortSet(ports: number[]): void {
+    this.desiredPorts = new Set(ports);
   }
 
-  get desired(): number | null {
-    return this.desiredPort;
+  /** The ports this node is maintaining, ascending (test seam / observability). */
+  get desired(): number[] {
+    return [...this.desiredPorts].sort((a, b) => a - b);
   }
   /** Which mode this node is in (test seam / observability). */
   get currentMode(): CoordinatorMode {
@@ -357,14 +370,14 @@ export class UpnpCoordinator {
       return;
     }
 
-    if (this.desiredPort == null) return;
-    // Count this node's turns since the last broadcast so it ages out of trust.
+    if (this.desiredPorts.size === 0) return;
+    // Count this node's turns since the last broadcast so it ages out of trust. One
+    // observation covers the whole set, so this ages once per turn, not per port.
     this.lapsSinceObserved += 1;
-    // The read-reduction win: a fresh leader enumerate already covered this node,
-    // so if it shows our port healthy we do ZERO router I/O this turn.
-    if (this.observedShowsHealthy(this.desiredPort)) return;
-    if (this.repairing) return; // a prior turn's repair is still running
-    void this.checkAndRepair();
+    // The read-reduction win is decided PER PORT inside checkAndRepair: a port a fresh
+    // leader enumerate already shows healthy costs ZERO router I/O this turn; the rest
+    // fall back to the read-before-write floor. (checkAndRepair guards re-entrancy.)
+    void this.checkAndRepair(true);
   }
 
   /**
@@ -441,17 +454,21 @@ export class UpnpCoordinator {
     });
   }
 
-  /** Slot fired: in SELF_CHECK only, run the SAME 5a read-before-write on our port. */
+  /** Slot fired: in SELF_CHECK only, run the SAME read-before-write over our whole
+   *  desired set — trusting NO broadcast (self-check trusts nobody). */
   private onSlot(): void {
-    if (this.mode !== "SELF_CHECK" || this.desiredPort == null) return;
-    if (this.repairing) return;
-    void this.checkAndRepair();
+    if (this.mode !== "SELF_CHECK" || this.desiredPorts.size === 0) return;
+    void this.checkAndRepair(false);
   }
 
   /**
    * Is the last leader broadcast still fresh AND does it show THIS node's port
-   * already healthy — present, pointing at us, with a non-expiring lease? Only then
-   * is skipping the targeted read safe; otherwise the 5a floor re-checks.
+   * already healthy — present, on OUR protocol, pointing at us, with a non-expiring
+   * lease? Only then is skipping the targeted read safe; otherwise the 5a floor
+   * re-checks. The protocol match is load-bearing: the read this skips is itself
+   * protocol-scoped (`getMapping({ protocol })`), so a same-port entry on a DIFFERENT
+   * protocol (e.g. a neighbour's UDP mapping on our TCP port number) must NOT count as
+   * our port being healthy, or we would skip and never repair the genuinely-missing one.
    */
   private observedShowsHealthy(port: number): boolean {
     if (this.lastObserved == null || this.lapsSinceObserved > this.freshLaps) {
@@ -460,6 +477,7 @@ export class UpnpCoordinator {
     return this.lastObserved.some(
       (m) =>
         m.public.port === port &&
+        m.protocol.toLowerCase() === this.protocol.toLowerCase() &&
         m.private.host === this.localAddress &&
         (m.ttl === 0 || m.ttl >= this.lowTtlThreshold)
     );
@@ -492,11 +510,14 @@ export class UpnpCoordinator {
         } satisfies ObservedMsg);
         this.recoverRate(); // clean scan: ease the whole segment back toward baseline
       } catch (err) {
-        this.onMappingFailed?.(this.desiredPort ?? -1, String(err));
+        // An enumerate failure is a whole-table read fault, not specific to one port,
+        // so report it under the sentinel -1 (no single port to attribute it to).
+        this.onMappingFailed?.(-1, String(err));
         this.backoffRate(); // the struggling router also stalls reads: back the group off
       }
-      // The leader still rate-gates its own writes via the shared 5a path.
-      await this.checkAndRepair();
+      // The leader keeps its OWN ports via the shared read-before-write path. It does
+      // NOT trust OBSERVED (it ignores its own broadcast), so it reads each own port.
+      await this.checkAndRepair(false);
     } finally {
       this.scanning = false;
     }
@@ -525,15 +546,48 @@ export class UpnpCoordinator {
   }
 
   /**
-   * Read-before-write the node's OWN mapping, writing only when needed and only
-   * when the rate budget permits. Wholly self-contained: never throws (so it can
-   * never escape into the token-dispatch path) and never touches another node's
-   * mapping.
+   * Read-before-write EACH desired port, writing only when needed and only when the
+   * rate budget permits. One pass over the whole set per call, guarded so only one
+   * pass runs at a time (a slow router can span several batons/slots). Each port is
+   * repaired independently and self-containedly, so one port's failure never blocks
+   * the rest and nothing ever throws into the token-dispatch path.
+   *
+   * `trustObserved` is the 5b read-reduction: a non-leader passes true so a port a
+   * fresh leader broadcast already shows healthy is skipped with ZERO router I/O; the
+   * leader's own scan and the self-check slot pass false (they trust no broadcast and
+   * read every port first-hand).
    */
-  private async checkAndRepair(): Promise<void> {
-    const port = this.desiredPort;
-    if (port == null) return;
+  private async checkAndRepair(trustObserved: boolean): Promise<void> {
+    if (this.repairing) return; // a prior pass is still working through the set
+    if (this.desiredPorts.size === 0) return;
     this.repairing = true;
+    try {
+      // Walk the set from a rotating offset so that when the rate budget is tighter
+      // than the number of ports needing a write (a router-reboot mass-repair, or one
+      // port that keeps failing to map and sinks a token each pass), the budget is
+      // shared across passes and every port is eventually reached — not perpetually
+      // starved behind an earlier one. Recomputed per call so a changed set is fine.
+      const ports = [...this.desiredPorts];
+      const start = this.repairCursor % ports.length;
+      this.repairCursor = (start + 1) % ports.length;
+      for (let i = 0; i < ports.length; i++) {
+        const port = ports[(start + i) % ports.length];
+        if (trustObserved && this.observedShowsHealthy(port)) continue;
+        await this.repairPort(port);
+      }
+    } finally {
+      this.repairing = false;
+    }
+  }
+
+  /**
+   * Read-before-write a SINGLE port: read the router's current mapping and write only
+   * if it is missing, points at the wrong host, or its lease is low; the write spends
+   * one rate token (else skip this port this pass and let a later turn retry). Wholly
+   * self-contained — never throws — so each port is isolated from the others and from
+   * the token path. Self-map-only: the create is always our own port -> localAddress.
+   */
+  private async repairPort(port: number): Promise<void> {
     try {
       const existing = await this.client.getMapping({
         public: port,
@@ -548,7 +602,7 @@ export class UpnpCoordinator {
         existing != null && existing.ttl > 0 && existing.ttl < this.lowTtlThreshold;
       if (!missing && !wrongHost && !lowTtl) return;
 
-      // A write is needed: spend a token, or skip this turn and let a later baton
+      // A write is needed: spend a token, or skip this port and let a later baton
       // retry (the rate limiter, not us, decides the cadence of router writes).
       if (!this.rl.acquire()) return;
 
@@ -562,9 +616,10 @@ export class UpnpCoordinator {
         });
       } catch (err) {
         // Some IGDs (e.g. MikroTik) reject a finite lease with SOAP fault 725
-        // OnlyPermanentLeasesSupported. Latch permanent and retry this SAME write
-        // with ttl 0 — NOT a second rate token, the acquire above already covered
-        // this logical write; the retry is the same write with a different lease.
+        // OnlyPermanentLeasesSupported. Latch permanent (a per-ROUTER property, so it
+        // applies to every port from here on) and retry this SAME write with ttl 0 —
+        // NOT a second rate token, the acquire above already covered this logical
+        // write; the retry is the same write with a different lease.
         if (this.permanentLease || !this.isPermanentLeaseError(err)) throw err;
         this.permanentLease = true;
         await this.client.createMapping({
@@ -577,8 +632,6 @@ export class UpnpCoordinator {
       }
     } catch (err) {
       this.onMappingFailed?.(port, String(err));
-    } finally {
-      this.repairing = false;
     }
   }
 

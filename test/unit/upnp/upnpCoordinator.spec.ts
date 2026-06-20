@@ -61,19 +61,31 @@ class FakeUpnpClient implements UpnpClientLike {
   getCalls: MappingQuery[] = [];
   getMappingsCalls = 0;
   createCalls: NewMapping[] = [];
+  /** Default getMapping result for a port NOT tracked in `byPort` — single-port tests
+   *  set this directly. */
   mapping: UpnpMapping | null = null;
+  /** Per-port mapping state — a real router is port-aware. getMapping consults this
+   *  first (by public port) and only falls back to `mapping` for an untracked port, so
+   *  single-port tests keep using `mapping`. `reflectCreates` writes here keyed by the
+   *  created port, and `getMappings` (enumerate) returns its values. Set a port to null
+   *  to model "this specific port is now gone". */
+  byPort = new Map<number, UpnpMapping | null>();
   failCreate = false;
   /** When set, ONLY the first createMapping rejects with this message (a router that
    *  rejects a finite lease answers the first AddPortMapping then accepts ttl 0). */
   failFirstCreateWith: string | null = null;
-  /** When set, a successful createMapping reflects into `mapping` like a real router
-   *  (so the next read-before-write sees its own write and skips). */
+  /** When set, a successful createMapping reflects into `byPort` (keyed by the created
+   *  port) like a real router, so the next read-before-write sees its own write and
+   *  skips — and OTHER ports are unaffected. */
   reflectCreates = false;
   /** A leader's enumerate (getMappings) returns this WHOLE-table view when set;
-   *  otherwise it falls back to the single `mapping` (5a behaviour). */
+   *  otherwise it derives the table from what's been created/reflected. */
   table: UpnpMapping[] | null = null;
   /** When set, getMappings rejects — drives the leader's enumerate-failure path. */
   failGetMappings = false;
+  /** createMapping rejects for any port in this set (an un-mappable port: conflict /
+   *  ACL) — models a port that persistently fails its write while others succeed. */
+  failCreatePorts = new Set<number>();
 
   async getGateway(): Promise<UpnpInfoLike> {
     throw new Error("unused");
@@ -82,28 +94,36 @@ class FakeUpnpClient implements UpnpClientLike {
     this.getMappingsCalls += 1;
     if (this.failGetMappings) throw new Error("enumerate failed");
     if (this.table) return this.table;
-    return this.mapping ? [this.mapping] : [];
+    // Derive the table from per-port state (plus a lone `mapping` for single-port
+    // tests that set it directly), so the enumerate is coherent with the writes.
+    const out = [...this.byPort.values()].filter((m): m is UpnpMapping => m != null);
+    if (this.mapping && !out.some((m) => m.public.port === this.mapping!.public.port)) {
+      out.push(this.mapping);
+    }
+    return out;
   }
   async getMapping(q: MappingQuery): Promise<UpnpMapping | null> {
     this.getCalls.push(q);
+    if (this.byPort.has(q.public)) return this.byPort.get(q.public) ?? null;
     return this.mapping;
   }
   async createMapping(m: NewMapping): Promise<void> {
     this.createCalls.push(m);
     if (this.failCreate) throw new Error("create failed");
+    if (this.failCreatePorts.has(m.public)) throw new Error(`create failed for ${m.public}`);
     // Reject only the FIRST create (the finite-lease attempt); later creates succeed.
     if (this.failFirstCreateWith != null && this.createCalls.length === 1) {
       throw new Error(this.failFirstCreateWith);
     }
     if (this.reflectCreates) {
-      this.mapping = {
+      this.byPort.set(m.public, {
         public: { host: "0.0.0.0", port: m.public },
         private: { ...m.private },
         protocol: m.protocol ?? "tcp",
         enabled: true,
         description: m.description ?? "Flux",
         ttl: m.ttl ?? 14400
-      };
+      });
     }
   }
   async removeMapping(): Promise<void> {
@@ -205,7 +225,7 @@ describe("UpnpCoordinator", () => {
       localAddress: "10.0.0.11",
       client
     });
-    coordinator.setDesiredPort(16127);
+    coordinator.setDesiredPortSet([16127]);
 
     await node.start();
     // Several turns, each settling the async repair, so a buggy non-idempotent
@@ -231,7 +251,7 @@ describe("UpnpCoordinator", () => {
       localAddress: "10.0.0.11",
       client
     });
-    coordinator.setDesiredPort(16127);
+    coordinator.setDesiredPortSet([16127]);
 
     await node.start();
     // Many batons pass; read-before-write skips every one.
@@ -254,7 +274,7 @@ describe("UpnpCoordinator", () => {
       localAddress: "10.0.0.11",
       client
     });
-    coordinator.setDesiredPort(16127);
+    coordinator.setDesiredPortSet([16127]);
 
     await node.start();
     w.clock.advance(200);
@@ -276,7 +296,7 @@ describe("UpnpCoordinator", () => {
       localAddress: "10.0.0.11",
       client
     });
-    coordinator.setDesiredPort(16127);
+    coordinator.setDesiredPortSet([16127]);
 
     await node.start();
     w.clock.advance(200);
@@ -300,7 +320,7 @@ describe("UpnpCoordinator", () => {
       rate: 0,
       capacity: 1
     });
-    coordinator.setDesiredPort(16127);
+    coordinator.setDesiredPortSet([16127]);
 
     await node.start();
     // Many settled turns: getMapping never reflects a write, so a repair is needed
@@ -330,7 +350,7 @@ describe("UpnpCoordinator", () => {
       client,
       onMappingFailed: (port, reason) => failed.push({ port, reason })
     });
-    coordinator.setDesiredPort(16127);
+    coordinator.setDesiredPortSet([16127]);
 
     await node.start();
     w.clock.advance(200);
@@ -351,7 +371,7 @@ describe("UpnpCoordinator", () => {
       localAddress: "10.0.0.11",
       client
     });
-    // never call setDesiredPort
+    // never call setDesiredPortSet
 
     await node.start();
     w.clock.advance(500);
@@ -359,6 +379,222 @@ describe("UpnpCoordinator", () => {
 
     assert.equal(client.getCalls.length, 0, "no read with no desired port");
     assert.equal(client.createCalls.length, 0, "no write with no desired port");
+  });
+});
+
+/**
+ * UpnpCoordinator (desired port SET) — a node maintains its WHOLE desired set, not a
+ * single port. Each port is read-before-written independently, the RateLimiter budget
+ * is spent per WRITE across the set, dropping a port stops maintaining it, and the
+ * per-router permanent-lease latch is shared across every port. Driven as lone
+ * SELF_CHECK nodes (the slot timer paces the repairs) — the per-port leader-check skip
+ * lives with the other 5b leader tests below.
+ */
+describe("UpnpCoordinator (desired port SET)", () => {
+  /** Settle several slot laps so the lone node's slot-driven repairs run. */
+  const runLaps = async (clock: ManualClock, n = 8): Promise<void> => {
+    for (let i = 0; i < n; i++) {
+      clock.advance(50);
+      await settle();
+    }
+  };
+
+  it("maps every missing port in the set exactly once", async () => {
+    const w = makeWorld();
+    const node = w.makeNode("10.0.0.11");
+    const client = new FakeUpnpClient(); // every port reads missing until created
+    client.reflectCreates = true; // each create sticks per-port, so it is mapped once
+    const { coordinator } = makeCoordinator(node, w.clock, {
+      self: "nidA",
+      localAddress: "10.0.0.11",
+      client
+    });
+    coordinator.setDesiredPortSet([16111, 16222, 16333]);
+
+    await node.start();
+    await runLaps(w.clock);
+
+    const created = client.createCalls.map((c) => c.public).sort((a, b) => a - b);
+    assert.deepEqual(created, [16111, 16222, 16333], "each missing port mapped exactly once");
+    for (const c of client.createCalls) {
+      assert.equal(c.private.host, "10.0.0.11", "self-map-only: every create points at us");
+      assert.equal(c.private.port, c.public, "private port mirrors the public port");
+    }
+  });
+
+  it("repairs only the unhealthy ports and leaves the healthy ones untouched", async () => {
+    const w = makeWorld();
+    const node = w.makeNode("10.0.0.11");
+    const client = new FakeUpnpClient();
+    client.reflectCreates = true;
+    // 16111 already healthy; 16222 missing; 16333 points at the wrong host.
+    client.byPort.set(16111, healthyMapping(16111, "10.0.0.11"));
+    client.byPort.set(16222, null);
+    client.byPort.set(16333, healthyMapping(16333, "10.0.0.99"));
+    const { coordinator } = makeCoordinator(node, w.clock, {
+      self: "nidA",
+      localAddress: "10.0.0.11",
+      client
+    });
+    coordinator.setDesiredPortSet([16111, 16222, 16333]);
+
+    await node.start();
+    await runLaps(w.clock);
+
+    const created = client.createCalls.map((c) => c.public).sort((a, b) => a - b);
+    assert.deepEqual(created, [16222, 16333], "wrote only the missing and the wrong-host ports");
+    assert.ok(
+      client.getCalls.some((q) => q.public === 16111),
+      "still read the healthy port (read-before-write); it just needed no write"
+    );
+  });
+
+  it("spends one rate token per WRITE across the set, not one per turn", async () => {
+    const w = makeWorld();
+    const node = w.makeNode("10.0.0.11");
+    // All three ports read missing forever (no reflect), so a write is always needed;
+    // capacity 1 + rate 0 means exactly ONE token ever exists, so across the WHOLE set
+    // only one write happens — yet every port is still read every pass.
+    const client = new FakeUpnpClient();
+    const { coordinator } = makeCoordinator(node, w.clock, {
+      self: "nidA",
+      localAddress: "10.0.0.11",
+      client,
+      rate: 0,
+      capacity: 1
+    });
+    coordinator.setDesiredPortSet([16111, 16222, 16333]);
+
+    await node.start();
+    await runLaps(w.clock);
+
+    assert.equal(client.createCalls.length, 1, "the single token caps writes across the whole set");
+    for (const port of [16111, 16222, 16333]) {
+      assert.ok(
+        client.getCalls.some((q) => q.public === port),
+        `read ${port} before writing — the budget gates the write, not the read`
+      );
+    }
+  });
+
+  it("stops maintaining a port once it is dropped from the set", async () => {
+    const w = makeWorld();
+    const node = w.makeNode("10.0.0.11");
+    const client = new FakeUpnpClient();
+    client.reflectCreates = true;
+    const { coordinator } = makeCoordinator(node, w.clock, {
+      self: "nidA",
+      localAddress: "10.0.0.11",
+      client
+    });
+    coordinator.setDesiredPortSet([16111, 16222]);
+
+    await node.start();
+    await runLaps(w.clock);
+    assert.deepEqual(
+      client.createCalls.map((c) => c.public).sort((a, b) => a - b),
+      [16111, 16222],
+      "both ports mapped while desired"
+    );
+
+    // Drop 16222 from the desired set: from now on it must never be touched again.
+    coordinator.setDesiredPortSet([16111]);
+    client.getCalls.length = 0;
+    client.createCalls.length = 0;
+    await runLaps(w.clock);
+
+    assert.ok(
+      client.getCalls.every((q) => q.public !== 16222),
+      "the dropped port is no longer checked"
+    );
+    assert.ok(
+      client.getCalls.some((q) => q.public === 16111),
+      "the still-desired port is still checked"
+    );
+    assert.equal(client.createCalls.length, 0, "and nothing was re-mapped (16111 stayed healthy)");
+  });
+
+  it("shares the permanent-lease latch across every port (one 725 covers the whole set)", async () => {
+    const w = makeWorld();
+    const node = w.makeNode("10.0.0.11");
+    const client = new FakeUpnpClient(); // both ports missing
+    // The FIRST create (16111, finite) is rejected 725; the latch then makes 16222 go
+    // straight to ttl 0 — a 725 is a per-ROUTER property, not per-port.
+    client.failFirstCreateWith = "soap:Client 725 OnlyPermanentLeasesSupported";
+    client.reflectCreates = true;
+    const { coordinator } = makeCoordinator(node, w.clock, {
+      self: "nidA",
+      localAddress: "10.0.0.11",
+      client
+    });
+    coordinator.setDesiredPortSet([16111, 16222]); // 16111 is iterated first (insertion order)
+
+    await node.start();
+    await runLaps(w.clock);
+
+    assert.equal(coordinator.leasePermanent, true, "the 725 latched permanent for the node");
+    const for16111 = client.createCalls.filter((c) => c.public === 16111).map((c) => c.ttl);
+    const for16222 = client.createCalls.filter((c) => c.public === 16222).map((c) => c.ttl);
+    assert.deepEqual(for16111, [14400, 0], "16111: finite attempt, then the permanent retry");
+    assert.deepEqual(for16222, [0], "16222: created permanent directly — no second 725");
+  });
+
+  it("shares a constrained rate budget FAIRLY — a failing front port does not starve the rest", async () => {
+    const w = makeWorld();
+    const node = w.makeNode("10.0.0.11");
+    const client = new FakeUpnpClient(); // every port missing
+    client.reflectCreates = true;
+    // 16111 is un-mappable: its create ALWAYS throws, so it spends (sinks) a token every
+    // time it is attempted. With a tight budget (capacity 1) and a FIXED front-to-back
+    // walk, 16111 would consume the lone token every pass and 16222/16333 would NEVER be
+    // written. The rotating cursor must rotate the head so the tail ports still get mapped.
+    client.failCreatePorts = new Set([16111]);
+    const { coordinator } = makeCoordinator(node, w.clock, {
+      self: "nidA",
+      localAddress: "10.0.0.11",
+      client,
+      rate: 1000, // refills the bucket each pass...
+      capacity: 1 // ...but only ever ONE token at a time, so one write per pass
+    });
+    coordinator.setDesiredPortSet([16111, 16222, 16333]);
+
+    await node.start();
+    await runLaps(w.clock, 12);
+
+    const n = (port: number): number => client.createCalls.filter((c) => c.public === port).length;
+    assert.ok(n(16111) >= 1, "the un-mappable front port kept being attempted");
+    assert.equal(n(16222), 1, "the tail port 16222 was still mapped (once) despite the token sink");
+    assert.equal(n(16333), 1, "the tail port 16333 was still mapped (once) despite the token sink");
+  });
+
+  it("re-maps a port evicted mid-run (router reboot) and leaves the others untouched", async () => {
+    const w = makeWorld();
+    const node = w.makeNode("10.0.0.11");
+    const client = new FakeUpnpClient();
+    client.reflectCreates = true;
+    const { coordinator } = makeCoordinator(node, w.clock, {
+      self: "nidA",
+      localAddress: "10.0.0.11",
+      client
+    });
+    coordinator.setDesiredPortSet([16111, 16222, 16333]);
+
+    await node.start();
+    await runLaps(w.clock);
+    assert.equal(client.createCalls.length, 3, "all three mapped, then steady (zero further writes)");
+    client.createCalls.length = 0;
+    client.getCalls.length = 0;
+
+    // The router drops ONLY 16222 (a targeted eviction); read-before-write must re-map
+    // exactly that port and leave the two still-healthy ones untouched.
+    client.byPort.set(16222, null);
+    await runLaps(w.clock);
+
+    assert.deepEqual(
+      client.createCalls.map((c) => c.public),
+      [16222],
+      "re-mapped only the evicted port, exactly once"
+    );
   });
 });
 
@@ -446,8 +682,8 @@ describe("UpnpCoordinator (5b leader-check)", () => {
       // measured laps so the skip is observed cleanly (expiry is covered elsewhere).
       freshLaps: 50
     });
-    lc.coordinator.setDesiredPort(16111);
-    pc.coordinator.setDesiredPort(16222);
+    lc.coordinator.setDesiredPortSet([16111]);
+    pc.coordinator.setDesiredPortSet([16222]);
 
     await lead.start();
     await peer.start();
@@ -481,14 +717,14 @@ describe("UpnpCoordinator (5b leader-check)", () => {
       localAddress: "10.0.0.10",
       client: leadClient
     });
-    lc.coordinator.setDesiredPort(16111);
+    lc.coordinator.setDesiredPortSet([16111]);
     const pc = makeCoordinator(peer, w.clock, {
       self: "10.0.0.20",
       localAddress: "10.0.0.20",
       client: peerClient,
       freshLaps: 50 // one broadcast stays trusted across the measured laps (see above)
     });
-    pc.coordinator.setDesiredPort(16222);
+    pc.coordinator.setDesiredPortSet([16222]);
 
     await lead.start();
     await peer.start();
@@ -520,13 +756,13 @@ describe("UpnpCoordinator (5b leader-check)", () => {
       localAddress: "10.0.0.10",
       client: leadClient
     });
-    lc.coordinator.setDesiredPort(16111);
+    lc.coordinator.setDesiredPortSet([16111]);
     const pc = makeCoordinator(peer, w.clock, {
       self: "10.0.0.20",
       localAddress: "10.0.0.20",
       client: peerClient
     });
-    pc.coordinator.setDesiredPort(16222);
+    pc.coordinator.setDesiredPortSet([16222]);
 
     await lead.start();
     await peer.start();
@@ -536,8 +772,8 @@ describe("UpnpCoordinator (5b leader-check)", () => {
       { coordinator: lc.coordinator, client: leadClient },
       { coordinator: pc.coordinator, client: peerClient }
     ]);
-    // Re-clear the reflected mapping so the post-reset read confirms it missing again.
-    peerClient.mapping = null;
+    // Re-clear this port's reflected mapping so the post-reset read confirms it missing.
+    peerClient.byPort.set(16222, null);
     await runLaps(w.clock);
 
     assert.ok(peerClient.getCalls.length >= 1, "non-leader did its OWN read-before-write");
@@ -558,7 +794,7 @@ describe("UpnpCoordinator (5b leader-check)", () => {
       localAddress: "10.0.0.30",
       client
     });
-    coordinator.setDesiredPort(16333);
+    coordinator.setDesiredPortSet([16333]);
 
     await node.start();
     await runLaps(w.clock);
@@ -568,6 +804,168 @@ describe("UpnpCoordinator (5b leader-check)", () => {
     assert.equal(coordinator.isLeader, true, "a singleton is its own representative");
     assert.ok(client.getCalls.length >= 1, "self-check read happened (no OBSERVED to skip on)");
     assert.equal(client.createCalls.length, 1, "mapped its missing port once via the 5a floor");
+  });
+
+  it("decides the skip PER PORT — skips a healthy observed port, repairs an omitted one", async () => {
+    const w = makeWorld();
+    const lead = w.makeNode("10.0.0.10");
+    const peer = w.makeNode("10.0.0.20");
+    const leadClient = new FakeUpnpClient();
+    const peerClient = new FakeUpnpClient();
+    // The leader's enumerate shows the peer's 16221 healthy but OMITS its 16222, so the
+    // peer must skip ONE port's read and fall back to read-before-write for the other.
+    leadClient.table = [
+      healthyMapping(16110, "10.0.0.10"),
+      healthyMapping(16221, "10.0.0.20")
+    ];
+    leadClient.mapping = healthyMapping(16110, "10.0.0.10");
+    peerClient.reflectCreates = true;
+    peerClient.byPort.set(16221, healthyMapping(16221, "10.0.0.20")); // healthy if ever read
+    peerClient.byPort.set(16222, null); // missing — the peer must repair it itself
+
+    const lc = makeCoordinator(lead, w.clock, {
+      self: "10.0.0.10",
+      localAddress: "10.0.0.10",
+      client: leadClient
+    });
+    lc.coordinator.setDesiredPortSet([16110]);
+    const pc = makeCoordinator(peer, w.clock, {
+      self: "10.0.0.20",
+      localAddress: "10.0.0.20",
+      client: peerClient,
+      freshLaps: 50 // one broadcast stays trusted across the measured laps
+    });
+    pc.coordinator.setDesiredPortSet([16221, 16222]);
+
+    await lead.start();
+    await peer.start();
+    await formRingAndReset(w.clock, [
+      { coordinator: lc.coordinator, client: leadClient },
+      { coordinator: pc.coordinator, client: peerClient }
+    ]);
+    // The peer may have already mapped 16222 during ring formation; re-clear it so the
+    // post-reset read confirms it missing and the single repair is observed cleanly.
+    peerClient.byPort.set(16222, null);
+    await runLaps(w.clock);
+
+    assert.equal(
+      peerClient.getCalls.filter((q) => q.public === 16221).length,
+      0,
+      "skipped the read for the port a fresh OBSERVED showed healthy"
+    );
+    assert.ok(
+      peerClient.getCalls.filter((q) => q.public === 16222).length >= 1,
+      "read-before-write the port OBSERVED omitted"
+    );
+    assert.deepEqual(
+      peerClient.createCalls.map((c) => c.public),
+      [16222],
+      "and repaired only that omitted port, exactly once"
+    );
+  });
+
+  it("does NOT skip on a same-port entry of a DIFFERENT protocol (protocol-scoped skip)", async () => {
+    const w = makeWorld();
+    const lead = w.makeNode("10.0.0.10");
+    const peer = w.makeNode("10.0.0.20");
+    const leadClient = new FakeUpnpClient();
+    const peerClient = new FakeUpnpClient();
+    // The enumerate carries a UDP mapping for the peer on the SAME port number it wants
+    // on TCP. That must NOT count as the peer's TCP port being healthy — the skip is as
+    // protocol-scoped as the targeted read it short-circuits, so the peer must still
+    // read-before-write its genuinely-missing TCP mapping.
+    leadClient.table = [
+      healthyMapping(16110, "10.0.0.10"),
+      { ...healthyMapping(16222, "10.0.0.20"), protocol: "udp" }
+    ];
+    leadClient.mapping = healthyMapping(16110, "10.0.0.10");
+    peerClient.reflectCreates = true;
+    peerClient.byPort.set(16222, null); // its TCP 16222 is actually missing
+
+    const lc = makeCoordinator(lead, w.clock, {
+      self: "10.0.0.10",
+      localAddress: "10.0.0.10",
+      client: leadClient
+    });
+    lc.coordinator.setDesiredPortSet([16110]);
+    const pc = makeCoordinator(peer, w.clock, {
+      self: "10.0.0.20",
+      localAddress: "10.0.0.20",
+      client: peerClient,
+      freshLaps: 50
+    });
+    pc.coordinator.setDesiredPortSet([16222]); // protocol defaults to tcp
+
+    await lead.start();
+    await peer.start();
+    await formRingAndReset(w.clock, [
+      { coordinator: lc.coordinator, client: leadClient },
+      { coordinator: pc.coordinator, client: peerClient }
+    ]);
+    peerClient.byPort.set(16222, null); // re-confirm missing after any formation write
+    await runLaps(w.clock);
+
+    assert.ok(
+      peerClient.getCalls.filter((q) => q.public === 16222).length >= 1,
+      "the UDP entry did NOT satisfy the TCP skip — the peer still read its own port"
+    );
+    assert.deepEqual(
+      peerClient.createCalls.map((c) => c.public),
+      [16222],
+      "and repaired its genuinely-missing TCP mapping (the protocol-blind false-skip is gone)"
+    );
+    assert.equal(peerClient.createCalls[0].protocol, "tcp", "self-mapped on its own protocol");
+  });
+
+  it("leader maintains its WHOLE own multi-port set — maps each missing own port once, healthy ones untouched", async () => {
+    const w = makeWorld();
+    const lead = w.makeNode("10.0.0.10");
+    const peer = w.makeNode("10.0.0.20");
+    const leadClient = new FakeUpnpClient();
+    const peerClient = new FakeUpnpClient();
+    leadClient.reflectCreates = true;
+    // The leader holds three OWN ports: 16110 healthy, 16111 missing, 16112 wrong-host.
+    leadClient.byPort.set(16110, healthyMapping(16110, "10.0.0.10"));
+    leadClient.byPort.set(16111, null);
+    leadClient.byPort.set(16112, healthyMapping(16112, "10.0.0.99"));
+    peerClient.byPort.set(16220, healthyMapping(16220, "10.0.0.20")); // peer stays quiet
+
+    const lc = makeCoordinator(lead, w.clock, {
+      self: "10.0.0.10",
+      localAddress: "10.0.0.10",
+      client: leadClient
+    });
+    lc.coordinator.setDesiredPortSet([16110, 16111, 16112]);
+    const pc = makeCoordinator(peer, w.clock, {
+      self: "10.0.0.20",
+      localAddress: "10.0.0.20",
+      client: peerClient,
+      freshLaps: 50
+    });
+    pc.coordinator.setDesiredPortSet([16220]);
+
+    await lead.start();
+    await peer.start();
+    await formRingAndReset(w.clock, [
+      { coordinator: lc.coordinator, client: leadClient },
+      { coordinator: pc.coordinator, client: peerClient }
+    ]);
+    // Re-establish the leader's repair targets after the reset (ring formation may have
+    // mapped them) so the steady-state leader scan provably maps each missing own port.
+    leadClient.byPort.set(16111, null);
+    leadClient.byPort.set(16112, healthyMapping(16112, "10.0.0.99"));
+    await runLaps(w.clock);
+
+    assert.equal(lc.coordinator.isLeader, true, "lowest address is the leader");
+    assert.ok(leadClient.getMappingsCalls >= 1, "the leader enumerated the whole table for the cohort");
+    assert.deepEqual(
+      leadClient.createCalls.map((c) => c.public).sort((a, b) => a - b),
+      [16111, 16112],
+      "leader mapped ONLY its missing/wrong-host own ports, each once (16110 healthy, untouched)"
+    );
+    for (const c of leadClient.createCalls) {
+      assert.equal(c.private.host, "10.0.0.10", "self-map-only: the leader maps only its own host");
+    }
   });
 });
 
@@ -681,8 +1079,8 @@ describe("UpnpCoordinator (5c mode machine)", () => {
       client: new FakeUpnpClient(),
       enterLaps: 3
     });
-    ca.coordinator.setDesiredPort(16111);
-    cb.coordinator.setDesiredPort(16222);
+    ca.coordinator.setDesiredPortSet([16111]);
+    cb.coordinator.setDesiredPortSet([16222]);
 
     // Default: never trust a ring we have not seen circulate.
     assert.equal(ca.coordinator.currentMode, "SELF_CHECK", "node A starts in SELF_CHECK");
@@ -717,7 +1115,7 @@ describe("UpnpCoordinator (5c mode machine)", () => {
       selfCheckCycleMs: 800,
       selfCheckWindows: 4
     });
-    coordinator.setDesiredPort(16127);
+    coordinator.setDesiredPortSet([16127]);
 
     await node.start();
     assert.equal(coordinator.currentMode, "SELF_CHECK", "a lone node never trusts a ring");
@@ -752,7 +1150,7 @@ describe("UpnpCoordinator (5c mode machine)", () => {
       selfCheckCycleMs: 100,
       selfCheckWindows: 1
     });
-    coordinator.setDesiredPort(16127);
+    coordinator.setDesiredPortSet([16127]);
     coordinator.start();
 
     // Climb into LEADER_CHECK on clean laps.
@@ -770,7 +1168,7 @@ describe("UpnpCoordinator (5c mode machine)", () => {
 
     // And it now repairs autonomously on its slot (clear any prior write first).
     client.createCalls.length = 0;
-    client.mapping = null;
+    client.byPort.set(16127, null); // drop the reflected mapping so the slot re-maps
     clock.advance(100); // cross the slot
     await settle();
     assert.ok(client.createCalls.length >= 1, "demoted node self-checks on its slot");
@@ -784,7 +1182,7 @@ describe("UpnpCoordinator (5c mode machine)", () => {
       tokenStallMs: 200,
       selfCheckCycleMs: 1_000_000 // keep the slot out of the way
     });
-    coordinator.setDesiredPort(16127);
+    coordinator.setDesiredPortSet([16127]);
     coordinator.start();
 
     for (let i = 0; i < 3; i++) cleanLap(group);
@@ -801,7 +1199,7 @@ describe("UpnpCoordinator (5c mode machine)", () => {
       enterLaps: 3,
       leaveLaps: 5
     });
-    coordinator.setDesiredPort(16127);
+    coordinator.setDesiredPortSet([16127]);
     coordinator.start();
 
     for (let i = 0; i < 3; i++) cleanLap(group);
@@ -836,7 +1234,7 @@ describe("UpnpCoordinator (5d lease fallback)", () => {
       localAddress: "10.0.0.11",
       client
     });
-    coordinator.setDesiredPort(16127);
+    coordinator.setDesiredPortSet([16127]);
 
     await node.start();
     for (let i = 0; i < 6; i++) {
@@ -863,7 +1261,7 @@ describe("UpnpCoordinator (5d lease fallback)", () => {
       client,
       onMappingFailed: (port, reason) => failed.push({ port, reason })
     });
-    coordinator.setDesiredPort(16127);
+    coordinator.setDesiredPortSet([16127]);
 
     await node.start();
     for (let i = 0; i < 6; i++) {
@@ -890,7 +1288,7 @@ describe("UpnpCoordinator (5d lease fallback)", () => {
       localAddress: "10.0.0.11",
       client
     });
-    coordinator.setDesiredPort(16127);
+    coordinator.setDesiredPortSet([16127]);
 
     await node.start();
     for (let i = 0; i < 4; i++) {
@@ -900,9 +1298,9 @@ describe("UpnpCoordinator (5d lease fallback)", () => {
     assert.equal(coordinator.leasePermanent, true, "latched permanent on the first 725");
     const writesAfterFallback = client.createCalls.length;
 
-    // Force a later write by dropping the reflected mapping: it must go straight to
-    // ttl 0 (no second 725 needed) and stay permanent.
-    client.mapping = null;
+    // Force a later write by dropping this port's reflected mapping: it must go
+    // straight to ttl 0 (no second 725 needed) and stay permanent.
+    client.byPort.set(16127, null);
     for (let i = 0; i < 4; i++) {
       w.clock.advance(50);
       await settle();
@@ -927,7 +1325,7 @@ describe("UpnpCoordinator (5d lease fallback)", () => {
       client,
       onMappingFailed: (port, reason) => failed.push({ port, reason })
     });
-    coordinator.setDesiredPort(16127);
+    coordinator.setDesiredPortSet([16127]);
 
     await node.start();
     for (let i = 0; i < 4; i++) {
@@ -1016,8 +1414,8 @@ describe("UpnpCoordinator (leader-set adaptive back-off)", () => {
       rate: 800,
       capacity: 1000
     });
-    lc.coordinator.setDesiredPort(16111);
-    pc.coordinator.setDesiredPort(16222);
+    lc.coordinator.setDesiredPortSet([16111]);
+    pc.coordinator.setDesiredPortSet([16222]);
 
     await lead.start();
     await peer.start();
@@ -1069,8 +1467,8 @@ describe("UpnpCoordinator (leader-set adaptive back-off)", () => {
       capacity: 1000,
       freshLaps: 50
     });
-    lc.coordinator.setDesiredPort(16111);
-    pc.coordinator.setDesiredPort(16222);
+    lc.coordinator.setDesiredPortSet([16111]);
+    pc.coordinator.setDesiredPortSet([16222]);
 
     await lead.start();
     await peer.start();
@@ -1130,8 +1528,8 @@ describe("UpnpCoordinator (leader-set adaptive back-off)", () => {
       capacity: 1000,
       freshLaps: 50
     });
-    lc.coordinator.setDesiredPort(16111);
-    pc.coordinator.setDesiredPort(16222);
+    lc.coordinator.setDesiredPortSet([16111]);
+    pc.coordinator.setDesiredPortSet([16222]);
 
     await lead.start();
     await peer.start();
@@ -1177,8 +1575,8 @@ describe("UpnpCoordinator (leader-set adaptive back-off)", () => {
       capacity: 1000,
       freshLaps: 50
     });
-    lc.coordinator.setDesiredPort(16111);
-    pc.coordinator.setDesiredPort(16222);
+    lc.coordinator.setDesiredPortSet([16111]);
+    pc.coordinator.setDesiredPortSet([16222]);
 
     await lead.start();
     await peer.start();
@@ -1191,5 +1589,56 @@ describe("UpnpCoordinator (leader-set adaptive back-off)", () => {
     // shared rate is untouched — still baseline on both nodes.
     assert.equal(pc.coordinator.currentRate, 800, "the non-leader did not back the group off");
     assert.equal(lc.coordinator.currentRate, 800, "and the healthy leader kept it at baseline");
+  });
+
+  it("reports an enumerate failure under the -1 sentinel and still repairs its own port", async () => {
+    const w = makeWorld();
+    const lead = w.makeNode("10.0.0.10");
+    const peer = w.makeNode("10.0.0.20");
+    const leadClient = new FakeUpnpClient();
+    const peerClient = new FakeUpnpClient();
+    // The leader cannot enumerate, but its OWN port is missing — the enumerate failure
+    // must surface as onMappingFailed(-1) (a whole-table read fault, not a single port),
+    // while the leader's own read-before-write still runs and maps its own port.
+    leadClient.failGetMappings = true;
+    leadClient.reflectCreates = true;
+    leadClient.byPort.set(16110, null);
+    peerClient.byPort.set(16220, healthyMapping(16220, "10.0.0.20")); // peer quiet
+
+    const failed: Array<{ port: number; reason: string }> = [];
+    const lc = makeCoordinator(lead, w.clock, {
+      self: "10.0.0.10",
+      localAddress: "10.0.0.10",
+      client: leadClient,
+      rate: 800,
+      capacity: 1000,
+      onMappingFailed: (port, reason) => failed.push({ port, reason })
+    });
+    const pc = makeCoordinator(peer, w.clock, {
+      self: "10.0.0.20",
+      localAddress: "10.0.0.20",
+      client: peerClient,
+      rate: 800,
+      capacity: 1000
+    });
+    lc.coordinator.setDesiredPortSet([16110]);
+    pc.coordinator.setDesiredPortSet([16220]);
+
+    await lead.start();
+    await peer.start();
+    await formLeaderCheckRing(w.clock, [lc.coordinator, pc.coordinator]);
+    assert.equal(lc.coordinator.isLeader, true, "lowest address leads");
+
+    await runLaps(w.clock);
+
+    assert.ok(
+      failed.some((f) => f.port === -1),
+      "the enumerate failure surfaced under the -1 sentinel (not attributed to a port)"
+    );
+    assert.deepEqual(
+      leadClient.createCalls.map((c) => c.public),
+      [16110],
+      "and the leader still repaired its OWN port despite the failed enumerate"
+    );
   });
 });
