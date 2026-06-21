@@ -430,6 +430,20 @@ export class FluxNodeAgent extends EventEmitter {
     this.refreshUpnpDesired();
   }
 
+  /**
+   * Urgent install-time UPnP map: declare a port desired and map it immediately (bypassing
+   * the routine cadence), still through the one serialized client + rate budget. FluxOS
+   * calls this when an app is installed. The port joins the maintained set (so the routine
+   * loop keeps it, and it survives later desired-set refreshes), and the optional
+   * description (e.g. "Flux_App_<name>") labels it. No-op until the coordinator is built.
+   */
+  async requestMap(port: number, description?: string): Promise<void> {
+    if (!this.fluxosDesiredUpnp.includes(port)) {
+      this.fluxosDesiredUpnp = [...this.fluxosDesiredUpnp, port];
+    }
+    if (this.upnpCoordinator) await this.upnpCoordinator.requestMap(port, description);
+  }
+
   /** Feed the coordinator the union of FluxOS's desired set and our own assigned port. */
   private refreshUpnpDesired(): void {
     if (!this.upnpCoordinator) return;

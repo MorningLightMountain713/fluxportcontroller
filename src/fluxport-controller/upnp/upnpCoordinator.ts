@@ -237,6 +237,10 @@ export class UpnpCoordinator {
   // writes: a persistently-failing unmap cannot perpetually sink a tight token budget and
   // starve the other orphans behind it.
   private unmapCursor = 0;
+  // Per-port mapping descriptions set by requestMap (e.g. "Flux_App_<name>") so a routine
+  // re-map of an app port keeps its app name instead of reverting to the default "Flux".
+  // Pruned when a port leaves the desired set.
+  private portDescriptions = new Map<number, string>();
   // Once this router has rejected a finite lease (SOAP 725) it never accepts one, so
   // we latch permanent and request ttl 0 for the rest of this node's life on it.
   private permanentLease = false;
@@ -371,8 +375,30 @@ export class UpnpCoordinator {
     }
     // A (re-)desired port is by definition not an orphan — cancel any pending candidacy.
     for (const port of next) this.orphanCandidates.delete(port);
+    // Drop per-port descriptions for ports no longer desired (kept only while maintained).
+    for (const port of [...this.portDescriptions.keys()]) {
+      if (!next.has(port)) this.portDescriptions.delete(port);
+    }
     this.desiredPorts = next;
     this.desiredEverSet = true;
+  }
+
+  /**
+   * Urgent install-time map: declare a port desired AND map it NOW, bypassing the baton
+   * cadence (FluxOS calls this the instant an app is installed, not on the slow routine
+   * loop). It STILL goes through the one serialized client and the rate budget — urgency
+   * is about cadence, not flooding the router — so if no token is free this turn the map
+   * is left to the routine loop (the port is now in the desired set). The optional
+   * description (e.g. "Flux_App_<name>") is remembered so a later routine re-map keeps it.
+   * Failures surface via onMappingFailed, like any other map; read-before-write keeps it
+   * idempotent against a concurrent baton-driven pass.
+   */
+  async requestMap(port: number, description?: string): Promise<void> {
+    this.desiredEverSet = true;
+    this.desiredPorts.add(port);
+    this.orphanCandidates.delete(port); // desired now — never an orphan
+    if (description != null) this.portDescriptions.set(port, description);
+    await this.repairPort(port);
   }
 
   /** The ports this node is maintaining, ascending (test seam / observability). */
@@ -812,12 +838,13 @@ export class UpnpCoordinator {
       // retry (the rate limiter, not us, decides the cadence of router writes).
       if (!this.rl.acquire()) return;
 
+      const description = this.portDescriptions.get(port) ?? this.description;
       try {
         await this.client.createMapping({
           public: port,
           private: { host: this.localAddress, port },
           protocol: this.protocol,
-          description: this.description,
+          description,
           ttl: this.permanentLease ? 0 : this.ttl
         });
       } catch (err) {
@@ -832,7 +859,7 @@ export class UpnpCoordinator {
           public: port,
           private: { host: this.localAddress, port },
           protocol: this.protocol,
-          description: this.description,
+          description,
           ttl: 0
         });
       }

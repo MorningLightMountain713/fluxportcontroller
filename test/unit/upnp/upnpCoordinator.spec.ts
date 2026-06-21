@@ -2185,3 +2185,120 @@ describe("UpnpCoordinator (orphan cleanup)", () => {
     );
   });
 });
+
+/**
+ * UpnpCoordinator (requestMap) — the urgent install-time path. FluxOS calls this the
+ * instant an app is installed: map the port NOW (bypass the baton cadence) but STILL
+ * through the serialized client + rate budget, add it to the maintained desired set, and
+ * remember its description so a routine re-map keeps the app name.
+ */
+describe("UpnpCoordinator (requestMap — urgent install-time map)", () => {
+  it("maps the port IMMEDIATELY (off-baton) and adds it to the desired set", async () => {
+    const w = makeWorld();
+    const node = w.makeNode("10.0.0.11");
+    const client = new FakeUpnpClient(); // getMapping -> null (missing)
+    client.reflectCreates = true;
+    const { coordinator } = makeCoordinator(node, w.clock, {
+      self: "nidA",
+      localAddress: "10.0.0.11",
+      client
+    });
+
+    await node.start();
+    // No clock advance, no baton, no slot — requestMap must map right now.
+    await coordinator.requestMap(16127, "Flux_App_myapp");
+
+    assert.deepEqual(
+      client.createCalls.map((c) => c.public),
+      [16127],
+      "mapped immediately, without waiting for a baton/slot"
+    );
+    assert.equal(client.createCalls[0].description, "Flux_App_myapp", "used the given description");
+    assert.deepEqual(client.createCalls[0].private, { host: "10.0.0.11", port: 16127 });
+    assert.deepEqual(coordinator.desired, [16127], "joined the maintained desired set");
+  });
+
+  it("remembers the description so a routine re-map keeps it (not the default Flux)", async () => {
+    const w = makeWorld();
+    const node = w.makeNode("10.0.0.11");
+    const client = new FakeUpnpClient();
+    client.reflectCreates = true;
+    const { coordinator } = makeCoordinator(node, w.clock, {
+      self: "nidA",
+      localAddress: "10.0.0.11",
+      client
+    });
+
+    await node.start();
+    await coordinator.requestMap(16500, "Flux_App_myapp");
+    assert.equal(client.createCalls[0].description, "Flux_App_myapp");
+
+    // The router drops it -> the routine self-check slot re-maps it, keeping the app name.
+    client.byPort.set(16500, null);
+    client.createCalls.length = 0;
+    for (let i = 0; i < 6; i++) {
+      w.clock.advance(50);
+      await settle();
+    }
+    assert.ok(client.createCalls.length >= 1, "the routine loop re-mapped the dropped port");
+    assert.ok(
+      client.createCalls.every((c) => c.description === "Flux_App_myapp"),
+      "every re-map kept the requestMap description, not the default"
+    );
+  });
+
+  it("still respects the rate budget — no token means it waits for the routine loop", async () => {
+    const w = makeWorld();
+    const node = w.makeNode("10.0.0.11");
+    const client = new FakeUpnpClient();
+    client.reflectCreates = true;
+    const { coordinator } = makeCoordinator(node, w.clock, {
+      self: "nidA",
+      localAddress: "10.0.0.11",
+      client,
+      rate: 0,
+      capacity: 1 // exactly one token ever
+    });
+
+    await node.start();
+    await coordinator.requestMap(16127); // spends the one token -> mapped now
+    await coordinator.requestMap(16222); // no token left -> not mapped immediately
+
+    assert.deepEqual(
+      client.createCalls.map((c) => c.public),
+      [16127],
+      "the budget gated the second urgent map (urgency is cadence, not flooding the router)"
+    );
+    assert.deepEqual(
+      coordinator.desired,
+      [16127, 16222],
+      "but both are desired — the routine loop maps the second once budget allows"
+    );
+  });
+
+  it("clears a pending orphan candidacy when a dropped port is re-requested", async () => {
+    const w = makeWorld();
+    const node = w.makeNode("10.0.0.11");
+    const client = new FakeUpnpClient();
+    client.reflectCreates = true;
+    const { coordinator } = makeCoordinator(node, w.clock, {
+      self: "nidA",
+      localAddress: "10.0.0.11",
+      client
+    });
+
+    coordinator.setDesiredPortSet([16127]);
+    coordinator.setDesiredPortSet([]); // drop 16127 -> queued as an orphan
+    assert.deepEqual(coordinator.pendingUnmaps, [16127], "queued for prune after the drop");
+
+    await node.start();
+    await coordinator.requestMap(16127); // re-requested -> no longer an orphan
+
+    assert.deepEqual(coordinator.pendingUnmaps, [], "the re-request cancelled the orphan candidacy");
+    assert.deepEqual(coordinator.desired, [16127], "and it is desired again");
+    assert.ok(
+      client.createCalls.some((c) => c.public === 16127),
+      "and it was mapped immediately"
+    );
+  });
+});

@@ -386,6 +386,38 @@ describe("FluxNodeAgent (UPnP coordination)", () => {
     assert.deepEqual(b.desiredUpnpPorts, [pb], "B's desired UPnP set is its assigned port");
   });
 
+  it("requestMap urgently maps a port through the agent and keeps it desired", async () => {
+    const net = new VirtualNetwork();
+    const clock = new ManualClock();
+    const router = new SharedFakeRouter();
+    const a = new FluxNodeAgent(
+      { txhash: "aaa", outidx: "0" },
+      {
+        ...FAST_TIMING,
+        ports: [16197, 16187, 16177],
+        clock,
+        upnpClient: router.clientFor("10.0.0.11"),
+        createTransport: (addr) => net.register(addr),
+        getPublicIp: async () => "1.2.3.4",
+        resolveNodeInfo: async () => ({ priorPort: null, priority: 100 }),
+        upnpTiming,
+        upnpTuning
+      }
+    );
+
+    assert.equal(await a.start(), true);
+    // No clock advance — requestMap must map right now (bypassing the routine cadence).
+    await a.requestMap(17000, "Flux_App_test");
+
+    assert.equal(
+      router.table.get(17000)?.private.host,
+      "10.0.0.11",
+      "urgently mapped to its own IP on the router"
+    );
+    assert.equal(router.table.get(17000)?.description, "Flux_App_test", "with the given description");
+    assert.ok(a.desiredUpnpPorts.includes(17000), "and kept in the maintained desired set");
+  });
+
   it("can be disabled (enableUpnp:false): no upnp group, ports still converge", async () => {
     const net = new VirtualNetwork();
     const clock = new ManualClock();
