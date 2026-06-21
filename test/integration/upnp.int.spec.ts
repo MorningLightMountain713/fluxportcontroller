@@ -7,10 +7,14 @@
  *
  * Verification is ground-truth: after the `ports` allocation converges, the test reads
  * the router's ACTUAL mapping table (a getMappings SOAP enumerate via a node's status
- * endpoint) and asserts each node mapped ONLY its own assigned port, pointing at its own
- * LAN IP (the self-map invariant), and that the slow-timing mode machine reaches
- * LEADER_CHECK over real multicast. Nodes run with UPNP_FAST so the minutes-scale
- * production cadence is scaled to seconds for the test window.
+ * endpoint). Nodes run with UPNP_FAST so the minutes-scale production cadence is scaled
+ * to seconds for the test window.
+ *
+ * Coverage: each node maps only its own port (self-map invariant) + reaches LEADER_CHECK;
+ * steady-state zero writes (map rarely, check often); a departed node leaves no orphaned
+ * obligation on the survivors; the leader's adaptive back-off cuts the group rate when the
+ * router goes unreachable and recovers when it returns; and a stuck UPnP SOAP call on one
+ * node never wedges the token or the `ports` group (the §5 fire-and-forget + isolation).
  */
 import assert from "assert/strict";
 import { after, before, describe, it } from "node:test";
@@ -19,7 +23,7 @@ import {
   createConsensusEnv,
   waitForConvergence
 } from "./framework/test-env";
-import { UpnpMappingView } from "./framework/node-client";
+import { NodeClient, UpnpMappingView } from "./framework/node-client";
 
 const NODES = Number(process.env.UPNP_INT_NODES ?? 3);
 const CONVERGE_TIMEOUT_MS = 90_000;
@@ -28,8 +32,32 @@ const MAP_TIMEOUT_MS = 60_000;
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 const isFlux = (m: UpnpMappingView): boolean => /^Flux/i.test(m.description);
 
+/** Read one node's full router table (ground truth), tolerating a transient fetch error. */
+async function routerTable(probe: NodeClient): Promise<UpnpMappingView[]> {
+  const s = await probe.upnpStatus().catch(() => null);
+  return s?.upnpMappings ?? [];
+}
+
+/** Poll until `pred(table)` holds or the deadline passes; returns the last table seen. */
+async function waitForTable(
+  probe: NodeClient,
+  pred: (t: UpnpMappingView[]) => boolean,
+  timeoutMs: number
+): Promise<{ ok: boolean; table: UpnpMappingView[] }> {
+  const deadline = Date.now() + timeoutMs;
+  let table: UpnpMappingView[] = [];
+  while (Date.now() < deadline) {
+    table = await routerTable(probe);
+    if (pred(table)) return { ok: true, table };
+    await sleep(3000);
+  }
+  return { ok: false, table };
+}
+
 describe("UPnP coordination integration (real miniupnpd mappings)", () => {
   let env: ConsensusEnv;
+  let portByNid: Map<string, number>;
+  let ipByNid: Map<string, string>;
 
   before(async () => {
     env = await createConsensusEnv({ nodes: NODES, env: { UPNP_FAST: "1" } });
@@ -43,7 +71,6 @@ describe("UPnP coordination integration (real miniupnpd mappings)", () => {
     "each node maps ONLY its own assigned port on the real router (self-map invariant)",
     { timeout: CONVERGE_TIMEOUT_MS + MAP_TIMEOUT_MS + 30_000 },
     async () => {
-      // 1) the ports allocation converges — each node wins a distinct port.
       let statuses;
       try {
         statuses = await waitForConvergence(env.nodes, NODES, CONVERGE_TIMEOUT_MS);
@@ -51,67 +78,216 @@ describe("UPnP coordination integration (real miniupnpd mappings)", () => {
         for (const n of env.nodes) console.error(`\n--- ${n.name} ---\n${await n.tailLogs(15)}`);
         throw err;
       }
-      const portByNid = new Map(statuses.map((s) => [s.nid, s.port as number]));
-      const ipByNid = new Map(env.nodes.map((n) => [n.expectedNid!, env.ipOf(n)]));
+      portByNid = new Map(statuses.map((s) => [s.nid, s.port as number]));
+      ipByNid = new Map(env.nodes.map((n) => [n.expectedNid!, env.ipOf(n)]));
 
-      // 2) wait until the router table holds a mapping for every node's assigned port,
-      //    each pointing at THAT node's own IP — read as ground truth via a real
-      //    getMappings enumerate through one node.
-      const probe = env.nodes[0];
       const wanted = (table: UpnpMappingView[]): boolean =>
         [...portByNid].every(([nid, port]) =>
           table.some((m) => m.public.port === port && m.private.host === ipByNid.get(nid))
         );
-      let table: UpnpMappingView[] = [];
-      let lastErr: string | undefined;
-      const deadline = Date.now() + MAP_TIMEOUT_MS;
-      let ok = false;
-      while (Date.now() < deadline) {
-        const s = await probe.upnpStatus().catch(() => null);
-        if (s) {
-          table = s.upnpMappings;
-          lastErr = s.upnpError;
-        }
-        if (wanted(table)) {
-          ok = true;
-          break;
-        }
-        await sleep(3000);
-      }
-
+      const { ok, table } = await waitForTable(env.nodes[0], wanted, MAP_TIMEOUT_MS);
       if (!ok) {
         console.error(`router table: ${JSON.stringify(table)}`);
-        if (lastErr) console.error(`last getMappings error: ${lastErr}`);
         for (const n of env.nodes) console.error(`\n--- ${n.name} ---\n${await n.tailLogs(20)}`);
       }
-      assert.ok(
-        ok,
-        `every node's assigned port mapped to its own IP within ${MAP_TIMEOUT_MS}ms` +
-          (lastErr ? ` (last enumerate error: ${lastErr})` : "")
-      );
+      assert.ok(ok, `every node's assigned port mapped to its own IP within ${MAP_TIMEOUT_MS}ms`);
 
-      // 3) self-map invariant: every Flux mapping belongs to a known node and is exactly
-      //    that node's OWN assigned port — no third-party / cross maps.
+      // self-map invariant: every Flux mapping is exactly its owner's OWN assigned port.
       const ipToNid = new Map([...ipByNid].map(([nid, ip]) => [ip, nid]));
       for (const m of table.filter(isFlux)) {
         const owner = ipToNid.get(m.private.host);
         assert.ok(owner, `Flux mapping ${m.public.port} -> ${m.private.host} has no known owner`);
-        assert.equal(
-          m.public.port,
-          portByNid.get(owner),
-          `node ${owner} mapped ${m.public.port}, not its own assigned port ${portByNid.get(owner)}`
-        );
+        assert.equal(m.public.port, portByNid.get(owner), `node ${owner} mapped a foreign port`);
       }
 
-      // 4) the slow-timing mode machine reached LEADER_CHECK over real multicast (the 5c
-      //    health gate works end-to-end), not just the always-available self-check floor.
-      const modes = await Promise.all(
-        env.nodes.map((n) => n.upnpStatus().then((s) => s.upnpMode).catch(() => null))
-      );
+      // the slow-timing mode machine reached LEADER_CHECK over real multicast (5c gate).
+      const live = await Promise.all(env.nodes.map((n) => n.status().catch(() => null)));
       assert.ok(
-        modes.some((m) => m === "LEADER_CHECK"),
-        `at least one node reached LEADER_CHECK on real multicast; modes=${JSON.stringify(modes)}`
+        live.some((s) => s?.upnpMode === "LEADER_CHECK"),
+        `at least one node reached LEADER_CHECK; modes=${JSON.stringify(live.map((s) => s?.upnpMode))}`
       );
+    }
+  );
+
+  it(
+    "map rarely, check often: steady state holds at ZERO further router writes",
+    { timeout: 90_000 },
+    async () => {
+      // Wait until every node's write count has stopped climbing (initial maps done).
+      const writesOf = async (): Promise<number[]> =>
+        Promise.all(env.nodes.map((n) => n.status().then((s) => s.upnpWrites ?? 0)));
+      let prev = await writesOf();
+      const settleDeadline = Date.now() + 30_000;
+      for (;;) {
+        await sleep(4000);
+        const now = await writesOf();
+        if (now.every((w, i) => w === prev[i]) && now.every((w) => w > 0)) break;
+        prev = now;
+        assert.ok(Date.now() < settleDeadline, "write counts never settled");
+      }
+
+      // Now the steady-state assertion: across several more scan cycles, NO node writes
+      // again — a healthy long-lease mapping is re-read, never re-written.
+      const before = await writesOf();
+      await sleep(15_000);
+      const afterWrites = await writesOf();
+      assert.deepEqual(
+        afterWrites,
+        before,
+        `steady state must be zero writes; before=${before} after=${afterWrites}`
+      );
+    }
+  );
+
+  // MUST be last in this describe: it kills a node, shrinking env.nodes.
+  it(
+    "a departed node leaves no mapping obligation on the survivors (self-map-only)",
+    { timeout: CONVERGE_TIMEOUT_MS + 30_000 },
+    async () => {
+      const victim = env.nodes[env.nodes.length - 1];
+      const victimNid = victim.expectedNid!;
+      const victimPort = portByNid.get(victimNid)!;
+      const survivors = env.nodes.filter((n) => n !== victim);
+      const survivorNids = new Set(survivors.map((n) => n.expectedNid!));
+
+      await env.kill(victim);
+      // The ports ring reconverges to the survivors.
+      await waitForConvergence(env.nodes, NODES - 1, CONVERGE_TIMEOUT_MS);
+
+      // Each survivor still holds its OWN port; no survivor ever maps the victim's port
+      // (strict self-map-only — nobody maps on a departed node's behalf).
+      const survivorIps = new Set(survivors.map((n) => env.ipOf(n)));
+      const stillMine = (table: UpnpMappingView[]): boolean =>
+        survivors.every((n) =>
+          table.some(
+            (m) => m.public.port === portByNid.get(n.expectedNid!) && m.private.host === env.ipOf(n)
+          )
+        );
+      const { ok, table } = await waitForTable(survivors[0], stillMine, 30_000);
+      assert.ok(ok, `survivors keep their own mappings; table=${JSON.stringify(table)}`);
+
+      for (const m of table.filter(isFlux)) {
+        if (m.public.port === victimPort && !survivorIps.has(m.private.host)) continue; // victim's lingering own mapping
+        assert.ok(survivorIps.has(m.private.host), `unexpected mapping owner ${m.private.host}`);
+        assert.notEqual(m.public.port, victimPort, "a survivor wrongly took over the victim's port");
+        // finite lease => a departed node's mapping self-cleans (no orphan accrual).
+        assert.ok(m.ttl > 0, `survivor mapping ${m.public.port} must carry a finite lease`);
+      }
+    }
+  );
+});
+
+describe("UPnP coordination integration (router stress: back-off + stall isolation)", () => {
+  let env: ConsensusEnv;
+
+  before(async () => {
+    env = await createConsensusEnv({ nodes: NODES, env: { UPNP_FAST: "1" } });
+    await waitForConvergence(env.nodes, NODES, CONVERGE_TIMEOUT_MS);
+  }, { timeout: 300_000 });
+
+  after(async () => {
+    await env?.teardown();
+  }, { timeout: 60_000 });
+
+  /** Poll the plain status (no SOAP — safe when the router is blocked) until pred holds. */
+  const waitForStatus = async (
+    node: NodeClient,
+    pred: (s: Awaited<ReturnType<NodeClient["status"]>>) => boolean,
+    timeoutMs: number
+  ): Promise<boolean> => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const s = await node.status().catch(() => null);
+      if (s && pred(s)) return true;
+      await sleep(2000);
+    }
+    return false;
+  };
+
+  it(
+    "the leader backs the group rate off when the router goes unreachable, and recovers when it returns",
+    { timeout: 150_000 },
+    async () => {
+      // Find the elected leader (lowest LAN address) once a ring is healthy.
+      const leaderUp = await waitForStatus(
+        env.nodes[0],
+        () => env.nodes.length > 0,
+        1000
+      );
+      assert.ok(leaderUp);
+      let leader: NodeClient | null = null;
+      const findDeadline = Date.now() + 60_000;
+      while (!leader && Date.now() < findDeadline) {
+        for (const n of env.nodes) {
+          const s = await n.status().catch(() => null);
+          if (s?.upnpIsLeader) {
+            leader = n;
+            break;
+          }
+        }
+        if (!leader) await sleep(2000);
+      }
+      assert.ok(leader, "an upnp leader was elected");
+      const peer = env.nodes.find((n) => n !== leader)!;
+
+      const baseline = (await leader.status()).upnpRate!;
+      assert.ok(baseline > 0, `leader has a baseline rate: ${baseline}`);
+
+      // Cut the leader off from the router: its per-cycle enumerate now fails, so it
+      // multiplicatively backs the WHOLE segment off (a setRate every node folds).
+      await env.blockRouter(leader);
+      const droppedLeader = await waitForStatus(
+        leader,
+        (s) => (s.upnpRate ?? Infinity) < baseline,
+        90_000
+      );
+      assert.ok(droppedLeader, "the failing leader scan cut the shared rate below baseline");
+      // The non-leader folded the SAME lower rate (the leader paced the whole segment).
+      const droppedPeer = await waitForStatus(
+        peer,
+        (s) => (s.upnpRate ?? Infinity) < baseline,
+        30_000
+      );
+      assert.ok(droppedPeer, "the non-leader folded the leader's backed-off rate");
+
+      // Restore the router: clean scans must ease the rate back up toward baseline.
+      await env.unblockRouter(leader);
+      const recovered = await waitForStatus(
+        leader,
+        (s) => (s.upnpRate ?? 0) >= baseline,
+        90_000
+      );
+      assert.ok(recovered, "clean scans recovered the rate to baseline after the router returned");
+    }
+  );
+
+  it(
+    "a stuck UPnP SOAP call on one node never wedges the token or the ports group (§5 isolation)",
+    { timeout: 120_000 },
+    async () => {
+      const victim = env.nodes[0];
+      // Block ONLY this node's router access — its UPnP SOAP calls now stall/fail. The
+      // coordinator fires repair off the baton (never awaited on the token path) and one
+      // SOAP is in flight at a time, so a stuck call must not stop the token or affect the
+      // separate `ports` consensus on the shared socket.
+      await env.blockRouter(victim);
+
+      // Through the stall, the ports group stays fully converged (the production-critical
+      // path is untouched), proven via the plain status (no SOAP).
+      await sleep(20_000);
+      const conv = await waitForConvergence(env.nodes, NODES, 30_000).catch(() => null);
+      assert.ok(conv, "the ports group stayed converged despite a stuck UPnP SOAP call");
+      const vs = await victim.status();
+      assert.equal(vs.members.length, NODES, "the stalled node is still a full ring member");
+      assert.ok(vs.upnpMode != null, "the stalled node's coordinator did not wedge");
+
+      // Recovery: once the router returns, the node resumes a working enumerate.
+      await env.unblockRouter(victim);
+      const back = await env.nodes[0]
+        .upnpStatus()
+        .then((s) => !s.upnpError && s.upnpMappings.length > 0)
+        .catch(() => false);
+      assert.ok(back, "router enumerate works again after the block is cleared");
     }
   );
 });

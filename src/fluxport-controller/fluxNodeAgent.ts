@@ -447,6 +447,14 @@ export class FluxNodeAgent extends EventEmitter {
   get upnpMode(): string | null {
     return this.upnpCoordinator?.currentMode ?? null;
   }
+  /** The current group-wide UPnP rate (the adaptive back-off value), or null if disabled. */
+  get upnpRate(): number | null {
+    return this.upnpCoordinator?.currentRate ?? null;
+  }
+  /** True when this node is the upnp ring's enumerating leader (observability). */
+  get upnpIsLeader(): boolean {
+    return this.upnpCoordinator?.isLeader ?? false;
+  }
 
   /**
    * Enumerate the router's current UPnP mapping table (a real SOAP read through the one

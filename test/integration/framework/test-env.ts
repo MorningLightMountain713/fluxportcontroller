@@ -136,6 +136,13 @@ export interface ConsensusEnv {
   clearLoss(targets: NodeClient[]): Promise<void>;
   /** A node's current IP on the env network (the LAN address it self-maps to). */
   ipOf(node: NodeClient): string;
+  /** miniupnpd's IP on the env network (the router the nodes' SOAP calls target). */
+  routerIp: string;
+  /** Sever a node's traffic to/from the router (its UPnP SOAP calls stall/fail), leaving
+   *  multicast consensus untouched — models an IGD that has gone unreachable for one node. */
+  blockRouter(node: NodeClient): Promise<void>;
+  /** Restore a node's router access (remove the block rules). */
+  unblockRouter(node: NodeClient): Promise<void>;
   teardown(): Promise<void>;
 }
 
@@ -283,6 +290,7 @@ export async function createConsensusEnv(opts: {
         .withWaitStrategy(Wait.forLogMessage(/HTTP listening on port/))
     ).start();
     started.push(miniupnpd);
+    const routerIp = miniupnpd.getIpAddress(networkName);
 
     // Start nodes concurrently; startNode tracks each the instant it starts so a
     // partial-failure teardown still stops everything already up.
@@ -346,6 +354,22 @@ export async function createConsensusEnv(opts: {
         await Promise.all(targets.map((n) => exec(n, "iptables -F INPUT")));
       },
       ipOf,
+      routerIp,
+      async blockRouter(node: NodeClient): Promise<void> {
+        await exec(
+          node,
+          `iptables -A OUTPUT -d ${routerIp} -j DROP && iptables -A INPUT -s ${routerIp} -j DROP`
+        );
+      },
+      async unblockRouter(node: NodeClient): Promise<void> {
+        // Delete the specific rules (not a flush, which would also clear partition/loss);
+        // `|| true` so an already-absent rule never fails the test.
+        await exec(
+          node,
+          `iptables -D OUTPUT -d ${routerIp} -j DROP || true; ` +
+            `iptables -D INPUT -s ${routerIp} -j DROP || true`
+        );
+      },
       teardown
     };
   } catch (err) {

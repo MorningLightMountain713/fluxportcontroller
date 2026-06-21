@@ -4,6 +4,32 @@ import os from "node:os";
 import { createServer } from "node:http";
 import axios from "axios";
 import { FluxNodeAgent, FluxNodeAgentOptions, logController } from "./src";
+import {
+  createDefaultUpnpClient,
+  UpnpClientLike
+} from "./src/fluxport-controller/upnpClient";
+
+// Test-side instrumentation (harness only): count router WRITES so the integration
+// test can assert steady-state zero writes. A thin pass-through around the real
+// serialized client — no production code involved.
+let upnpWrites = 0;
+let upnpDeletes = 0;
+function countingClient(inner: UpnpClientLike): UpnpClientLike {
+  return {
+    getGateway: () => inner.getGateway(),
+    getMappings: () => inner.getMappings(),
+    getMapping: (q) => inner.getMapping(q),
+    createMapping: (m) => {
+      upnpWrites += 1;
+      return inner.createMapping(m);
+    },
+    removeMapping: (q) => {
+      upnpDeletes += 1;
+      return inner.removeMapping(q);
+    },
+    close: () => inner.close?.()
+  };
+}
 
 logController.addLoggerTransport("console");
 
@@ -38,6 +64,8 @@ if (harness) {
     priorPort: null,
     priority: Number.MAX_SAFE_INTEGER
   });
+  // Real serialized client, wrapped to count writes for the steady-state assertion.
+  options.upnpClient = countingClient(createDefaultUpnpClient());
 }
 if (process.env.UPNP_FAST === "1") {
   // Fast-but-PROPORTIONED upnp timing for the integration harness: same shape as the
@@ -92,6 +120,9 @@ manager.on("portConfirmed", (port: number) => {
 // against the router — kept OFF the frequent poll so it never spams miniupnpd; the §7.5
 // integration test calls it on demand for ground-truth verification.
 createServer((req, res) => {
+  // Sync UPnP fields (no SOAP) ride the plain poll, so they stay readable even when a
+  // test has blocked the node's router access. Only the table read (?upnp=1) does a SOAP
+  // enumerate, kept off the frequent convergence poll.
   const respond = (extra: Record<string, unknown>): void => {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(
@@ -100,6 +131,12 @@ createServer((req, res) => {
         port: confirmedPort,
         view: manager.viewId,
         members: manager.members,
+        upnpMode: manager.upnpMode,
+        upnpRate: manager.upnpRate,
+        upnpIsLeader: manager.upnpIsLeader,
+        desiredUpnpPorts: manager.desiredUpnpPorts,
+        upnpWrites,
+        upnpDeletes,
         ...extra
       })
     );
@@ -107,20 +144,9 @@ createServer((req, res) => {
   if (!req.url || !req.url.includes("upnp=1")) return respond({});
   manager
     .getUpnpMappings()
-    .then((upnpMappings) =>
-      respond({
-        upnpMode: manager.upnpMode,
-        desiredUpnpPorts: manager.desiredUpnpPorts,
-        upnpMappings
-      })
-    )
+    .then((upnpMappings) => respond({ upnpMappings }))
     .catch((err) =>
-      respond({
-        upnpMode: manager.upnpMode,
-        desiredUpnpPorts: manager.desiredUpnpPorts,
-        upnpMappings: [],
-        upnpError: String((err && (err as Error).message) || err)
-      })
+      respond({ upnpMappings: [], upnpError: String((err && (err as Error).message) || err) })
     );
 }).listen(statusPort, () => console.log(`status endpoint on :${statusPort}`));
 

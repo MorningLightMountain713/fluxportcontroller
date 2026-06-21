@@ -23,6 +23,15 @@ export interface NodeStatus {
   view: string | null;
   /** Members of the current view. */
   members: string[];
+  // Sync UPnP fields (harness only; no SOAP, so they ride the plain status poll and stay
+  // readable even when a test has blocked the node's router access).
+  upnpMode?: string | null;
+  upnpRate?: number | null;
+  upnpIsLeader?: boolean;
+  desiredUpnpPorts?: number[];
+  /** Cumulative router writes/deletes this node has issued (steady-state assertion). */
+  upnpWrites?: number;
+  upnpDeletes?: number;
 }
 
 /** A router mapping as the node reads it back (a subset of the package's UpnpMapping). */
@@ -35,10 +44,8 @@ export interface UpnpMappingView {
   enabled: boolean;
 }
 
-/** Status + the live UPnP view (mode, desired set, and the REAL router table). */
+/** Plain status PLUS the REAL router table (a getMappings SOAP enumerate). */
 export interface UpnpNodeStatus extends NodeStatus {
-  upnpMode: string | null;
-  desiredUpnpPorts: number[];
   upnpMappings: UpnpMappingView[];
   /** Present if the getMappings SOAP enumerate failed. */
   upnpError?: string;
