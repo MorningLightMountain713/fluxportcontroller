@@ -25,6 +25,25 @@ export interface NodeStatus {
   members: string[];
 }
 
+/** A router mapping as the node reads it back (a subset of the package's UpnpMapping). */
+export interface UpnpMappingView {
+  public: { host: string; port: number };
+  private: { host: string; port: number };
+  protocol: string;
+  description: string;
+  ttl: number;
+  enabled: boolean;
+}
+
+/** Status + the live UPnP view (mode, desired set, and the REAL router table). */
+export interface UpnpNodeStatus extends NodeStatus {
+  upnpMode: string | null;
+  desiredUpnpPorts: number[];
+  upnpMappings: UpnpMappingView[];
+  /** Present if the getMappings SOAP enumerate failed. */
+  upnpError?: string;
+}
+
 export class NodeClient {
   constructor(
     readonly container: StartedTestContainer,
@@ -60,6 +79,25 @@ export class NodeClient {
       );
     }
     return JSON.parse(res.stdout) as NodeStatus;
+  }
+
+  /**
+   * Fetch status PLUS the live UPnP view — mode, desired set, and the REAL router table
+   * (a getMappings SOAP enumerate inside the container). Slower than status() because it
+   * hits the router, so callers poll it sparingly. Times out generously for the SOAP call.
+   */
+  async upnpStatus(): Promise<UpnpNodeStatus> {
+    const script =
+      `fetch('http://127.0.0.1:${this.statusPort}/?upnp=1',{signal:AbortSignal.timeout(8000)})` +
+      `.then(r=>r.text()).then(t=>process.stdout.write(t))` +
+      `.catch(e=>{process.stderr.write(String(e&&e.message||e));process.exit(1)})`;
+    const res = await this.container.exec(["node", "--no-warnings", "-e", script]);
+    if (res.exitCode !== 0) {
+      throw new Error(
+        `upnp status fetch failed on ${this.name} (exit ${res.exitCode}): ${res.stderr || res.output}`
+      );
+    }
+    return JSON.parse(res.stdout) as UpnpNodeStatus;
   }
 
   /** Recent container logs (for diagnosing a failed convergence). */

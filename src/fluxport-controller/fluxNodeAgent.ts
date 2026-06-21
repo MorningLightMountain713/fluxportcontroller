@@ -42,6 +42,7 @@ import { Consensus, Group } from "./consensus/consensus";
 import { logController } from "./log";
 import {
   UpnpClientLike,
+  UpnpMapping,
   createDefaultUpnpClient
 } from "./upnpClient";
 import {
@@ -445,5 +446,14 @@ export class FluxNodeAgent extends EventEmitter {
   /** The UPnP coordinator's mode (LEADER_CHECK / SELF_CHECK), or null if disabled. */
   get upnpMode(): string | null {
     return this.upnpCoordinator?.currentMode ?? null;
+  }
+
+  /**
+   * Enumerate the router's current UPnP mapping table (a real SOAP read through the one
+   * serialized client). Route-through for FluxOS's `getmap` and the integration harness's
+   * ground-truth check. Throws if no client/gateway — callers handle it.
+   */
+  async getUpnpMappings(): Promise<UpnpMapping[]> {
+    return this.upnpClient.getMappings();
   }
 }

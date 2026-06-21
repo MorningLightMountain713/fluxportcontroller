@@ -59,7 +59,8 @@ function buildImage(): Promise<unknown> {
 // testcontainers Network, or a user-IPAM one when static IPs are needed).
 function nodeContainer(
   attach: (c: GenericContainer) => GenericContainer,
-  txHash: string
+  txHash: string,
+  extraEnv: Record<string, string> = {}
 ): GenericContainer {
   return attach(
     new GenericContainer(IMAGE)
@@ -69,7 +70,8 @@ function nodeContainer(
         MULTICAST_GROUP,
         PORT: String(CONSENSUS_PORT),
         STATUS_PORT: String(STATUS_PORT),
-        TX_HASH: txHash
+        TX_HASH: txHash,
+        ...extraEnv
       })
       .withLabels(LABELS)
       // Gate start on the listening-log line (a Docker-API signal). We don't map
@@ -132,6 +134,8 @@ export interface ConsensusEnv {
   injectLoss(targets: NodeClient[], lossPct: number): Promise<void>;
   /** Remove injected loss on each target (flush its INPUT chain). */
   clearLoss(targets: NodeClient[]): Promise<void>;
+  /** A node's current IP on the env network (the LAN address it self-maps to). */
+  ipOf(node: NodeClient): string;
   teardown(): Promise<void>;
 }
 
@@ -153,6 +157,8 @@ export async function createConsensusEnv(opts: {
    * membership-loss test. Needs a privileged host-network helper container.
    */
   querier?: boolean;
+  /** Extra environment variables for each node container (e.g. { UPNP_FAST: "1" }). */
+  env?: Record<string, string>;
 }): Promise<ConsensusEnv> {
   await buildImage();
   const runtime = await getContainerRuntimeClient();
@@ -253,7 +259,7 @@ export async function createConsensusEnv(opts: {
   };
 
   const startNode = async (txHash: string): Promise<NodeClient> => {
-    const c = await nodeContainer(attach, txHash).start();
+    const c = await nodeContainer(attach, txHash, opts.env).start();
     started.push(c);
     const client = new NodeClient(c, STATUS_PORT, txHash);
     nodes.push(client);
@@ -339,6 +345,7 @@ export async function createConsensusEnv(opts: {
       async clearLoss(targets: NodeClient[]): Promise<void> {
         await Promise.all(targets.map((n) => exec(n, "iptables -F INPUT")));
       },
+      ipOf,
       teardown
     };
   } catch (err) {

@@ -39,6 +39,33 @@ if (harness) {
     priority: Number.MAX_SAFE_INTEGER
   });
 }
+if (process.env.UPNP_FAST === "1") {
+  // Fast-but-PROPORTIONED upnp timing for the integration harness: same shape as the
+  // production slow timing, scaled to seconds so real mappings happen within a test
+  // window. announceInterval (50) ≪ the per-node baton interval (~|members| × 100) so
+  // the 5c health gate sees multicast advance; tokenStallMs (5000) > that interval so a
+  // normal rotation never trips a spurious SELF_CHECK.
+  options.upnpTiming = {
+    tokenRotationTarget: 100,
+    tokenRetransmitTimeout: 1000,
+    maxTokenRetransmits: 10,
+    tokenLossTimeout: 5000,
+    maxMessagesPerToken: 16,
+    announceInterval: 50,
+    joinInterval: 100,
+    joinTimeout: 1000,
+    commitTimeout: 5000
+  };
+  options.upnpTuning = {
+    rate: 1000,
+    capacity: 1000,
+    enterLaps: 3,
+    leaveLaps: 5,
+    tokenStallMs: 5000,
+    selfCheckCycleMs: 2000,
+    selfCheckWindows: 4
+  };
+}
 
 const manager = new FluxNodeAgent({ txhash, outidx }, options);
 
@@ -60,17 +87,41 @@ manager.on("portConfirmed", (port: number) => {
   }
 });
 
-// status endpoint for the verifier
-createServer((_req, res) => {
-  res.writeHead(200, { "content-type": "application/json" });
-  res.end(
-    JSON.stringify({
-      nid,
-      port: confirmedPort,
-      view: manager.viewId,
-      members: manager.members
-    })
-  );
+// status endpoint for the verifier. The plain GET (/) is the cheap convergence poll
+// (sync getters only). GET /?upnp=1 additionally does a REAL getMappings SOAP enumerate
+// against the router — kept OFF the frequent poll so it never spams miniupnpd; the §7.5
+// integration test calls it on demand for ground-truth verification.
+createServer((req, res) => {
+  const respond = (extra: Record<string, unknown>): void => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        nid,
+        port: confirmedPort,
+        view: manager.viewId,
+        members: manager.members,
+        ...extra
+      })
+    );
+  };
+  if (!req.url || !req.url.includes("upnp=1")) return respond({});
+  manager
+    .getUpnpMappings()
+    .then((upnpMappings) =>
+      respond({
+        upnpMode: manager.upnpMode,
+        desiredUpnpPorts: manager.desiredUpnpPorts,
+        upnpMappings
+      })
+    )
+    .catch((err) =>
+      respond({
+        upnpMode: manager.upnpMode,
+        desiredUpnpPorts: manager.desiredUpnpPorts,
+        upnpMappings: [],
+        upnpError: String((err && (err as Error).message) || err)
+      })
+    );
 }).listen(statusPort, () => console.log(`status endpoint on :${statusPort}`));
 
 process.on("SIGINT", () => {
