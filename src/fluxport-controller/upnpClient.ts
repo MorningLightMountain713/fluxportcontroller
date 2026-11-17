@@ -8,7 +8,7 @@
  * virtual network with no real UPnP.
  */
 
-import { Client as RealUpnpClient } from "@megachips/nat-upnp";
+import { Client as RealUpnpClient } from "@runonflux/nat-upnp";
 import { SerialQueue } from "./serialQueue";
 
 export interface UpnpInfoLike {
