@@ -11,10 +11,8 @@
 
 import assert from "assert/strict";
 import { describe, it } from "node:test";
-import { VirtualNetwork } from "@/fluxport-controller/consensus/transport";
 import { ManualClock } from "@/fluxport-controller/consensus/clock";
 import { Consensus, Group } from "@/fluxport-controller/consensus/consensus";
-import { MembershipConfig } from "@/fluxport-controller/consensus/membership";
 import {
   UpnpMapping,
   NewMapping,
@@ -23,34 +21,7 @@ import {
   UpnpInfoLike
 } from "@/fluxport-controller/upnpClient";
 import { UpnpCoordinator } from "@/fluxport-controller/upnp/upnpCoordinator";
-
-const FAST_TIMING = {
-  tokenRotationTarget: 5,
-  tokenRetransmitTimeout: 60,
-  maxTokenRetransmits: 5,
-  tokenLossTimeout: 150,
-  maxMessagesPerToken: 8,
-  announceInterval: 20,
-  joinInterval: 10,
-  joinTimeout: 40,
-  commitTimeout: 1000
-};
-// The "upnp" group config the coordinator drives. Token rotation is NOT faster than
-// the announce cadence so a healthy baton lap reliably hears peer multicast — the
-// condition the 5c health gate needs to reach K CONSECUTIVE clean laps. (In
-// production the rotation is similarly comparable to the announce interval; the raw
-// FAST_TIMING rotation of 5ms vs announce 20ms is finer than any real cadence and
-// would starve a higher-traffic node of per-lap multicast.) The timeout hierarchy
-// (rotation ≪ retransmit < loss) is preserved.
-const cfg: MembershipConfig = {
-  ...FAST_TIMING,
-  tokenRotationTarget: 30,
-  tokenRetransmitTimeout: 120,
-  tokenLossTimeout: 300
-};
-
-/** Let the async repair's microtasks run after advancing the clock (deterministic). */
-const settle = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
+import { makeCoordinator, makeWorld, settle } from "./coordinatorHarness";
 
 /**
  * A fake serialized UPnP client: records getMapping/createMapping calls and returns
@@ -72,9 +43,6 @@ class FakeUpnpClient implements UpnpClientLike {
    *  to model "this specific port is now gone". */
   byPort = new Map<number, UpnpMapping | null>();
   failCreate = false;
-  /** When set, ONLY the first createMapping rejects with this message (a router that
-   *  rejects a finite lease answers the first AddPortMapping then accepts ttl 0). */
-  failFirstCreateWith: string | null = null;
   /** When set, a successful createMapping reflects into `byPort` (keyed by the created
    *  port) like a real router, so the next read-before-write sees its own write and
    *  skips — and OTHER ports are unaffected. */
@@ -128,10 +96,6 @@ class FakeUpnpClient implements UpnpClientLike {
     this.createCalls.push(m);
     if (this.failCreate) throw new Error("create failed");
     if (this.failCreatePorts.has(m.public)) throw new Error(`create failed for ${m.public}`);
-    // Reject only the FIRST create (the finite-lease attempt); later creates succeed.
-    if (this.failFirstCreateWith != null && this.createCalls.length === 1) {
-      throw new Error(this.failFirstCreateWith);
-    }
     if (this.reflectCreates) {
       this.byPort.set(m.public, {
         public: { host: "0.0.0.0", port: m.public },
@@ -151,18 +115,6 @@ class FakeUpnpClient implements UpnpClientLike {
   }
 }
 
-function makeWorld() {
-  const net = new VirtualNetwork();
-  const clock = new ManualClock();
-  const makeNode = (address: string): Consensus =>
-    new Consensus(net.register(address), clock, {
-      localAddress: address,
-      resolveLocalAddress: async () => address,
-      createTransport: (addr) => net.register(addr)
-    });
-  return { net, clock, makeNode };
-}
-
 function healthyMapping(port: number, host: string): UpnpMapping {
   return {
     public: { host: "0.0.0.0", port },
@@ -172,66 +124,6 @@ function healthyMapping(port: number, host: string): UpnpMapping {
     description: "Flux",
     ttl: 14400
   };
-}
-
-/**
- * Build a coordinator over a freshly joined "upnp" group on the given node and
- * `start()` it (so the 5c mode machine runs). Defaults are tuned for determinism
- * under ManualClock: a SHORT self-check cycle with ONE window (slot 0) so a lone /
- * not-yet-LEADER_CHECK node repairs on its slot during the tests' small clock
- * advances, and a LONG token-stall window so the no-baton watchdog never fires
- * mid-test (the demotion tests set it explicitly). `start: false` opts out of the
- * lifecycle for the tests that assert pre-start behaviour.
- */
-function makeCoordinator(
-  c: Consensus,
-  clock: ManualClock,
-  opts: {
-    self: string;
-    localAddress: string;
-    client: UpnpClientLike;
-    rate?: number;
-    capacity?: number;
-    floorRate?: number;
-    backoffFactor?: number;
-    recoverFactor?: number;
-    freshLaps?: number;
-    enterLaps?: number;
-    leaveLaps?: number;
-    tokenStallMs?: number;
-    selfCheckCycleMs?: number;
-    selfCheckWindows?: number;
-    orphanConfirmPasses?: number;
-    start?: boolean;
-    onMappingFailed?: (port: number, reason: string) => void;
-  }
-): { coordinator: UpnpCoordinator; group: Group } {
-  const group = c.join("upnp", {
-    config: cfg,
-    hooks: { onDeliver: () => {}, onViewChange: () => {} }
-  });
-  const coordinator = new UpnpCoordinator({
-    self: opts.self,
-    group,
-    client: opts.client,
-    clock,
-    localAddress: opts.localAddress,
-    rate: opts.rate ?? 1000, // ample by default; specific tests pin it down
-    capacity: opts.capacity ?? 1000,
-    floorRate: opts.floorRate,
-    backoffFactor: opts.backoffFactor,
-    recoverFactor: opts.recoverFactor,
-    freshLaps: opts.freshLaps,
-    enterLaps: opts.enterLaps,
-    leaveLaps: opts.leaveLaps,
-    tokenStallMs: opts.tokenStallMs ?? 1_000_000, // effectively off unless overridden
-    selfCheckCycleMs: opts.selfCheckCycleMs ?? 10,
-    selfCheckWindows: opts.selfCheckWindows ?? 1,
-    orphanConfirmPasses: opts.orphanConfirmPasses,
-    hooks: { onMappingFailed: opts.onMappingFailed }
-  });
-  if (opts.start !== false) coordinator.start();
-  return { coordinator, group };
 }
 
 describe("UpnpCoordinator", () => {
@@ -407,8 +299,7 @@ describe("UpnpCoordinator", () => {
 /**
  * UpnpCoordinator (desired port SET) — a node maintains its WHOLE desired set, not a
  * single port. Each port is read-before-written independently, the RateLimiter budget
- * is spent per WRITE across the set, dropping a port stops maintaining it, and the
- * per-router permanent-lease latch is shared across every port. Driven as lone
+ * is spent per WRITE across the set, and dropping a port stops maintaining it. Driven as lone
  * SELF_CHECK nodes (the slot timer paces the repairs) — the per-port leader-check skip
  * lives with the other 5b leader tests below.
  */
@@ -542,31 +433,6 @@ describe("UpnpCoordinator (desired port SET)", () => {
       "nothing was re-mapped — neither the healthy 16111 nor the pruned 16222"
     );
     assert.deepEqual(coordinator.pendingUnmaps, [], "the orphan queue drained");
-  });
-
-  it("shares the permanent-lease latch across every port (one 725 covers the whole set)", async () => {
-    const w = makeWorld();
-    const node = w.makeNode("10.0.0.11");
-    const client = new FakeUpnpClient(); // both ports missing
-    // The FIRST create (16111, finite) is rejected 725; the latch then makes 16222 go
-    // straight to ttl 0 — a 725 is a per-ROUTER property, not per-port.
-    client.failFirstCreateWith = "soap:Client 725 OnlyPermanentLeasesSupported";
-    client.reflectCreates = true;
-    const { coordinator } = makeCoordinator(node, w.clock, {
-      self: "nidA",
-      localAddress: "10.0.0.11",
-      client
-    });
-    coordinator.setDesiredPortSet([16111, 16222]); // 16111 is iterated first (insertion order)
-
-    await node.start();
-    await runLaps(w.clock);
-
-    assert.equal(coordinator.leasePermanent, true, "the 725 latched permanent for the node");
-    const for16111 = client.createCalls.filter((c) => c.public === 16111).map((c) => c.ttl);
-    const for16222 = client.createCalls.filter((c) => c.public === 16222).map((c) => c.ttl);
-    assert.deepEqual(for16111, [14400, 0], "16111: finite attempt, then the permanent retry");
-    assert.deepEqual(for16222, [0], "16222: created permanent directly — no second 725");
   });
 
   it("shares a constrained rate budget FAIRLY — a failing front port does not starve the rest", async () => {
@@ -1249,135 +1115,6 @@ describe("UpnpCoordinator (5c mode machine)", () => {
     assert.equal(coordinator.currentMode, "LEADER_CHECK", "one deaf lap does not flip the mode");
     cleanLap(group);
     assert.equal(coordinator.currentMode, "LEADER_CHECK", "and a clean lap keeps it");
-  });
-});
-
-/**
- * UpnpCoordinator (5d lease fallback) — the OnlyPermanentLeasesSupported escape.
- *
- * Most routers honour the finite lease we request (ttl 14400) so a crashed node's
- * mapping self-expires. Some IGDs (e.g. MikroTik) REJECT a finite lease with SOAP
- * fault 725 and require a permanent one; the coordinator must detect that, fall back
- * to a permanent mapping (ttl 0), and stay permanent for the rest of its life on that
- * router. A lone node (its own representative, SELF_CHECK) drives the writes on its
- * short self-check slot — the same single-node pattern the 5a/5c lone tests use.
- */
-describe("UpnpCoordinator (5d lease fallback)", () => {
-  it("requests a finite lease by default and stays non-permanent", async () => {
-    const w = makeWorld();
-    const node = w.makeNode("10.0.0.11");
-    const client = new FakeUpnpClient(); // getMapping -> null (missing)
-    client.reflectCreates = true; // mapped once, then steady
-    const { coordinator } = makeCoordinator(node, w.clock, {
-      self: "nidA",
-      localAddress: "10.0.0.11",
-      client
-    });
-    coordinator.setDesiredPortSet([16127]);
-
-    await node.start();
-    for (let i = 0; i < 6; i++) {
-      w.clock.advance(50);
-      await settle();
-    }
-
-    assert.equal(client.createCalls.length, 1, "mapped the missing port once");
-    assert.equal(client.createCalls[0].ttl, 14400, "default create uses the finite ttl");
-    assert.equal(coordinator.leasePermanent, false, "no 725 seen -> stays non-permanent");
-  });
-
-  it("falls back to a permanent lease (ttl 0) on a 725 OnlyPermanentLeasesSupported fault", async () => {
-    const w = makeWorld();
-    const node = w.makeNode("10.0.0.11");
-    const client = new FakeUpnpClient(); // getMapping -> null (missing)
-    // The router rejects the FIRST (finite) AddPortMapping with 725, then accepts.
-    client.failFirstCreateWith = "soap:Client 725 OnlyPermanentLeasesSupported";
-    client.reflectCreates = true;
-    const failed: Array<{ port: number; reason: string }> = [];
-    const { coordinator } = makeCoordinator(node, w.clock, {
-      self: "nidA",
-      localAddress: "10.0.0.11",
-      client,
-      onMappingFailed: (port, reason) => failed.push({ port, reason })
-    });
-    coordinator.setDesiredPortSet([16127]);
-
-    await node.start();
-    for (let i = 0; i < 6; i++) {
-      w.clock.advance(50);
-      await settle();
-    }
-
-    assert.equal(client.createCalls.length, 2, "the finite attempt then the permanent retry");
-    assert.equal(client.createCalls[0].ttl, 14400, "first attempt requested the finite lease");
-    assert.equal(client.createCalls[1].ttl, 0, "retried the SAME write with a permanent lease");
-    assert.deepEqual(client.createCalls[1].private, { host: "10.0.0.11", port: 16127 });
-    assert.equal(coordinator.leasePermanent, true, "latched permanent after the 725");
-    assert.equal(failed.length, 0, "the retry succeeded, so no failure surfaced");
-  });
-
-  it("is sticky: after the fallback a later needed write uses ttl 0 with no second 725", async () => {
-    const w = makeWorld();
-    const node = w.makeNode("10.0.0.11");
-    const client = new FakeUpnpClient();
-    client.failFirstCreateWith = "725"; // only the first create is rejected
-    client.reflectCreates = true;
-    const { coordinator } = makeCoordinator(node, w.clock, {
-      self: "nidA",
-      localAddress: "10.0.0.11",
-      client
-    });
-    coordinator.setDesiredPortSet([16127]);
-
-    await node.start();
-    for (let i = 0; i < 4; i++) {
-      w.clock.advance(50);
-      await settle();
-    }
-    assert.equal(coordinator.leasePermanent, true, "latched permanent on the first 725");
-    const writesAfterFallback = client.createCalls.length;
-
-    // Force a later write by dropping this port's reflected mapping: it must go
-    // straight to ttl 0 (no second 725 needed) and stay permanent.
-    client.byPort.set(16127, null);
-    for (let i = 0; i < 4; i++) {
-      w.clock.advance(50);
-      await settle();
-    }
-
-    assert.ok(client.createCalls.length > writesAfterFallback, "a later write happened");
-    for (const c of client.createCalls.slice(writesAfterFallback)) {
-      assert.equal(c.ttl, 0, "every post-fallback write uses the permanent lease directly");
-    }
-    assert.equal(coordinator.leasePermanent, true, "permanence is sticky");
-  });
-
-  it("does not flip to permanent on an unrelated create error", async () => {
-    const w = makeWorld();
-    const node = w.makeNode("10.0.0.11");
-    const client = new FakeUpnpClient();
-    client.failCreate = true; // a generic, non-725 failure on every create
-    const failed: Array<{ port: number; reason: string }> = [];
-    const { coordinator } = makeCoordinator(node, w.clock, {
-      self: "nidA",
-      localAddress: "10.0.0.11",
-      client,
-      onMappingFailed: (port, reason) => failed.push({ port, reason })
-    });
-    coordinator.setDesiredPortSet([16127]);
-
-    await node.start();
-    for (let i = 0; i < 4; i++) {
-      w.clock.advance(50);
-      await settle();
-    }
-
-    assert.ok(failed.length >= 1, "the unrelated failure surfaced via onMappingFailed");
-    assert.match(failed[0].reason, /create failed/);
-    assert.equal(coordinator.leasePermanent, false, "a non-725 error never latches permanent");
-    for (const c of client.createCalls) {
-      assert.equal(c.ttl, 14400, "and no create silently used a permanent lease");
-    }
   });
 });
 

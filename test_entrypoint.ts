@@ -67,6 +67,10 @@ if (harness) {
   // Real serialized client, wrapped to count writes for the steady-state assertion.
   options.upnpClient = countingClient(createDefaultUpnpClient());
 }
+// A harness node `node-N` tests lease renewal on 40000 + N: distinct per node, as
+// FluxOS's api port + 3 is.
+const nodeNumber = /^node-(\d+)$/.exec(txhash);
+const leaseTestPort = harness && nodeNumber ? 40000 + Number(nodeNumber[1]) : undefined;
 if (process.env.UPNP_FAST === "1") {
   // Fast-but-PROPORTIONED upnp timing for the integration harness: same shape as the
   // production slow timing, scaled to seconds so real mappings happen within a test
@@ -91,8 +95,11 @@ if (process.env.UPNP_FAST === "1") {
     leaveLaps: 5,
     tokenStallMs: 5000,
     selfCheckCycleMs: 2000,
-    selfCheckWindows: 4
+    selfCheckWindows: 4,
+    leaseTestPort
   };
+} else if (leaseTestPort != null) {
+  options.upnpTuning = { leaseTestPort };
 }
 
 const manager = new FluxNodeAgent({ txhash, outidx }, options);

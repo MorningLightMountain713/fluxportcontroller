@@ -137,6 +137,10 @@ export interface UpnpCoordinatorTuning {
   leaveLaps?: number;
   orphanConfirmPasses?: number;
   orphanMaxDeleteAttempts?: number;
+  /** A port of this node's own that no app uses (FluxOS: api port + 3), on which the
+   *  coordinator tests whether the router renews leases. Without it mappings stay
+   *  permanent. Must differ from every other node's behind the same router. */
+  leaseTestPort?: number;
 }
 
 export const DEFAULT_UPNP_TUNING: Required<
@@ -413,6 +417,7 @@ export class FluxNodeAgent extends EventEmitter {
       leaveLaps: t.leaveLaps,
       orphanConfirmPasses: t.orphanConfirmPasses,
       orphanMaxDeleteAttempts: t.orphanMaxDeleteAttempts,
+      leaseTestPort: t.leaseTestPort,
       hooks: {
         onMappingFailed: (port, reason) => this.emit("mappingFailed", port, reason)
       }

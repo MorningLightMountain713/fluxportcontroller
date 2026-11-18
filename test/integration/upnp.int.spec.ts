@@ -92,11 +92,18 @@ describe("UPnP coordination integration (real miniupnpd mappings)", () => {
       }
       assert.ok(ok, `every node's assigned port mapped to its own IP within ${MAP_TIMEOUT_MS}ms`);
 
-      // self-map invariant: every Flux mapping is exactly its owner's OWN assigned port.
+      // self-map invariant: every Flux mapping is exactly its owner's OWN assigned port, or
+      // its own lease-test port (40000 + N for node-N) while a lease test runs.
       const ipToNid = new Map([...ipByNid].map(([nid, ip]) => [ip, nid]));
+      const leaseTestPortOf = (nid: string): number =>
+        40000 + Number(/^node-(\d+):/.exec(nid)![1]);
       for (const m of table.filter(isFlux)) {
         const owner = ipToNid.get(m.private.host);
         assert.ok(owner, `Flux mapping ${m.public.port} -> ${m.private.host} has no known owner`);
+        if (m.description === "Flux_Lease_Test") {
+          assert.equal(m.public.port, leaseTestPortOf(owner), `node ${owner} tested on a foreign port`);
+          continue;
+        }
         assert.equal(m.public.port, portByNid.get(owner), `node ${owner} mapped a foreign port`);
       }
 
@@ -111,9 +118,21 @@ describe("UPnP coordination integration (real miniupnpd mappings)", () => {
 
   it(
     "map rarely, check often: steady state holds at ZERO further router writes",
-    { timeout: 90_000 },
+    { timeout: 210_000 },
     async () => {
-      // Wait until every node's write count has stopped climbing (initial maps done).
+      // The end state first: every lease test done (its mapping removed) and every
+      // assigned port converted to a lease, so no write is still due.
+      const leasedAndTested = (table: UpnpMappingView[]): boolean =>
+        !table.some((m) => m.description === "Flux_Lease_Test") &&
+        [...portByNid].every(([nid, port]) =>
+          table.some(
+            (m) => m.public.port === port && m.private.host === ipByNid.get(nid) && m.ttl > 0
+          )
+        );
+      const leased = await waitForTable(env.nodes[0], leasedAndTested, 120_000);
+      assert.ok(leased.ok, `ports leased and lease tests done; table=${JSON.stringify(leased.table)}`);
+
+      // Wait until every node's write count has stopped climbing.
       const writesOf = async (): Promise<number[]> =>
         Promise.all(env.nodes.map((n) => n.status().then((s) => s.upnpWrites ?? 0)));
       let prev = await writesOf();
@@ -127,7 +146,7 @@ describe("UPnP coordination integration (real miniupnpd mappings)", () => {
       }
 
       // Now the steady-state assertion: across several more scan cycles, NO node writes
-      // again — a healthy long-lease mapping is re-read, never re-written.
+      // again — a healthy leased mapping is re-read, never re-written.
       const before = await writesOf();
       await sleep(15_000);
       const afterWrites = await writesOf();
@@ -142,7 +161,7 @@ describe("UPnP coordination integration (real miniupnpd mappings)", () => {
   // MUST be last in this describe: it kills a node, shrinking env.nodes.
   it(
     "a departed node leaves no mapping obligation on the survivors (self-map-only)",
-    { timeout: CONVERGE_TIMEOUT_MS + 30_000 },
+    { timeout: CONVERGE_TIMEOUT_MS + 120_000 },
     async () => {
       const victim = env.nodes[env.nodes.length - 1];
       const victimNid = victim.expectedNid!;
@@ -157,14 +176,19 @@ describe("UPnP coordination integration (real miniupnpd mappings)", () => {
       // Each survivor still holds its OWN port; no survivor ever maps the victim's port
       // (strict self-map-only — nobody maps on a departed node's behalf).
       const survivorIps = new Set(survivors.map((n) => env.ipOf(n)));
-      const stillMine = (table: UpnpMappingView[]): boolean =>
+      // Held, and leased: miniupnpd renews a lease on a re-add, so once a lease test
+      // has answered (70 s) every survivor's mapping carries one.
+      const stillMineLeased = (table: UpnpMappingView[]): boolean =>
         survivors.every((n) =>
           table.some(
-            (m) => m.public.port === portByNid.get(n.expectedNid!) && m.private.host === env.ipOf(n)
+            (m) =>
+              m.public.port === portByNid.get(n.expectedNid!) &&
+              m.private.host === env.ipOf(n) &&
+              m.ttl > 0
           )
         );
-      const { ok, table } = await waitForTable(survivors[0], stillMine, 30_000);
-      assert.ok(ok, `survivors keep their own mappings; table=${JSON.stringify(table)}`);
+      const { ok, table } = await waitForTable(survivors[0], stillMineLeased, 120_000);
+      assert.ok(ok, `survivors keep their own leased mappings; table=${JSON.stringify(table)}`);
 
       for (const m of table.filter(isFlux)) {
         if (m.public.port === victimPort && !survivorIps.has(m.private.host)) continue; // victim's lingering own mapping

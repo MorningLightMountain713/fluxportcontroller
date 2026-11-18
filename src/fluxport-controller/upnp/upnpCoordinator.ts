@@ -66,6 +66,22 @@
  * repairs are served first so a tight budget keeps a wanted port up before removing a
  * dead one. A confirm delay plus a "desired set has been fed at least once" latch guard
  * against deleting a live mapping before FluxOS has declared what it wants.
+ *
+ * READING A PORT — a lookup (GetSpecificPortMappingEntry) is trusted only when it answers
+ * "no such entry" or an entry for that same internal port. Some routers fault instead
+ * (606, 501), answer with another entry, or answer an empty success; the first such
+ * answer marks this router's lookups unreliable, and from then on this node reads its
+ * ports from a walk of the table (once per pass; the leader reuses its own scan).
+ *
+ * LEASES — a mapping is permanent (ttl 0) unless this router is known to renew a lease
+ * when the mapping is added again. Many do not: the re-add is accepted and the lease runs
+ * out regardless, and some of those also answer 714 to a lookup of a leased entry they
+ * hold. The lease test answers it once per router: on `leaseTestPort` it maps with a 60 s
+ * lease, adds the same mapping at +30 s, and looks it up at +70 s — renewed means held,
+ * pointing at us, with a lease of at most 60 s. Any other outcome means permanent. The
+ * leader runs the test and carries the answer in every UPNP_OBSERVED; a node in
+ * SELF_CHECK runs it itself. A leased write the router refuses is made permanent and ends
+ * leasing on this node.
  */
 
 import { Group } from "../consensus/consensus";
@@ -81,6 +97,26 @@ interface ObservedMsg {
   type: typeof OBSERVED;
   by: string; // the enumerating leader, so a node ignores its own broadcast
   mappings: UpnpMapping[];
+  /** The lease test's answer for this router; null until it has one. */
+  leaseRenews: boolean | null;
+}
+
+/** The lease the lease test asks for, and when it adds again and reads back. */
+const LEASE_TEST_SECONDS = 60;
+const LEASE_TEST_READD_MS = 30_000;
+const LEASE_TEST_READ_MS = 70_000;
+/** Wait before trying again a lease test that could not finish (no rate token, no answer). */
+const LEASE_TEST_RETRY_MS = 600_000;
+
+/** One repair or cleanup pass: the router table, once walked, is reused by every port. */
+interface Pass {
+  table: UpnpMapping[] | null;
+}
+
+/** A SOAP fault the router answered with (nat-upnp's UpnpError carries a numeric code),
+ *  as opposed to a request that got no answer. */
+function isRouterFault(err: unknown): boolean {
+  return typeof (err as { code?: unknown } | null)?.code === "number";
 }
 
 /** Laps (this node's own baton turns) an OBSERVED stays usable before it is stale. */
@@ -169,10 +205,13 @@ export interface UpnpCoordinatorDeps {
   recoverFactor?: number;
   protocol?: string;
   description?: string;
-  /** Requested lease seconds for createMapping. */
+  /** Lease seconds for a mapping, once the lease test has shown this router renews
+   *  leases; until then, and on routers that do not, mappings are permanent. */
   ttl?: number;
   /** Re-map when an existing mapping's remaining ttl drops below this. */
   lowTtlThreshold?: number;
+  /** A port of this node's own that no app uses, free on the router, for the lease test. */
+  leaseTestPort?: number;
   /** Baton turns a leader's OBSERVED stays trusted before a node re-checks itself. */
   freshLaps?: number;
   /** Consecutive clean laps to enter LEADER_CHECK (K). */
@@ -208,6 +247,7 @@ export class UpnpCoordinator {
   private readonly description: string;
   private readonly ttl: number;
   private readonly lowTtlThreshold: number;
+  private readonly leaseTestPort: number | null;
   private readonly freshLaps: number;
   private readonly enterLaps: number;
   private readonly leaveLaps: number;
@@ -241,9 +281,14 @@ export class UpnpCoordinator {
   // re-map of an app port keeps its app name instead of reverting to the default "Flux".
   // Pruned when a port leaves the desired set.
   private portDescriptions = new Map<number, string>();
-  // Once this router has rejected a finite lease (SOAP 725) it never accepts one, so
-  // we latch permanent and request ttl 0 for the rest of this node's life on it.
-  private permanentLease = false;
+  // Whether this router renews a lease on a re-add: null until the lease test (this
+  // node's, or the leader's via UPNP_OBSERVED) answers. Mappings are leased only when true.
+  private leaseRenewal: boolean | null = null;
+  private leaseTestRunning = false;
+  private leaseTestNotBefore = 0;
+  private leaseTestTimer: TimerId | null = null;
+  // Set by the first lookup answer that cannot be trusted; ports are then read from a walk.
+  private lookupsUnreliable = false;
   // A repair runs async off the baton; guard so only one is in flight at a time.
   private repairing = false;
   // Rotating start offset for the per-pass set walk, so a constrained rate budget is
@@ -281,6 +326,7 @@ export class UpnpCoordinator {
     this.description = deps.description ?? "Flux";
     this.ttl = deps.ttl ?? 14400;
     this.lowTtlThreshold = deps.lowTtlThreshold ?? this.ttl / 4;
+    this.leaseTestPort = deps.leaseTestPort ?? null;
     this.freshLaps = deps.freshLaps ?? DEFAULT_FRESH_LAPS;
     this.enterLaps = deps.enterLaps ?? DEFAULT_ENTER_LAPS;
     this.leaveLaps = deps.leaveLaps ?? DEFAULT_LEAVE_LAPS;
@@ -350,6 +396,12 @@ export class UpnpCoordinator {
       this.clock.clearTimer(this.slotTimer);
       this.slotTimer = null;
     }
+    if (this.leaseTestTimer != null) {
+      // An interrupted lease test leaves its 60 s mapping to lapse; a later start retries.
+      this.clock.clearTimer(this.leaseTestTimer);
+      this.leaseTestTimer = null;
+      this.leaseTestRunning = false;
+    }
   }
 
   /**
@@ -398,7 +450,7 @@ export class UpnpCoordinator {
     this.desiredPorts.add(port);
     this.orphanCandidates.delete(port); // desired now — never an orphan
     if (description != null) this.portDescriptions.set(port, description);
-    await this.repairPort(port);
+    await this.repairPort(port, { table: null });
   }
 
   /** The ports this node is maintaining, ascending (test seam / observability). */
@@ -417,9 +469,9 @@ export class UpnpCoordinator {
   get selfCheckSlot(): number {
     return this.slot;
   }
-  /** True once the router rejected a finite lease and we latched permanent (test seam). */
-  get leasePermanent(): boolean {
-    return this.permanentLease;
+  /** Whether this router renews a lease on a re-add; null until known (test seam). */
+  get leaseRenews(): boolean | null {
+    return this.leaseRenewal;
   }
   /** The group's representative; delegates to the group. */
   get representative(): string | null {
@@ -457,6 +509,9 @@ export class UpnpCoordinator {
     if (msg.by === this.self) return;
     this.lastObserved = msg.mappings;
     this.lapsSinceObserved = 0;
+    // The lease answer is the router's, whoever measured it; a refusal this node saw
+    // itself (false) is never overridden.
+    if (this.leaseRenewal === null && msg.leaseRenews != null) this.leaseRenewal = msg.leaseRenews;
     // The leader's whole-table view also reveals OUR leftovers — a Flux mapping pointing
     // at us on a port we no longer desire (e.g. one from before a restart) — which we
     // queue to prune on our turn. (The leader ignores its own broadcast here, but feeds
@@ -482,6 +537,7 @@ export class UpnpCoordinator {
         m.protocol.toLowerCase() === this.protocol.toLowerCase() &&
         FLUX_DESCRIPTION.test(m.description) &&
         !this.desiredPorts.has(m.public.port) &&
+        m.public.port !== this.leaseTestPort &&
         !this.orphanCandidates.has(m.public.port)
       ) {
         this.orphanCandidates.set(m.public.port, { confirms: 0, failures: 0 });
@@ -517,7 +573,7 @@ export class UpnpCoordinator {
     // The read-reduction win is decided PER PORT inside checkAndRepair: a port a fresh
     // leader enumerate already shows healthy costs ZERO router I/O this turn; the rest
     // fall back to the read-before-write floor. (checkAndRepair guards re-entrancy.)
-    void this.checkAndRepair(true);
+    void this.checkAndRepair(true, { table: null });
   }
 
   /**
@@ -600,14 +656,14 @@ export class UpnpCoordinator {
    *  leftover discovery needs the leader's whole-table OBSERVED (leader-check). */
   private onSlot(): void {
     if (this.mode !== "SELF_CHECK") return;
+    this.maybeStartLeaseTest();
     if (this.desiredPorts.size === 0 && this.orphanCandidates.size === 0) return;
-    void this.checkAndRepair(false);
+    void this.checkAndRepair(false, { table: null });
   }
 
   /**
-   * Is the last leader broadcast still fresh AND does it show THIS node's port
-   * already healthy — present, on OUR protocol, pointing at us, with a non-expiring
-   * lease? Only then is skipping the targeted read safe; otherwise the 5a floor
+   * Is the last leader broadcast still fresh AND does it show THIS node's port needing
+   * no write? Only then is skipping the targeted read safe; otherwise the 5a floor
    * re-checks. The protocol match is load-bearing: the read this skips is itself
    * protocol-scoped (`getMapping({ protocol })`), so a same-port entry on a DIFFERENT
    * protocol (e.g. a neighbour's UDP mapping on our TCP port number) must NOT count as
@@ -617,13 +673,50 @@ export class UpnpCoordinator {
     if (this.lastObserved == null || this.lapsSinceObserved > this.freshLaps) {
       return false;
     }
-    return this.lastObserved.some(
-      (m) =>
-        m.public.port === port &&
-        m.protocol.toLowerCase() === this.protocol.toLowerCase() &&
-        m.private.host === this.localAddress &&
-        (m.ttl === 0 || m.ttl >= this.lowTtlThreshold)
+    const entry = this.entryIn(this.lastObserved, port);
+    return entry != null && !this.needsWrite(entry, port);
+  }
+
+  /** This node's protocol's entry for `port` in a whole-table view, or null. */
+  private entryIn(table: UpnpMapping[], port: number): UpnpMapping | null {
+    return (
+      table.find(
+        (m) =>
+          m.public.port === port && m.protocol.toLowerCase() === this.protocol.toLowerCase()
+      ) ?? null
     );
+  }
+
+  /**
+   * Does the router's entry for one of OUR ports need writing? Missing; pointing at
+   * another host or another internal port; a lease running low; or permanent while this
+   * router is known to renew leases (the write converts it to a lease).
+   */
+  private needsWrite(entry: UpnpMapping | null, port: number): boolean {
+    if (entry == null) return true;
+    if (entry.private.host !== this.localAddress || entry.private.port !== port) return true;
+    if (entry.ttl > 0 && entry.ttl < this.lowTtlThreshold) return true;
+    return this.leaseRenewal === true && entry.ttl === 0;
+  }
+
+  /**
+   * The router's entry for one of OUR ports. A lookup is used while this router's lookups
+   * are trusted; an answer that cannot be about this port (a fault other than "no such
+   * entry", or an entry for another internal port) marks them unreliable, and the port is
+   * read from the pass's walk of the table instead — made once per pass and shared.
+   */
+  private async readOwn(port: number, pass: Pass): Promise<UpnpMapping | null> {
+    if (!this.lookupsUnreliable) {
+      try {
+        const entry = await this.client.getMapping({ public: port, protocol: this.protocol });
+        if (entry == null || entry.private.port === port) return entry;
+      } catch (err) {
+        if (!isRouterFault(err)) throw err;
+      }
+      this.lookupsUnreliable = true;
+    }
+    pass.table ??= await this.client.getMappings();
+    return this.entryIn(pass.table, port);
   }
 
   /**
@@ -643,13 +736,17 @@ export class UpnpCoordinator {
    */
   private async scanAndBroadcast(): Promise<void> {
     this.scanning = true;
+    const pass: Pass = { table: null };
     try {
+      this.maybeStartLeaseTest();
       try {
         const mappings = await this.client.getMappings();
+        pass.table = mappings;
         this.group.broadcast({
           type: OBSERVED,
           by: this.self,
-          mappings
+          mappings,
+          leaseRenews: this.leaseRenewal
         } satisfies ObservedMsg);
         // The leader ignores its OWN broadcast (onObserved), so feed its leftovers from
         // the enumerate it just did — its own orphans get pruned like any other node's.
@@ -662,8 +759,9 @@ export class UpnpCoordinator {
         this.backoffRate(); // the struggling router also stalls reads: back the group off
       }
       // The leader keeps its OWN ports via the shared read-before-write path. It does
-      // NOT trust OBSERVED (it ignores its own broadcast), so it reads each own port.
-      await this.checkAndRepair(false);
+      // NOT trust OBSERVED (it ignores its own broadcast), so it reads each own port —
+      // from the scan it just made, where this router's lookups are unreliable.
+      await this.checkAndRepair(false, pass);
     } finally {
       this.scanning = false;
     }
@@ -701,9 +799,10 @@ export class UpnpCoordinator {
    * `trustObserved` is the 5b read-reduction: a non-leader passes true so a port a
    * fresh leader broadcast already shows healthy is skipped with ZERO router I/O; the
    * leader's own scan and the self-check slot pass false (they trust no broadcast and
-   * read every port first-hand).
+   * read every port first-hand). `pass` carries the router table across the ports once
+   * one has been read (the leader's scan, or a walk made because lookups are unreliable).
    */
-  private async checkAndRepair(trustObserved: boolean): Promise<void> {
+  private async checkAndRepair(trustObserved: boolean, pass: Pass): Promise<void> {
     if (this.repairing) return; // a prior pass is still working through the set
     if (this.desiredPorts.size === 0 && this.orphanCandidates.size === 0) return;
     this.repairing = true;
@@ -720,14 +819,14 @@ export class UpnpCoordinator {
         for (let i = 0; i < ports.length; i++) {
           const port = ports[(start + i) % ports.length];
           if (trustObserved && this.observedShowsHealthy(port)) continue;
-          await this.repairPort(port);
+          await this.repairPort(port, pass);
         }
       }
       // Then prune our own orphans, paced by the SAME budget. Repairs run first, so a
       // tight budget always keeps a wanted port up before spending a token to remove a
       // dead one — the asymmetry that matters (a missed orphan just lingers; a wrongly
       // dropped repair breaks a live port).
-      await this.cleanupOrphans();
+      await this.cleanupOrphans(pass);
     } finally {
       this.repairing = false;
     }
@@ -741,7 +840,7 @@ export class UpnpCoordinator {
    * a tight budget fairly — the same guard the repair cursor gives writes — so a
    * persistently-failing unmap can never starve the rest of the queue.
    */
-  private async cleanupOrphans(): Promise<void> {
+  private async cleanupOrphans(pass: Pass): Promise<void> {
     if (this.orphanCandidates.size === 0) return;
     // Snapshot the keys so deletes / re-adds during the awaited pass do not perturb this
     // walk; the live map is the source of truth for each port's current state below.
@@ -760,7 +859,7 @@ export class UpnpCoordinator {
         st.confirms += 1; // serve the confirm grace first
         continue;
       }
-      await this.unmapPort(port);
+      await this.unmapPort(port, pass);
     }
   }
 
@@ -773,12 +872,9 @@ export class UpnpCoordinator {
    * escapes into the token path; the candidate is kept (the cursor rotates so it cannot
    * starve the rest) and the benign failure is surfaced via onMappingFailed.
    */
-  private async unmapPort(port: number): Promise<void> {
+  private async unmapPort(port: number, pass: Pass): Promise<void> {
     try {
-      const existing = await this.client.getMapping({
-        public: port,
-        protocol: this.protocol
-      });
+      const existing = await this.readOwn(port, pass);
       // A re-desire can have landed DURING the awaited read — setDesiredPortSet runs on the
       // same loop, concurrent with our SOAP round-trip, and cancels the candidacy. Re-check
       // at the LAST point before the committed delete (no further await before removeMapping)
@@ -813,68 +909,128 @@ export class UpnpCoordinator {
   }
 
   /**
-   * Read-before-write a SINGLE port: read the router's current mapping and write only
-   * if it is missing, points at the wrong host, or its lease is low; the write spends
-   * one rate token (else skip this port this pass and let a later turn retry). Wholly
-   * self-contained — never throws — so each port is isolated from the others and from
-   * the token path. Self-map-only: the create is always our own port -> localAddress.
+   * Read-before-write a SINGLE port: read the router's current entry and write only when
+   * `needsWrite` says so; the write spends one rate token (else skip this port this pass
+   * and let a later turn retry). Wholly self-contained — never throws — so each port is
+   * isolated from the others and from the token path. Self-map-only: the create is always
+   * our own port -> localAddress.
    */
-  private async repairPort(port: number): Promise<void> {
+  private async repairPort(port: number, pass: Pass): Promise<void> {
     try {
-      const existing = await this.client.getMapping({
-        public: port,
-        protocol: this.protocol
-      });
-
-      // The steady-state path: a present mapping that points at us with a healthy
-      // lease needs no write, so the common case costs one read and zero writes.
-      const missing = existing == null;
-      const wrongHost = existing != null && existing.private.host !== this.localAddress;
-      const lowTtl =
-        existing != null && existing.ttl > 0 && existing.ttl < this.lowTtlThreshold;
-      if (!missing && !wrongHost && !lowTtl) return;
+      const existing = await this.readOwn(port, pass);
+      // The steady-state path: an entry that needs nothing costs one read, zero writes.
+      if (!this.needsWrite(existing, port)) return;
 
       // A write is needed: spend a token, or skip this port and let a later baton
       // retry (the rate limiter, not us, decides the cadence of router writes).
       if (!this.rl.acquire()) return;
 
+      const lease = this.leaseRenewal === true ? this.ttl : 0;
       const description = this.portDescriptions.get(port) ?? this.description;
+      const write = (ttl: number): Promise<void> =>
+        this.client.createMapping({
+          public: port,
+          private: { host: this.localAddress, port },
+          protocol: this.protocol,
+          description,
+          ttl
+        });
       try {
-        await this.client.createMapping({
-          public: port,
-          private: { host: this.localAddress, port },
-          protocol: this.protocol,
-          description,
-          ttl: this.permanentLease ? 0 : this.ttl
-        });
+        await write(lease);
       } catch (err) {
-        // Some IGDs (e.g. MikroTik) reject a finite lease with SOAP fault 725
-        // OnlyPermanentLeasesSupported. Latch permanent (a per-ROUTER property, so it
-        // applies to every port from here on) and retry this SAME write with ttl 0 —
-        // NOT a second rate token, the acquire above already covered this logical
-        // write; the retry is the same write with a different lease.
-        if (this.permanentLease || !this.isPermanentLeaseError(err)) throw err;
-        this.permanentLease = true;
-        await this.client.createMapping({
-          public: port,
-          private: { host: this.localAddress, port },
-          protocol: this.protocol,
-          description,
-          ttl: 0
-        });
+        // A router that refuses a leased mapping (725, 501, 718 on a port that is free or
+        // ours) takes the same write permanently. Another host's entry on the port is a
+        // conflict, not a lease refusal. The retry is the same logical write: no token.
+        const othersEntry = existing != null && existing.private.host !== this.localAddress;
+        if (lease === 0 || othersEntry || !isRouterFault(err)) throw err;
+        await write(0);
+        this.leaseRenewal = false;
       }
     } catch (err) {
       this.onMappingFailed?.(port, String(err));
     }
   }
 
+  /** Start the lease test when this node is the one to answer it and has no answer yet. */
+  private maybeStartLeaseTest(): void {
+    if (this.leaseTestPort == null || this.leaseRenewal !== null || this.leaseTestRunning) return;
+    if (this.clock.now() < this.leaseTestNotBefore) return;
+    void this.runLeaseTest(this.leaseTestPort);
+  }
+
+  private async runLeaseTest(port: number): Promise<void> {
+    this.leaseTestRunning = true;
+    try {
+      const renews = await this.leaseTestOutcome(port);
+      if (renews === null) {
+        this.leaseTestNotBefore = this.clock.now() + LEASE_TEST_RETRY_MS;
+      } else if (this.leaseRenewal === null) {
+        this.leaseRenewal = renews;
+      }
+    } catch (err) {
+      this.onMappingFailed?.(port, String(err));
+      this.leaseTestNotBefore = this.clock.now() + LEASE_TEST_RETRY_MS;
+    } finally {
+      this.leaseTestRunning = false;
+    }
+  }
+
   /**
-   * Does this error signal the router only accepts permanent leases? Match the SOAP
-   * fault on `String(err)` case-insensitively, covering BOTH the numeric code (725)
-   * and the text (OnlyPermanentLeases...), since the nat-upnp error surface may carry
-   * either.
+   * Map the test port with a 60 s lease, add it again at +30 s, look it up at +70 s:
+   * true when it is still held, pointing at us, with a lease of at most 60 s; false for any
+   * refusal or other answer; null when the test could not finish (no rate token, or a
+   * request with no answer). Each write spends a rate token. The test mapping is removed
+   * at the end; when it cannot be, its lease ends it.
    */
-  private isPermanentLeaseError(err: unknown): boolean {
-    return /725|OnlyPermanentLeases/i.test(String(err));
+  private async leaseTestOutcome(port: number): Promise<boolean | null> {
+    const add = (): Promise<void> =>
+      this.client.createMapping({
+        public: port,
+        private: { host: this.localAddress, port },
+        protocol: this.protocol,
+        description: `${this.description}_Lease_Test`,
+        ttl: LEASE_TEST_SECONDS
+      });
+    for (const at of [0, LEASE_TEST_READD_MS]) {
+      if (at > 0) await this.wait(at);
+      if (!this.rl.acquire()) return null;
+      try {
+        await add();
+      } catch (err) {
+        return isRouterFault(err) ? false : null;
+      }
+    }
+    await this.wait(LEASE_TEST_READ_MS - LEASE_TEST_READD_MS);
+    let held: UpnpMapping | null;
+    try {
+      held = await this.client.getMapping({ public: port, protocol: this.protocol });
+    } catch (err) {
+      if (!isRouterFault(err)) return null;
+      held = null;
+    }
+    const renews =
+      held != null &&
+      held.private.host === this.localAddress &&
+      held.private.port === port &&
+      held.enabled &&
+      held.ttl > 0 &&
+      held.ttl <= LEASE_TEST_SECONDS;
+    if (this.rl.acquire()) {
+      try {
+        await this.client.removeMapping({ public: port, protocol: this.protocol });
+      } catch {
+        // its lease ends it
+      }
+    }
+    return renews;
+  }
+
+  private wait(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      this.leaseTestTimer = this.clock.setTimer(ms, () => {
+        this.leaseTestTimer = null;
+        resolve();
+      });
+    });
   }
 }
