@@ -15,11 +15,21 @@
  *   timedLeaseFault      a fault code every leased AddPortMapping is refused with
  *                        (725 MikroTik, 501, 718)
  *   minimumLease         seconds every lease is raised to (libupnp 1.6.22: 900, 86400)
+ *   eventing             "works": a NOTIFY on subscribing and on every change to the
+ *                        table's size; "no-answer": SUBSCRIBE gets no answer; "no-sid":
+ *                        SUBSCRIBE is answered without a SID (Netgear RAX30);
+ *                        "initial-only": the NOTIFY on subscribing and none after (TP-Link
+ *                        Omada ER605); "callback-blocked": no NOTIFY reaches the node (a
+ *                        firewall that drops the router's connections)
+ *   replaceSignalled     a re-add that changes a held mapping is also signalled (Freebox,
+ *                        Huawei, Keenetic, Livebox); miniupnpd signals size changes only
  *
- * `clientFor(address)` is the UpnpClientLike a node at that LAN address uses.
+ * `clientFor(address)` is the UpnpClientLike a node at that LAN address uses, and
+ * `eventsFor(address)` its RouterEvents. A NOTIFY reaches the node 5 ms after the change.
  */
 
 import { ManualClock } from "@/fluxport-controller/consensus/clock";
+import { RouterEvent, RouterEvents, Subscription } from "@/fluxport-controller/upnp/routerEvents";
 import {
   MappingQuery,
   NewMapping,
@@ -42,6 +52,26 @@ export interface RouterBehaviour {
   renewsOnReadd?: boolean;
   timedLeaseFault?: number | null;
   minimumLease?: number;
+  eventing?: "works" | "no-answer" | "no-sid" | "initial-only" | "callback-blocked";
+  replaceSignalled?: boolean;
+  /** The lifetime a subscription is granted (default 1800 s). */
+  subscriptionSeconds?: number;
+  /** A walk answers this long after it starts, with the table as it was at the start. */
+  walkDelayMs?: number;
+}
+
+interface Subscriber {
+  sid: string;
+  address: string;
+  seq: number;
+  expiresAt: number;
+}
+
+export interface EventCounts {
+  subscribes: number;
+  renews: number;
+  unsubscribes: number;
+  delivered: number;
 }
 
 interface Held {
@@ -66,6 +96,11 @@ export interface ClientCounts {
 
 export class ModelRouter {
   private readonly table: Held[] = [];
+  private readonly subscribers = new Map<string, Subscriber>();
+  private readonly listeners = new Map<string, (event: RouterEvent) => void>();
+  private nextSid = 1;
+  /** Set to lose the next NOTIFY: its SEQ is used, nothing is delivered. */
+  dropNextEvent = false;
   /** Mutable: a test can change how the router behaves mid-run. */
   readonly behaviour: Required<RouterBehaviour>;
 
@@ -79,7 +114,11 @@ export class ModelRouter {
       hidesLeasedEntries: behaviour.hidesLeasedEntries ?? false,
       renewsOnReadd: behaviour.renewsOnReadd ?? true,
       timedLeaseFault: behaviour.timedLeaseFault ?? null,
-      minimumLease: behaviour.minimumLease ?? 0
+      minimumLease: behaviour.minimumLease ?? 0,
+      eventing: behaviour.eventing ?? "works",
+      replaceSignalled: behaviour.replaceSignalled ?? false,
+      subscriptionSeconds: behaviour.subscriptionSeconds ?? 1800,
+      walkDelayMs: behaviour.walkDelayMs ?? 0
     };
   }
 
@@ -98,7 +137,7 @@ export class ModelRouter {
 
   /** Put a mapping on the table directly (another machine's, or a leftover). */
   seed(m: { port: number; host: string; internal?: number; description?: string; lease?: number }): void {
-    this.table.push({
+    const held: Held = {
       external: m.port,
       protocol: "tcp",
       host: m.host,
@@ -106,12 +145,113 @@ export class ModelRouter {
       description: m.description ?? "Flux",
       lease: m.lease ?? 0,
       expiresAt: m.lease ? this.clock.now() + m.lease * 1000 : null
+    };
+    const h = this.find(m.port, "tcp");
+    if (h) {
+      Object.assign(h, held);
+      if (this.behaviour.replaceSignalled) this.notify();
+    } else {
+      this.table.push(held);
+      this.notify();
+    }
+    this.scheduleExpiry(held);
+  }
+
+  /** Another machine removes a mapping, whoever holds it. */
+  drop(port: number, protocol = "tcp"): void {
+    const h = this.find(port, protocol);
+    if (!h) return;
+    this.table.splice(this.table.indexOf(h), 1);
+    this.notify();
+  }
+
+  /** Drop every mapping and every subscription, as a router reboot does. Nothing is
+   *  signalled: a rebooted router has forgotten its subscribers. */
+  reboot(): void {
+    this.table.length = 0;
+    this.subscribers.clear();
+  }
+
+  readonly eventCounts: EventCounts = { subscribes: 0, renews: 0, unsubscribes: 0, delivered: 0 };
+
+  eventsFor(address: string): RouterEvents {
+    const router = this;
+    return {
+      async listen(onEvent: (event: RouterEvent) => void): Promise<void> {
+        router.listeners.set(address, onEvent);
+      },
+      async subscribe(): Promise<Subscription> {
+        router.eventCounts.subscribes += 1;
+        if (router.behaviour.eventing === "no-answer") throw new Error("SUBSCRIBE timed out");
+        if (router.behaviour.eventing === "no-sid") throw new Error("SUBSCRIBE answered without a SID");
+        const sub: Subscriber = {
+          sid: `uuid:sub-${router.nextSid++}`,
+          address,
+          seq: 0,
+          expiresAt: router.clock.now() + router.behaviour.subscriptionSeconds * 1000
+        };
+        router.subscribers.set(sub.sid, sub);
+        if (router.behaviour.eventing !== "callback-blocked") router.deliver(sub, 0);
+        return { sid: sub.sid, timeoutSeconds: router.behaviour.subscriptionSeconds };
+      },
+      async renew(sid: string): Promise<Subscription> {
+        router.eventCounts.renews += 1;
+        const sub = router.liveSubscriber(sid);
+        if (!sub) throw new Error("SUBSCRIBE answered 412");
+        sub.expiresAt = router.clock.now() + router.behaviour.subscriptionSeconds * 1000;
+        return { sid, timeoutSeconds: router.behaviour.subscriptionSeconds };
+      },
+      async unsubscribe(sid: string): Promise<void> {
+        router.eventCounts.unsubscribes += 1;
+        if (!router.subscribers.delete(sid)) throw new Error("UNSUBSCRIBE answered 412");
+      },
+      close(): void {
+        router.listeners.delete(address);
+      }
+    };
+  }
+
+  /** Live subscriptions held for a node's address (test seam). */
+  subscriptionsFor(address: string): number {
+    return [...this.subscribers.values()].filter((s) => s.address === address && this.liveSubscriber(s.sid))
+      .length;
+  }
+
+  private liveSubscriber(sid: string): Subscriber | null {
+    const sub = this.subscribers.get(sid);
+    if (!sub) return null;
+    if (sub.expiresAt <= this.clock.now()) {
+      this.subscribers.delete(sid);
+      return null;
+    }
+    return sub;
+  }
+
+  private notify(): void {
+    for (const sub of [...this.subscribers.values()]) {
+      if (!this.liveSubscriber(sub.sid)) continue;
+      sub.seq += 1;
+      if (this.behaviour.eventing !== "works") continue;
+      if (this.dropNextEvent) {
+        this.dropNextEvent = false;
+        continue;
+      }
+      this.deliver(sub, sub.seq);
+    }
+  }
+
+  private deliver(sub: Subscriber, seq: number): void {
+    const entries = this.table.length;
+    this.clock.setTimer(5, () => {
+      const listener = this.listeners.get(sub.address);
+      if (!listener || !this.subscribers.has(sub.sid)) return;
+      this.eventCounts.delivered += 1;
+      listener({ sid: sub.sid, seq, entries });
     });
   }
 
-  /** Drop every mapping, as a router reboot does. */
-  reboot(): void {
-    this.table.length = 0;
+  private scheduleExpiry(h: Held): void {
+    if (h.expiresAt != null) this.clock.setTimer(h.expiresAt - this.clock.now(), () => this.expire());
   }
 
   clientFor(address: string): UpnpClientLike & { counts: ClientCounts } {
@@ -127,7 +267,10 @@ export class ModelRouter {
       },
       async getMappings(): Promise<UpnpMapping[]> {
         counts.walks += 1;
-        return router.entries();
+        const table = router.entries();
+        const delay = router.behaviour.walkDelayMs;
+        if (delay > 0) await new Promise<void>((r) => router.clock.setTimer(delay, r));
+        return table;
       },
       async getMapping(q: MappingQuery): Promise<UpnpMapping | null> {
         counts.lookups += 1;
@@ -185,6 +328,7 @@ export class ModelRouter {
     const h = this.find(m.public, protocol);
     if (h && h.host !== address) throw new RouterFault(718);
     if (h && !this.behaviour.renewsOnReadd) return;
+    const changes = !h || h.internal !== m.private.port || h.description !== (m.description ?? "");
     const next: Held = {
       external: m.public,
       protocol,
@@ -194,8 +338,14 @@ export class ModelRouter {
       lease,
       expiresAt: lease > 0 ? this.clock.now() + lease * 1000 : null
     };
-    if (h) Object.assign(h, next);
-    else this.table.push(next);
+    if (h) {
+      Object.assign(h, next);
+      if (changes && this.behaviour.replaceSignalled) this.notify();
+    } else {
+      this.table.push(next);
+      this.notify();
+    }
+    this.scheduleExpiry(next);
   }
 
   private remove(address: string, port: number, protocol: string): void {
@@ -204,6 +354,7 @@ export class ModelRouter {
     if (!h) throw new RouterFault(714);
     if (h.host !== address) throw new RouterFault(606);
     this.table.splice(this.table.indexOf(h), 1);
+    this.notify();
   }
 
   private find(port: number, protocol: string): Held | undefined {
@@ -212,10 +363,15 @@ export class ModelRouter {
 
   private expire(): void {
     const now = this.clock.now();
+    let expired = false;
     for (let i = this.table.length - 1; i >= 0; i--) {
       const at = this.table[i].expiresAt;
-      if (at != null && at <= now) this.table.splice(i, 1);
+      if (at != null && at <= now) {
+        this.table.splice(i, 1);
+        expired = true;
+      }
     }
+    if (expired) this.notify();
   }
 
   private toMapping(h: Held): UpnpMapping {

@@ -76,18 +76,28 @@
  * LEASES — a mapping is permanent (ttl 0) unless this router is known to renew a lease
  * when the mapping is added again. Many do not: the re-add is accepted and the lease runs
  * out regardless, and some of those also answer 714 to a lookup of a leased entry they
- * hold. The lease test answers it once per router: on `leaseTestPort` it maps with a 60 s
+ * hold. The lease test answers it once per router: on `routerTestPort` it maps with a 60 s
  * lease, adds the same mapping at +30 s, and looks it up at +70 s — renewed means held,
  * pointing at us, with a lease of at most 60 s. Any other outcome means permanent. The
  * leader runs the test and carries the answer in every UPNP_OBSERVED; a node in
  * SELF_CHECK runs it itself. A leased write the router refuses is made permanent and ends
  * leasing on this node.
+ *
+ * EVENTS — with `events` and `routerTestPort`, the leader subscribes to the router's
+ * events (EventWatch decides when they are trusted). While trusted, the leader broadcasts
+ * its last full read of the table, kept current with its own writes, instead of reading
+ * the router on every turn; it reads again on an event and at least every
+ * `eventsSafetyNetMs`, because no router signals every change (a mapping replaced at the
+ * same table size goes unsignalled on most). That interval stays under half of
+ * `lowTtlThreshold`, so a lease is still seen running low in time.
  */
 
 import { Group } from "../consensus/consensus";
 import { Clock, TimerId } from "../consensus/clock";
 import { RateLimiter } from "../consensus/rateLimiter";
 import { UpnpClientLike, UpnpMapping } from "../upnpClient";
+import { EventWatch, EventWatchState } from "./eventWatch";
+import { RouterEvents } from "./routerEvents";
 
 export type CoordinatorMode = "LEADER_CHECK" | "SELF_CHECK";
 
@@ -108,9 +118,13 @@ const LEASE_TEST_READ_MS = 70_000;
 /** Wait before trying again a lease test that could not finish (no rate token, no answer). */
 const LEASE_TEST_RETRY_MS = 600_000;
 
-/** One repair or cleanup pass: the router table, once walked, is reused by every port. */
+const DEFAULT_EVENTS_SAFETY_NET_MS = 1_800_000;
+
+/** One repair or cleanup pass: the router table, once walked, is reused by every port.
+ *  `authoritative`: the table is current, so ports are read from it without a lookup. */
 interface Pass {
   table: UpnpMapping[] | null;
+  authoritative?: boolean;
 }
 
 /** A SOAP fault the router answered with (nat-upnp's UpnpError carries a numeric code),
@@ -210,8 +224,15 @@ export interface UpnpCoordinatorDeps {
   ttl?: number;
   /** Re-map when an existing mapping's remaining ttl drops below this. */
   lowTtlThreshold?: number;
-  /** A port of this node's own that no app uses, free on the router, for the lease test. */
-  leaseTestPort?: number;
+  /** A port of this node's own that no app uses, free on the router, for the lease and
+   *  event tests. */
+  routerTestPort?: number;
+  /** The router's events, for the leader to read the table only when it changes. Used
+   *  only with `routerTestPort`. */
+  events?: RouterEvents;
+  /** The longest a leader trusting events goes without reading the table. Default 30
+   *  minutes, capped at half of `lowTtlThreshold`. */
+  eventsSafetyNetMs?: number;
   /** Baton turns a leader's OBSERVED stays trusted before a node re-checks itself. */
   freshLaps?: number;
   /** Consecutive clean laps to enter LEADER_CHECK (K). */
@@ -234,7 +255,11 @@ export interface UpnpCoordinatorDeps {
    *  distinguishable only if the SOAP client's message says so, not by the coordinator. A
    *  delete failure is benign — the mapping just lingers; the unmap is retried, then
    *  bounded (dropped after a few attempts, re-surfaced by a later OBSERVED if present). */
-  hooks?: { onMappingFailed?: (port: number, reason: string) => void };
+  hooks?: {
+    onMappingFailed?: (port: number, reason: string) => void;
+    /** The leader's trust in the router's events changed, and why. */
+    onEventsStateChange?: (state: EventWatchState, reason: string) => void;
+  };
 }
 
 export class UpnpCoordinator {
@@ -247,7 +272,7 @@ export class UpnpCoordinator {
   private readonly description: string;
   private readonly ttl: number;
   private readonly lowTtlThreshold: number;
-  private readonly leaseTestPort: number | null;
+  private readonly routerTestPort: number | null;
   private readonly freshLaps: number;
   private readonly enterLaps: number;
   private readonly leaveLaps: number;
@@ -302,6 +327,16 @@ export class UpnpCoordinator {
   private lastObserved: UpnpMapping[] | null = null;
   private lapsSinceObserved = 0;
 
+  // ---- events (leader only) ----
+  private readonly watch: EventWatch | null;
+  private readonly eventsSafetyNetMs: number;
+  // The leader's last full read of the table, with its own writes applied since; when it
+  // was read; and the events received by then.
+  private tableCache: UpnpMapping[] | null = null;
+  private tableReadAt = 0;
+  private eventsAtRead = 0;
+  private tableDirty = false;
+
   // ---- 5c mode machine ----
   // Default SELF_CHECK: never start trusting a leader/token we have not seen circulate.
   private mode: CoordinatorMode = "SELF_CHECK";
@@ -326,7 +361,7 @@ export class UpnpCoordinator {
     this.description = deps.description ?? "Flux";
     this.ttl = deps.ttl ?? 14400;
     this.lowTtlThreshold = deps.lowTtlThreshold ?? this.ttl / 4;
-    this.leaseTestPort = deps.leaseTestPort ?? null;
+    this.routerTestPort = deps.routerTestPort ?? null;
     this.freshLaps = deps.freshLaps ?? DEFAULT_FRESH_LAPS;
     this.enterLaps = deps.enterLaps ?? DEFAULT_ENTER_LAPS;
     this.leaveLaps = deps.leaveLaps ?? DEFAULT_LEAVE_LAPS;
@@ -338,6 +373,21 @@ export class UpnpCoordinator {
       deps.orphanMaxDeleteAttempts ?? DEFAULT_ORPHAN_MAX_DELETE_ATTEMPTS;
     this.slot = fnv1a(this.self, this.selfCheckWindows);
     this.onMappingFailed = deps.hooks?.onMappingFailed;
+    this.eventsSafetyNetMs = Math.min(
+      deps.eventsSafetyNetMs ?? DEFAULT_EVENTS_SAFETY_NET_MS,
+      (this.lowTtlThreshold * 1000) / 2
+    );
+    this.watch =
+      deps.events && this.routerTestPort != null
+        ? new EventWatch({
+            events: deps.events,
+            clock: deps.clock,
+            addTestMapping: () => this.addEventTestMapping(),
+            removeTestMapping: () => this.removeEventTestMapping(),
+            onChange: () => this.onTableChanged(),
+            onStateChange: deps.hooks?.onEventsStateChange
+          })
+        : null;
 
     // Closed-loop back-off bounds. Baseline is the requested rate; the floor defaults
     // to baseline/8 (a tiny but non-zero pace, never a standstill) and is clamped so an
@@ -383,11 +433,14 @@ export class UpnpCoordinator {
     this.started = true;
     this.armTokenStall();
     this.armSlotTimer();
+    // A listener that cannot start leaves the leader reading the table on its turns.
+    this.watch?.start().catch((err) => this.onMappingFailed?.(-1, `event listener: ${String(err)}`));
   }
 
-  /** Clear both timers (idempotent). */
+  /** Clear the timers and drop the event subscription (idempotent). */
   stop(): void {
     this.started = false;
+    this.watch?.stop();
     if (this.tokenStallTimer != null) {
       this.clock.clearTimer(this.tokenStallTimer);
       this.tokenStallTimer = null;
@@ -473,6 +526,10 @@ export class UpnpCoordinator {
   get leaseRenews(): boolean | null {
     return this.leaseRenewal;
   }
+  /** This node's use of the router's events: "off" without them (observability). */
+  get eventsState(): EventWatchState | "off" {
+    return this.watch?.state ?? "off";
+  }
   /** The group's representative; delegates to the group. */
   get representative(): string | null {
     return this.group.representative;
@@ -537,7 +594,7 @@ export class UpnpCoordinator {
         m.protocol.toLowerCase() === this.protocol.toLowerCase() &&
         FLUX_DESCRIPTION.test(m.description) &&
         !this.desiredPorts.has(m.public.port) &&
-        m.public.port !== this.leaseTestPort &&
+        m.public.port !== this.routerTestPort &&
         !this.orphanCandidates.has(m.public.port)
       ) {
         this.orphanCandidates.set(m.public.port, { confirms: 0, failures: 0 });
@@ -558,6 +615,7 @@ export class UpnpCoordinator {
    */
   private onBaton(): void {
     this.sampleLap();
+    if (!this.watchesRouter) this.stopWatching();
     if (this.mode !== "LEADER_CHECK") return;
 
     if (this.isLeader) {
@@ -610,6 +668,17 @@ export class UpnpCoordinator {
   private toSelfCheck(): void {
     this.mode = "SELF_CHECK";
     this.cleanLaps = 0;
+    this.stopWatching();
+  }
+
+  /** Only the leader of a healthy ring watches the router's events. */
+  private get watchesRouter(): boolean {
+    return this.mode === "LEADER_CHECK" && this.isLeader;
+  }
+
+  private stopWatching(): void {
+    this.watch?.disengage();
+    this.tableCache = null;
   }
 
   /**
@@ -706,6 +775,7 @@ export class UpnpCoordinator {
    * read from the pass's walk of the table instead — made once per pass and shared.
    */
   private async readOwn(port: number, pass: Pass): Promise<UpnpMapping | null> {
+    if (pass.authoritative && pass.table) return this.entryIn(pass.table, port);
     if (!this.lookupsUnreliable) {
       try {
         const entry = await this.client.getMapping({ public: port, protocol: this.protocol });
@@ -739,9 +809,19 @@ export class UpnpCoordinator {
     const pass: Pass = { table: null };
     try {
       this.maybeStartLeaseTest();
+      if (!this.leaseTestRunning && (this.routerTestPort == null || this.leaseRenewal !== null)) {
+        this.watch?.engage();
+      }
+      const trusted = this.watch?.trusted === true;
+      const cached =
+        trusted &&
+        this.tableCache != null &&
+        !this.tableDirty &&
+        this.clock.now() - this.tableReadAt < this.eventsSafetyNetMs;
       try {
-        const mappings = await this.client.getMappings();
+        const mappings = cached ? this.tableCache! : await this.readTable(trusted);
         pass.table = mappings;
+        pass.authoritative = trusted;
         this.group.broadcast({
           type: OBSERVED,
           by: this.self,
@@ -751,7 +831,7 @@ export class UpnpCoordinator {
         // The leader ignores its OWN broadcast (onObserved), so feed its leftovers from
         // the enumerate it just did — its own orphans get pruned like any other node's.
         this.noteObservedOrphans(mappings);
-        this.recoverRate(); // clean scan: ease the whole segment back toward baseline
+        if (!cached) this.recoverRate(); // clean scan: ease the segment back toward baseline
       } catch (err) {
         // An enumerate failure is a whole-table read fault, not specific to one port,
         // so report it under the sentinel -1 (no single port to attribute it to).
@@ -759,11 +839,88 @@ export class UpnpCoordinator {
         this.backoffRate(); // the struggling router also stalls reads: back the group off
       }
       // The leader keeps its OWN ports via the shared read-before-write path. It does
-      // NOT trust OBSERVED (it ignores its own broadcast), so it reads each own port —
-      // from the scan it just made, where this router's lookups are unreliable.
+      // NOT trust OBSERVED (it ignores its own broadcast), so it reads each own port.
       await this.checkAndRepair(false, pass);
     } finally {
       this.scanning = false;
+    }
+    // An event that arrived during this scan asks for another read.
+    if (this.tableDirty && this.watch?.trusted && this.watchesRouter) void this.scanAndBroadcast();
+  }
+
+  /** While events are trusted, a change in the table's size with no event since the
+   *  previous read means an event was lost. */
+  private async readTable(trusted: boolean): Promise<UpnpMapping[]> {
+    this.tableDirty = false;
+    const events = this.watch?.received ?? 0;
+    const mappings = await this.client.getMappings();
+    if (
+      trusted &&
+      this.tableCache != null &&
+      mappings.length !== this.tableCache.length &&
+      this.eventsAtRead === events
+    ) {
+      this.watch?.distrust("the table changed without an event");
+    }
+    this.tableCache = mappings;
+    this.tableReadAt = this.clock.now();
+    // Counted from the read's start: an event that arrives while the table is being read
+    // may not be in this read, so it belongs to the next one.
+    this.eventsAtRead = events;
+    return mappings;
+  }
+
+  /** Read now: the leader's next turn can be minutes away. */
+  private onTableChanged(): void {
+    this.tableDirty = true;
+    if (this.watchesRouter && !this.scanning) void this.scanAndBroadcast();
+  }
+
+  /** A renewal brings no event (the table's size is unchanged), so without this the
+   *  leader would see its renewed lease still running low and write it on every turn. */
+  private applyOwnWrite(port: number, entry: UpnpMapping | null): void {
+    if (this.tableCache == null) return;
+    const rest = this.tableCache.filter(
+      (m) => !(m.public.port === port && m.protocol.toLowerCase() === this.protocol.toLowerCase())
+    );
+    this.tableCache = entry ? [...rest, entry] : rest;
+  }
+
+  /** Both rate tokens are taken up front so the removal never waits on the budget: a
+   *  router that refused the lease holds the test mapping permanently. */
+  private async addEventTestMapping(): Promise<boolean | null> {
+    const port = this.routerTestPort!;
+    if (this.rl.available < 2) return null;
+    this.rl.acquire();
+    this.rl.acquire();
+    const add = (ttl: number): Promise<void> =>
+      this.client.createMapping({
+        public: port,
+        private: { host: this.localAddress, port },
+        protocol: this.protocol,
+        description: `${this.description}_Event_Test`,
+        ttl
+      });
+    try {
+      await add(LEASE_TEST_SECONDS);
+      return true;
+    } catch (err) {
+      if (!isRouterFault(err)) return null;
+    }
+    try {
+      await add(0); // a router that refuses leases
+      return true;
+    } catch (err) {
+      return isRouterFault(err) ? false : null;
+    }
+  }
+
+  private async removeEventTestMapping(): Promise<boolean | null> {
+    try {
+      await this.client.removeMapping({ public: this.routerTestPort!, protocol: this.protocol });
+      return true;
+    } catch (err) {
+      return isRouterFault(err) ? false : null;
     }
   }
 
@@ -893,8 +1050,10 @@ export class UpnpCoordinator {
         return;
       }
       if (!this.rl.acquire()) return; // no budget this pass; keep the candidate, retry later
+      const mark = this.watch?.received ?? 0;
       await this.client.removeMapping({ public: port, protocol: this.protocol });
       this.orphanCandidates.delete(port);
+      this.noteOwnWrite(port, null, mark);
     } catch (err) {
       this.onMappingFailed?.(port, String(err));
       // Bounded retry (unlike repairs, which retry a WANTED port forever): a delete that
@@ -935,6 +1094,8 @@ export class UpnpCoordinator {
           description,
           ttl
         });
+      const mark = this.watch?.received ?? 0;
+      let written = lease;
       try {
         await write(lease);
       } catch (err) {
@@ -944,18 +1105,37 @@ export class UpnpCoordinator {
         const othersEntry = existing != null && existing.private.host !== this.localAddress;
         if (lease === 0 || othersEntry || !isRouterFault(err)) throw err;
         await write(0);
+        written = 0;
         this.leaseRenewal = false;
       }
+      const entry: UpnpMapping = {
+        public: { host: "", port },
+        private: { host: this.localAddress, port },
+        protocol: this.protocol,
+        enabled: true,
+        description,
+        ttl: written
+      };
+      this.noteOwnWrite(port, entry, existing == null ? mark : null);
     } catch (err) {
       this.onMappingFailed?.(port, String(err));
     }
   }
 
+  /** `mark` (`received` before the write) is set when the write changed the table's
+   *  size, which must bring an event. */
+  private noteOwnWrite(port: number, entry: UpnpMapping | null, mark: number | null): void {
+    if (!this.watch?.trusted || !this.watchesRouter) return;
+    this.applyOwnWrite(port, entry);
+    if (mark != null) this.watch.expectChange(mark);
+  }
+
   /** Start the lease test when this node is the one to answer it and has no answer yet. */
   private maybeStartLeaseTest(): void {
-    if (this.leaseTestPort == null || this.leaseRenewal !== null || this.leaseTestRunning) return;
+    if (this.routerTestPort == null || this.leaseRenewal !== null || this.leaseTestRunning) return;
+    if (this.watch?.state === "testing") return; // the event test holds the test port
     if (this.clock.now() < this.leaseTestNotBefore) return;
-    void this.runLeaseTest(this.leaseTestPort);
+    void this.runLeaseTest(this.routerTestPort);
   }
 
   private async runLeaseTest(port: number): Promise<void> {

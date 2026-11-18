@@ -9,6 +9,8 @@ import { Consensus, Group } from "@/fluxport-controller/consensus/consensus";
 import { MembershipConfig } from "@/fluxport-controller/consensus/membership";
 import { UpnpClientLike } from "@/fluxport-controller/upnpClient";
 import { UpnpCoordinator } from "@/fluxport-controller/upnp/upnpCoordinator";
+import { RouterEvents } from "@/fluxport-controller/upnp/routerEvents";
+import { EventWatchState } from "@/fluxport-controller/upnp/eventWatch";
 
 const FAST_TIMING = {
   tokenRotationTarget: 5,
@@ -32,8 +34,20 @@ export const cfg: MembershipConfig = {
   tokenLossTimeout: 300
 };
 
+/** `cfg` with every interval 20 times longer: a turn comes round about every second. */
+export const slowCfg: MembershipConfig = {
+  ...cfg,
+  tokenRotationTarget: cfg.tokenRotationTarget * 20,
+  tokenRetransmitTimeout: cfg.tokenRetransmitTimeout * 20,
+  tokenLossTimeout: cfg.tokenLossTimeout * 20,
+  announceInterval: cfg.announceInterval * 20,
+  joinInterval: cfg.joinInterval * 20,
+  joinTimeout: cfg.joinTimeout * 20,
+  commitTimeout: cfg.commitTimeout * 20
+};
+
 /** Let the async repair's microtasks run after advancing the clock (deterministic). */
-export const settle = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
+export const settle = (): Promise<void> => new Promise((r) => setImmediate(r));
 
 export function makeWorld() {
   const net = new VirtualNetwork();
@@ -77,13 +91,17 @@ export function makeCoordinator(
     orphanConfirmPasses?: number;
     ttl?: number;
     lowTtlThreshold?: number;
-    leaseTestPort?: number;
+    routerTestPort?: number;
+    events?: RouterEvents;
+    eventsSafetyNetMs?: number;
     start?: boolean;
     onMappingFailed?: (port: number, reason: string) => void;
+    onEventsStateChange?: (state: EventWatchState, reason: string) => void;
+    config?: MembershipConfig;
   }
 ): { coordinator: UpnpCoordinator; group: Group } {
   const group = c.join("upnp", {
-    config: cfg,
+    config: opts.config ?? cfg,
     hooks: { onDeliver: () => {}, onViewChange: () => {} }
   });
   const coordinator = new UpnpCoordinator({
@@ -106,8 +124,10 @@ export function makeCoordinator(
     orphanConfirmPasses: opts.orphanConfirmPasses,
     ttl: opts.ttl,
     lowTtlThreshold: opts.lowTtlThreshold,
-    leaseTestPort: opts.leaseTestPort,
-    hooks: { onMappingFailed: opts.onMappingFailed }
+    routerTestPort: opts.routerTestPort,
+    events: opts.events,
+    eventsSafetyNetMs: opts.eventsSafetyNetMs,
+    hooks: { onMappingFailed: opts.onMappingFailed, onEventsStateChange: opts.onEventsStateChange }
   });
   if (opts.start !== false) coordinator.start();
   return { coordinator, group };

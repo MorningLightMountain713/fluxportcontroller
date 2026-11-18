@@ -32,6 +32,11 @@ export interface NodeStatus {
   /** Cumulative router writes/deletes this node has issued (steady-state assertion). */
   upnpWrites?: number;
   upnpDeletes?: number;
+  /** Cumulative whole-table reads and single-port lookups this node has made. */
+  upnpReads?: number;
+  upnpLookups?: number;
+  /** The node's use of the router's events: off, idle, testing or trusted. */
+  upnpEvents?: string | null;
 }
 
 /** A router mapping as the node reads it back (a subset of the package's UpnpMapping). */
@@ -105,6 +110,18 @@ export class NodeClient {
       );
     }
     return JSON.parse(res.stdout) as UpnpNodeStatus;
+  }
+
+  /** Remove a mapping from the router, as another machine on the LAN would. */
+  async unmap(port: number): Promise<void> {
+    const script =
+      `fetch('http://127.0.0.1:${this.statusPort}/?unmap=${port}',{signal:AbortSignal.timeout(8000)})` +
+      `.then(r=>r.json()).then(j=>{if(j.unmapError){process.stderr.write(j.unmapError);process.exit(1)}})` +
+      `.catch(e=>{process.stderr.write(String(e&&e.message||e));process.exit(1)})`;
+    const res = await this.container.exec(["node", "--no-warnings", "-e", script]);
+    if (res.exitCode !== 0) {
+      throw new Error(`unmap ${port} failed on ${this.name}: ${res.stderr || res.output}`);
+    }
   }
 
   /** Recent container logs (for diagnosing a failed convergence). */

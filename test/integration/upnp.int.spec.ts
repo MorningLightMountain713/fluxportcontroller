@@ -95,13 +95,13 @@ describe("UPnP coordination integration (real miniupnpd mappings)", () => {
       // self-map invariant: every Flux mapping is exactly its owner's OWN assigned port, or
       // its own lease-test port (40000 + N for node-N) while a lease test runs.
       const ipToNid = new Map([...ipByNid].map(([nid, ip]) => [ip, nid]));
-      const leaseTestPortOf = (nid: string): number =>
+      const routerTestPortOf = (nid: string): number =>
         40000 + Number(/^node-(\d+):/.exec(nid)![1]);
       for (const m of table.filter(isFlux)) {
         const owner = ipToNid.get(m.private.host);
         assert.ok(owner, `Flux mapping ${m.public.port} -> ${m.private.host} has no known owner`);
         if (m.description === "Flux_Lease_Test") {
-          assert.equal(m.public.port, leaseTestPortOf(owner), `node ${owner} tested on a foreign port`);
+          assert.equal(m.public.port, routerTestPortOf(owner), `node ${owner} tested on a foreign port`);
           continue;
         }
         assert.equal(m.public.port, portByNid.get(owner), `node ${owner} mapped a foreign port`);
@@ -312,6 +312,87 @@ describe("UPnP coordination integration (router stress: back-off + stall isolati
         .then((s) => !s.upnpError && s.upnpMappings.length > 0)
         .catch(() => false);
       assert.ok(back, "router enumerate works again after the block is cleared");
+    }
+  );
+});
+
+describe("UPnP coordination integration (the router's events)", () => {
+  let env: ConsensusEnv;
+  let leader: NodeClient;
+
+  before(async () => {
+    env = await createConsensusEnv({ nodes: NODES, env: { UPNP_FAST: "1", UPNP_EVENTS: "1" } });
+    await waitForConvergence(env.nodes, NODES, CONVERGE_TIMEOUT_MS);
+  }, { timeout: 300_000 });
+
+  after(async () => {
+    await env?.teardown();
+  }, { timeout: 60_000 });
+
+  /** Poll every node's status until `pred` holds for the set, or the deadline passes. */
+  const waitForStatuses = async (
+    pred: (s: Array<Awaited<ReturnType<NodeClient["status"]>> | null>) => boolean,
+    timeoutMs: number
+  ) => {
+    const deadline = Date.now() + timeoutMs;
+    let statuses = await Promise.all(env.nodes.map((n) => n.status().catch(() => null)));
+    while (!pred(statuses) && Date.now() < deadline) {
+      await sleep(2000);
+      statuses = await Promise.all(env.nodes.map((n) => n.status().catch(() => null)));
+    }
+    return statuses;
+  };
+
+  it(
+    "the leader comes to trust miniupnpd's events, and no other node subscribes",
+    { timeout: 200_000 },
+    async () => {
+      // The lease test (70 s) answers first, then the event test.
+      const statuses = await waitForStatuses(
+        (s) => s.some((x) => x?.upnpIsLeader && x.upnpEvents === "trusted"),
+        180_000
+      );
+      const i = statuses.findIndex((x) => x?.upnpIsLeader);
+      if (statuses[i]?.upnpEvents !== "trusted") {
+        for (const n of env.nodes) console.error(`\n--- ${n.name} ---\n${await n.tailLogs(30)}`);
+      }
+      assert.equal(statuses[i]?.upnpEvents, "trusted", JSON.stringify(statuses));
+      leader = env.nodes[i];
+      for (const [j, s] of statuses.entries()) {
+        if (j !== i) assert.notEqual(s?.upnpEvents, "trusted", "only the leader watches the router");
+      }
+    }
+  );
+
+  it(
+    "while trusted the leader reads the table only at the safety net, not on every turn",
+    { timeout: 60_000 },
+    async () => {
+      const before = (await leader.status()).upnpReads ?? 0;
+      await sleep(15_000);
+      const after = (await leader.status()).upnpReads ?? 0;
+      // Turns come round about every second; the safety net reads every 20 s.
+      assert.ok(after - before <= 1, `reads in 15 s: ${after - before}`);
+    }
+  );
+
+  it(
+    "a mapping removed behind the coordinator's back is restored within seconds",
+    { timeout: 60_000 },
+    async () => {
+      const statuses = await Promise.all(env.nodes.map((n) => n.status()));
+      const victim = statuses.find((s) => !s.upnpIsLeader && s.port != null)!;
+      const node = env.nodes.find((n) => n.expectedNid === victim.nid)!;
+      const ip = env.ipOf(node);
+      const held = (t: UpnpMappingView[]): boolean =>
+        t.some((m) => m.public.port === victim.port && m.private.host === ip);
+      assert.ok(held(await routerTable(leader)), "mapped before the removal");
+
+      // From the victim's own host: miniupnpd lets only a mapping's host remove it.
+      await node.unmap(victim.port!);
+      const restored = await waitForTable(leader, held, 10_000);
+      assert.ok(restored.ok, `restored within 10 s; table=${JSON.stringify(restored.table)}`);
+      assert.equal((await leader.status()).upnpEvents, "trusted", "still trusted");
     }
   );
 });

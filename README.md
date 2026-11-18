@@ -54,10 +54,20 @@ node maps or deletes on another's behalf.
   for the port asked about. A router whose lookups fault, answer with another entry
   or answer an empty success is read through a walk of its table instead.
 - **Leases.** Mappings are permanent unless the router is known to renew a lease
-  when a mapping is added again. A node with a `leaseTestPort` tests that once: it
+  when a mapping is added again. A node with a `routerTestPort` tests that once: it
   maps the port with a 60 s lease, adds it again at +30 s and looks it up at +70 s.
   The leader shares the answer with the ring. A router that refuses a leased
   mapping gets permanent ones.
+- **Events.** With an `eventPort`, the leader subscribes to the router's events
+  and, once they are trusted, reads the table only when an event arrives and at a
+  slow safety-net interval, instead of on every turn. Routers that advertise
+  eventing still fail to deliver it in several ways, so events are trusted only
+  after a test on that router and node: a subscription, the event it starts with,
+  and an event each for a mapping added and removed on the `routerTestPort`. Trust
+  ends, until a retest an hour later, when a lost subscription cannot be replaced,
+  when one of the leader's own changes brings no event, or when a safety-net read
+  finds the table's size changed with no event. A failed test or lost trust only
+  means the leader reads on every turn again.
 
 ## Installation
 
@@ -76,7 +86,7 @@ logController.addLoggerTransport("console");
 const agent = new FluxNodeAgent(
   // this node's collateral outpoint
   { txhash: "334896be9aacb757de3e01633eba12b30198612513289223ca355d52137ba221", outidx: "0" },
-  { upnpTuning: { leaseTestPort: apiPort + 3 } }
+  { upnpTuning: { routerTestPort: apiPort + 3, eventPort: apiPort + 4 } }
 );
 
 agent.on("portConfirmed", (port) => console.log(`assigned port: ${port}`));
@@ -124,7 +134,9 @@ outpoint, the stable port-ownership identity.
 
 | Field | Default | Meaning |
 |---|---|---|
-| `leaseTestPort` | none | A port of this node's own that no app uses, for the lease test. It must differ from every other node's behind the same router (FluxOS: api port + 3). Without it, mappings stay permanent. |
+| `routerTestPort` | none | A port of this node's own that no app uses, for the lease and event tests. It must differ from every other node's behind the same router (FluxOS: api port + 3). Without it, mappings stay permanent and events are not used. |
+| `eventPort` | none | The port this node listens on for the router's events. The node's firewall must let the gateway reach it. Without it, the leader reads the table on every turn. |
+| `eventsSafetyNetMs` | `1800000` | The longest the leader goes without reading the table while it trusts events (capped at half the lease's renewal threshold) |
 | `rate`, `capacity` | `0.5`/s, `4` | The group's write budget |
 | `selfCheckCycleMs` | `300000` | The cycle a node checks its own ports on when the ring is not healthy |
 | `tokenStallMs` | `240000` | No turn for this long means the ring is not healthy |
@@ -144,6 +156,7 @@ in-memory network with no sockets, UPnP or HTTP.
 | `startError` | — | Startup failed (e.g. UPnP discovery); `start()` can be called again |
 | `rebound` | `({ from, to }: { from: string \| null; to: string })` | The socket was rebuilt; the port is confirmed again |
 | `mappingFailed` | `(port: number, reason: string)` | A mapping write, delete or read failed; `port` is `-1` for a failed read of the whole table |
+| `upnpEvents` | `(state: string, reason: string)` | The leader's use of the router's events changed: `testing`, `trusted` or `idle` |
 
 ### Methods and properties
 
@@ -158,7 +171,8 @@ in-memory network with no sockets, UPnP or HTTP.
 - `nid`, `assignedPort`, `members`, `viewId` — the node's identity, its port and the
   `ports` view.
 - `desiredUpnpPorts`, `upnpMode` (`LEADER_CHECK` / `SELF_CHECK`), `upnpIsLeader`,
-  `upnpRate` — the UPnP coordinator's state.
+  `upnpRate`, `upnpEvents` (`off` / `idle` / `testing` / `trusted`) — the UPnP
+  coordinator's state.
 
 ### Consensus as a library
 

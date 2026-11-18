@@ -26,7 +26,7 @@ async function run(clock: ManualClock, ms: number, step = 100, each?: () => void
 /** One node behind a ModelRouter, in SELF_CHECK (its slot drives repairs). */
 async function loneNode(
   behaviour: RouterBehaviour,
-  opts: { desired: number[]; ttl?: number; lowTtlThreshold?: number; leaseTestPort?: number }
+  opts: { desired: number[]; ttl?: number; lowTtlThreshold?: number; routerTestPort?: number }
 ) {
   const w = makeWorld();
   const router = new ModelRouter(w.clock, behaviour);
@@ -39,7 +39,7 @@ async function loneNode(
     client,
     ttl: opts.ttl,
     lowTtlThreshold: opts.lowTtlThreshold,
-    leaseTestPort: opts.leaseTestPort,
+    routerTestPort: opts.routerTestPort,
     onMappingFailed: (port, reason) => failures.push(`${port}: ${reason}`)
   });
   coordinator.setDesiredPortSet(opts.desired);
@@ -93,7 +93,7 @@ describe("UpnpCoordinator against real routers' behaviour", () => {
       it(`maps the port permanently when a lease is refused with ${timedLeaseFault}`, async () => {
         const { w, router } = await loneNode(
           { timedLeaseFault },
-          { desired: [16127], leaseTestPort: 16130 }
+          { desired: [16127], routerTestPort: 16130 }
         );
         await run(w.clock, 120_000, 500);
         const held = router.held(16127);
@@ -130,7 +130,7 @@ describe("UpnpCoordinator against real routers' behaviour", () => {
         desired: [16127],
         ttl: 60,
         lowTtlThreshold: 15,
-        leaseTestPort: 16130
+        routerTestPort: 16130
       });
       await run(w.clock, 300_000, 500);
       assert.equal(coordinator.leaseRenews, false, "the lease test found the lease is not renewed");
@@ -143,7 +143,7 @@ describe("UpnpCoordinator against real routers' behaviour", () => {
     it("leases the port once the lease test passes, and keeps it alive", async () => {
       const { w, router, coordinator, client } = await loneNode(
         {},
-        { desired: [16127], ttl: 60, lowTtlThreshold: 20, leaseTestPort: 16130 }
+        { desired: [16127], ttl: 60, lowTtlThreshold: 20, routerTestPort: 16130 }
       );
       await run(w.clock, 120_000, 500);
       assert.equal(coordinator.leaseRenews, true, "the lease test passed");
@@ -161,7 +161,7 @@ describe("UpnpCoordinator against real routers' behaviour", () => {
     it("maps permanently until the lease test has answered", async () => {
       const { w, router } = await loneNode(
         {},
-        { desired: [16127], ttl: 60, lowTtlThreshold: 20, leaseTestPort: 16130 }
+        { desired: [16127], ttl: 60, lowTtlThreshold: 20, routerTestPort: 16130 }
       );
       await run(w.clock, 1000);
       assert.equal(router.held(16127)?.ttl, 0, "permanent before the test has answered");
@@ -170,7 +170,7 @@ describe("UpnpCoordinator against real routers' behaviour", () => {
     it("maps permanently, for every port, once a leased write is refused", async () => {
       const { w, router, coordinator, client } = await loneNode(
         {},
-        { desired: [16127, 16128], ttl: 60, lowTtlThreshold: 20, leaseTestPort: 16130 }
+        { desired: [16127, 16128], ttl: 60, lowTtlThreshold: 20, routerTestPort: 16130 }
       );
       await run(w.clock, 120_000, 500);
       assert.equal(coordinator.leaseRenews, true);
@@ -211,7 +211,7 @@ describe("UpnpCoordinator against real routers' behaviour", () => {
         client,
         ttl: 60,
         lowTtlThreshold: 20,
-        leaseTestPort: 16130
+        routerTestPort: 16130
       });
       coordinator.setDesiredPortSet([16127, 16128]);
       await node.start();
@@ -236,7 +236,7 @@ describe("UpnpCoordinator against real routers' behaviour", () => {
     it("does not lease on a router whose minimum lease hides renewal", async () => {
       const { w, router, coordinator } = await loneNode(
         { minimumLease: 900 },
-        { desired: [16127], ttl: 60, lowTtlThreshold: 20, leaseTestPort: 16130 }
+        { desired: [16127], ttl: 60, lowTtlThreshold: 20, routerTestPort: 16130 }
       );
       await run(w.clock, 120_000, 500);
       assert.equal(coordinator.leaseRenews, false, "a 900 s lease at +70 s says nothing about renewal");
@@ -261,7 +261,7 @@ describe("UpnpCoordinator against real routers' behaviour", () => {
       const peer = w.makeNode(peerAddr);
       const leadClient = router.clientFor(leadAddr);
       const nodes: Array<{ coordinator: UpnpCoordinator }> = [];
-      for (const [node, addr, client, leaseTestPort] of [
+      for (const [node, addr, client, routerTestPort] of [
         [lead, leadAddr, leadClient, 16130],
         [peer, peerAddr, router.clientFor(peerAddr), undefined]
       ] as const) {
@@ -271,7 +271,7 @@ describe("UpnpCoordinator against real routers' behaviour", () => {
           client,
           ttl: 60,
           lowTtlThreshold: 20,
-          leaseTestPort,
+          routerTestPort,
           freshLaps: 50,
           orphanConfirmPasses: 0
         });

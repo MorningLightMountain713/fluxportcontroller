@@ -9,16 +9,22 @@ import {
   UpnpClientLike
 } from "./src/fluxport-controller/upnpClient";
 
-// Test-side instrumentation (harness only): count router WRITES so the integration
-// test can assert steady-state zero writes. A thin pass-through around the real
-// serialized client — no production code involved.
+// Counts the node's router requests, for the steady-state and read-count assertions.
 let upnpWrites = 0;
 let upnpDeletes = 0;
+let upnpReads = 0;
+let upnpLookups = 0;
 function countingClient(inner: UpnpClientLike): UpnpClientLike {
   return {
     getGateway: () => inner.getGateway(),
-    getMappings: () => inner.getMappings(),
-    getMapping: (q) => inner.getMapping(q),
+    getMappings: () => {
+      upnpReads += 1;
+      return inner.getMappings();
+    },
+    getMapping: (q) => {
+      upnpLookups += 1;
+      return inner.getMapping(q);
+    },
     createMapping: (m) => {
       upnpWrites += 1;
       return inner.createMapping(m);
@@ -67,10 +73,12 @@ if (harness) {
   // Real serialized client, wrapped to count writes for the steady-state assertion.
   options.upnpClient = countingClient(createDefaultUpnpClient());
 }
-// A harness node `node-N` tests lease renewal on 40000 + N: distinct per node, as
-// FluxOS's api port + 3 is.
+// The tests' own client, so their reads and removals are not counted as the node's.
+const groundTruth = createDefaultUpnpClient();
+// A harness node `node-N` tests the router on 40000 + N: distinct per node, as FluxOS's
+// api port + 3 is.
 const nodeNumber = /^node-(\d+)$/.exec(txhash);
-const leaseTestPort = harness && nodeNumber ? 40000 + Number(nodeNumber[1]) : undefined;
+const routerTestPort = harness && nodeNumber ? 40000 + Number(nodeNumber[1]) : undefined;
 if (process.env.UPNP_FAST === "1") {
   // Fast-but-PROPORTIONED upnp timing for the integration harness: same shape as the
   // production slow timing, scaled to seconds so real mappings happen within a test
@@ -96,10 +104,11 @@ if (process.env.UPNP_FAST === "1") {
     tokenStallMs: 5000,
     selfCheckCycleMs: 2000,
     selfCheckWindows: 4,
-    leaseTestPort
+    routerTestPort,
+    ...(process.env.UPNP_EVENTS === "1" ? { eventPort: 49152, eventsSafetyNetMs: 20_000 } : {})
   };
-} else if (leaseTestPort != null) {
-  options.upnpTuning = { leaseTestPort };
+} else if (routerTestPort != null) {
+  options.upnpTuning = { routerTestPort };
 }
 
 const manager = new FluxNodeAgent({ txhash, outidx }, options);
@@ -112,6 +121,9 @@ manager.on("startError", () => {
   console.log("Error starting, retrying in 5s...");
   setTimeout(() => manager.start(), 5000);
 });
+manager.on("upnpEvents", (state: string, reason: string) =>
+  console.log(`UPNP EVENTS: ${state} (${reason})`)
+);
 manager.on("portConfirmed", (port: number) => {
   confirmedPort = port;
   console.log(`PORT CONFIRMED: ${port}`);
@@ -144,13 +156,24 @@ createServer((req, res) => {
         desiredUpnpPorts: manager.desiredUpnpPorts,
         upnpWrites,
         upnpDeletes,
+        upnpReads,
+        upnpLookups,
+        upnpEvents: manager.upnpEvents,
         ...extra
       })
     );
   };
+  const unmap = /[?&]unmap=(\d+)/.exec(req.url ?? "");
+  if (unmap) {
+    groundTruth
+      .removeMapping({ public: Number(unmap[1]), protocol: "TCP" })
+      .then(() => respond({ unmapped: Number(unmap[1]) }))
+      .catch((err) => respond({ unmapError: String((err && (err as Error).message) || err) }));
+    return;
+  }
   if (!req.url || !req.url.includes("upnp=1")) return respond({});
-  manager
-    .getUpnpMappings()
+  groundTruth
+    .getMappings()
     .then((upnpMappings) => respond({ upnpMappings }))
     .catch((err) =>
       respond({ upnpMappings: [], upnpError: String((err && (err as Error).message) || err) })

@@ -54,6 +54,7 @@ import {
 } from "./nodeList";
 import { FluxPortManager } from "./fluxPortManager";
 import { UpnpCoordinator } from "./upnp/upnpCoordinator";
+import { GenaRouterEvents, RouterEvents } from "./upnp/routerEvents";
 
 /** The consensus group the port-allocation feature runs over. */
 const PORTS_GROUP = "ports";
@@ -140,7 +141,13 @@ export interface UpnpCoordinatorTuning {
   /** A port of this node's own that no app uses (FluxOS: api port + 3), on which the
    *  coordinator tests whether the router renews leases. Without it mappings stay
    *  permanent. Must differ from every other node's behind the same router. */
-  leaseTestPort?: number;
+  routerTestPort?: number;
+  /** The port this node listens on for the router's events (UPnP eventing). The node's
+   *  firewall must let the gateway reach it. Used with `routerTestPort`; without it the
+   *  leader reads the router's table on every turn. */
+  eventPort?: number;
+  /** The longest the leader goes without reading the table while it trusts events. */
+  eventsSafetyNetMs?: number;
 }
 
 export const DEFAULT_UPNP_TUNING: Required<
@@ -181,6 +188,9 @@ export interface FluxNodeAgentOptions extends Partial<Timing> {
    * gateway, so a cached gateway would return the stale pre-change address).
    */
   resolveLocalAddress?: () => Promise<string>;
+  /** The router's events for a gateway description URL, a LAN address and a listening
+   *  port. Default: GENA over HTTP. */
+  createRouterEvents?: (descriptionUrl: string, localAddress: string, port: number) => RouterEvents;
 }
 
 export class FluxNodeAgent extends EventEmitter {
@@ -203,6 +213,12 @@ export class FluxNodeAgent extends EventEmitter {
   ) => Promise<NodeInfo>;
   private readonly getPublicIp: () => Promise<string>;
   private readonly resolveLocalAddress: () => Promise<string>;
+  private readonly createRouterEvents: (
+    descriptionUrl: string,
+    localAddress: string,
+    port: number
+  ) => RouterEvents;
+  private gatewayDescription: string | null = null;
   private readonly enableUpnp: boolean;
   private readonly upnpTiming: Timing;
   private readonly upnpTuning: UpnpCoordinatorTuning;
@@ -251,6 +267,10 @@ export class FluxNodeAgent extends EventEmitter {
     this.resolveLocalAddress =
       options.resolveLocalAddress ??
       (async () => (await this.upnpClient.getGateway()).getLocalAddress());
+    this.createRouterEvents =
+      options.createRouterEvents ??
+      ((descriptionUrl, localAddress, port) =>
+        new GenaRouterEvents({ descriptionUrl, localAddress, port }));
     this.enableUpnp = options.enableUpnp ?? true;
     this.upnpTiming = { ...DEFAULT_UPNP_TIMING, ...options.upnpTiming };
     this.upnpTuning = { ...options.upnpTuning };
@@ -274,6 +294,7 @@ export class FluxNodeAgent extends EventEmitter {
       const publicIp = await this.getPublicIp();
 
       const gateway = await this.upnpClient.getGateway();
+      this.gatewayDescription = gateway.gateway.description;
       const localAddress = await gateway.getLocalAddress();
       if (!localAddress) {
         logger.error("Could not determine local interface from UPnP gateway");
@@ -417,9 +438,15 @@ export class FluxNodeAgent extends EventEmitter {
       leaveLaps: t.leaveLaps,
       orphanConfirmPasses: t.orphanConfirmPasses,
       orphanMaxDeleteAttempts: t.orphanMaxDeleteAttempts,
-      leaseTestPort: t.leaseTestPort,
+      routerTestPort: t.routerTestPort,
+      events:
+        t.eventPort != null && this.gatewayDescription != null
+          ? this.createRouterEvents(this.gatewayDescription, localAddress, t.eventPort)
+          : undefined,
+      eventsSafetyNetMs: t.eventsSafetyNetMs,
       hooks: {
-        onMappingFailed: (port, reason) => this.emit("mappingFailed", port, reason)
+        onMappingFailed: (port, reason) => this.emit("mappingFailed", port, reason),
+        onEventsStateChange: (state, reason) => this.emit("upnpEvents", state, reason)
       }
     });
     this.refreshUpnpDesired();
@@ -469,6 +496,10 @@ export class FluxNodeAgent extends EventEmitter {
   /** The current group-wide UPnP rate (the adaptive back-off value), or null if disabled. */
   get upnpRate(): number | null {
     return this.upnpCoordinator?.currentRate ?? null;
+  }
+  /** This node's use of the router's events: off, idle, testing or trusted. */
+  get upnpEvents(): string | null {
+    return this.upnpCoordinator?.eventsState ?? null;
   }
   /** True when this node is the upnp ring's enumerating leader (observability). */
   get upnpIsLeader(): boolean {
