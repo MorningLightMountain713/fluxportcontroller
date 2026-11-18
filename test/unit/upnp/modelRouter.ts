@@ -25,11 +25,14 @@
  *                        Huawei, Keenetic, Livebox); miniupnpd signals size changes only
  *
  * `clientFor(address)` is the UpnpClientLike a node at that LAN address uses, and
- * `eventsFor(address)` its RouterEvents. A NOTIFY reaches the node 5 ms after the change.
+ * `eventsFor(address)` its RouterEvents, whose subscriptions behave as nat-upnp's: renewed
+ * at half their lifetime, and lost when a renewal finds the router no longer holds them.
+ * A NOTIFY reaches the node 5 ms after the change.
  */
 
+import { EventEmitter } from "node:events";
 import { ManualClock } from "@/fluxport-controller/consensus/clock";
-import { RouterEvent, RouterEvents, Subscription } from "@/fluxport-controller/upnp/routerEvents";
+import { RouterEvents, RouterSubscription } from "@/fluxport-controller/upnp/routerEvents";
 import {
   MappingQuery,
   NewMapping,
@@ -61,10 +64,34 @@ export interface RouterBehaviour {
 }
 
 interface Subscriber {
-  sid: string;
   address: string;
-  seq: number;
-  expiresAt: number;
+  sub: ModelSubscription;
+}
+
+/** A subscription as nat-upnp's behaves: nothing is emitted once it has ended. */
+class ModelSubscription extends EventEmitter implements RouterSubscription {
+  private ended = false;
+
+  constructor(private readonly release: () => void) {
+    super();
+  }
+
+  notify(): void {
+    if (!this.ended) this.emit("event");
+  }
+
+  lose(reason: Error): void {
+    if (this.ended) return;
+    this.ended = true;
+    this.release();
+    this.emit("lost", reason);
+  }
+
+  async close(): Promise<void> {
+    if (this.ended) return;
+    this.ended = true;
+    this.release();
+  }
 }
 
 export interface EventCounts {
@@ -97,7 +124,6 @@ export interface ClientCounts {
 export class ModelRouter {
   private readonly table: Held[] = [];
   private readonly subscribers = new Map<string, Subscriber>();
-  private readonly listeners = new Map<string, (event: RouterEvent) => void>();
   private nextSid = 1;
   /** Set to lose the next NOTIFY: its SEQ is used, nothing is delivered. */
   dropNextEvent = false;
@@ -177,76 +203,52 @@ export class ModelRouter {
   eventsFor(address: string): RouterEvents {
     const router = this;
     return {
-      async listen(onEvent: (event: RouterEvent) => void): Promise<void> {
-        router.listeners.set(address, onEvent);
-      },
-      async subscribe(): Promise<Subscription> {
+      async subscribe(): Promise<RouterSubscription> {
         router.eventCounts.subscribes += 1;
         if (router.behaviour.eventing === "no-answer") throw new Error("SUBSCRIBE timed out");
-        if (router.behaviour.eventing === "no-sid") throw new Error("SUBSCRIBE answered without a SID");
-        const sub: Subscriber = {
-          sid: `uuid:sub-${router.nextSid++}`,
-          address,
-          seq: 0,
-          expiresAt: router.clock.now() + router.behaviour.subscriptionSeconds * 1000
-        };
-        router.subscribers.set(sub.sid, sub);
-        if (router.behaviour.eventing !== "callback-blocked") router.deliver(sub, 0);
-        return { sid: sub.sid, timeoutSeconds: router.behaviour.subscriptionSeconds };
-      },
-      async renew(sid: string): Promise<Subscription> {
-        router.eventCounts.renews += 1;
-        const sub = router.liveSubscriber(sid);
-        if (!sub) throw new Error("SUBSCRIBE answered 412");
-        sub.expiresAt = router.clock.now() + router.behaviour.subscriptionSeconds * 1000;
-        return { sid, timeoutSeconds: router.behaviour.subscriptionSeconds };
-      },
-      async unsubscribe(sid: string): Promise<void> {
-        router.eventCounts.unsubscribes += 1;
-        if (!router.subscribers.delete(sid)) throw new Error("UNSUBSCRIBE answered 412");
-      },
-      close(): void {
-        router.listeners.delete(address);
+        if (router.behaviour.eventing === "no-sid") throw new Error("SUBSCRIBE answered 200: no SID");
+        const sid = `uuid:sub-${router.nextSid++}`;
+        const renewMs = router.behaviour.subscriptionSeconds * 500;
+        let timer = router.clock.setTimer(renewMs, renew);
+        const sub = new ModelSubscription(() => {
+          router.clock.clearTimer(timer);
+          if (router.subscribers.delete(sid)) router.eventCounts.unsubscribes += 1;
+        });
+        function renew(): void {
+          router.eventCounts.renews += 1;
+          if (!router.subscribers.has(sid)) return sub.lose(new Error("SUBSCRIBE answered 412"));
+          timer = router.clock.setTimer(renewMs, renew);
+        }
+        const subscriber: Subscriber = { address, sub };
+        router.subscribers.set(sid, subscriber);
+        // As nat-upnp: the first event comes on a later tick than subscribe() resolves.
+        if (router.behaviour.eventing !== "callback-blocked") setImmediate(() => router.deliver(sid, subscriber));
+        return sub;
       }
     };
   }
 
-  /** Live subscriptions held for a node's address (test seam). */
+  /** Subscriptions held for a node's address (test seam). */
   subscriptionsFor(address: string): number {
-    return [...this.subscribers.values()].filter((s) => s.address === address && this.liveSubscriber(s.sid))
-      .length;
-  }
-
-  private liveSubscriber(sid: string): Subscriber | null {
-    const sub = this.subscribers.get(sid);
-    if (!sub) return null;
-    if (sub.expiresAt <= this.clock.now()) {
-      this.subscribers.delete(sid);
-      return null;
-    }
-    return sub;
+    return [...this.subscribers.values()].filter((s) => s.address === address).length;
   }
 
   private notify(): void {
-    for (const sub of [...this.subscribers.values()]) {
-      if (!this.liveSubscriber(sub.sid)) continue;
-      sub.seq += 1;
+    for (const [sid, subscriber] of [...this.subscribers]) {
       if (this.behaviour.eventing !== "works") continue;
       if (this.dropNextEvent) {
         this.dropNextEvent = false;
         continue;
       }
-      this.deliver(sub, sub.seq);
+      this.deliver(sid, subscriber);
     }
   }
 
-  private deliver(sub: Subscriber, seq: number): void {
-    const entries = this.table.length;
+  private deliver(sid: string, subscriber: Subscriber): void {
     this.clock.setTimer(5, () => {
-      const listener = this.listeners.get(sub.address);
-      if (!listener || !this.subscribers.has(sub.sid)) return;
+      if (!this.subscribers.has(sid)) return;
       this.eventCounts.delivered += 1;
-      listener({ sid: sub.sid, seq, entries });
+      subscriber.sub.notify();
     });
   }
 

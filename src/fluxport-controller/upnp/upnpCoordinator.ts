@@ -433,8 +433,6 @@ export class UpnpCoordinator {
     this.started = true;
     this.armTokenStall();
     this.armSlotTimer();
-    // A listener that cannot start leaves the leader reading the table on its turns.
-    this.watch?.start().catch((err) => this.onMappingFailed?.(-1, `event listener: ${String(err)}`));
   }
 
   /** Clear the timers and drop the event subscription (idempotent). */

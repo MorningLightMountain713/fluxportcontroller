@@ -37,7 +37,7 @@
     "typescript": "^6.0.3"
   },
   "dependencies": {
-    "@runonflux/nat-upnp": "^2.2.0",
+    "@runonflux/nat-upnp": "^3.0.0",
     "axios": "^1.18.0",
     "winston": "^3.19.0"
   }

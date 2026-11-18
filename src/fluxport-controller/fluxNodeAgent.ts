@@ -54,7 +54,7 @@ import {
 } from "./nodeList";
 import { FluxPortManager } from "./fluxPortManager";
 import { UpnpCoordinator } from "./upnp/upnpCoordinator";
-import { GenaRouterEvents, RouterEvents } from "./upnp/routerEvents";
+import { natUpnpRouterEvents, RouterEvents } from "./upnp/routerEvents";
 
 /** The consensus group the port-allocation feature runs over. */
 const PORTS_GROUP = "ports";
@@ -189,7 +189,7 @@ export interface FluxNodeAgentOptions extends Partial<Timing> {
    */
   resolveLocalAddress?: () => Promise<string>;
   /** The router's events for a gateway description URL, a LAN address and a listening
-   *  port. Default: GENA over HTTP. */
+   *  port. Default: nat-upnp's subscription to that router. */
   createRouterEvents?: (descriptionUrl: string, localAddress: string, port: number) => RouterEvents;
 }
 
@@ -269,8 +269,7 @@ export class FluxNodeAgent extends EventEmitter {
       (async () => (await this.upnpClient.getGateway()).getLocalAddress());
     this.createRouterEvents =
       options.createRouterEvents ??
-      ((descriptionUrl, localAddress, port) =>
-        new GenaRouterEvents({ descriptionUrl, localAddress, port }));
+      ((descriptionUrl, localAddress, port) => natUpnpRouterEvents(descriptionUrl, localAddress, port));
     this.enableUpnp = options.enableUpnp ?? true;
     this.upnpTiming = { ...DEFAULT_UPNP_TIMING, ...options.upnpTiming };
     this.upnpTuning = { ...options.upnpTuning };

@@ -2,16 +2,17 @@
  * Whether this node can rely on the router's events. Routers that advertise eventing
  * still fail to deliver it in several ways (no SID, NOTIFYs dropped by the node's
  * firewall, a NOTIFY on subscribing and none after), so events are trusted only after a
- * test on this router and this node: a subscription with a SID, the NOTIFY it starts
- * with, and a NOTIFY each for a mapping added and removed on the test port. While
- * trusted, every NOTIFY means "read the table" (`onChange`). Trust ends, until a retest
- * an hour later, when a lost subscription cannot be replaced, when a change this node
- * made brings no NOTIFY within 10 s, or when the caller finds the table changed without
- * one (`distrust`).
+ * test on this router and this node: a subscription, the NOTIFY it starts with, and a
+ * NOTIFY each for a mapping added and removed on the test port. While trusted, every
+ * NOTIFY means "read the table" (`onChange`). A subscription lost while trusted is
+ * replaced, and its first NOTIFY asks for a read, since a router that forgot it may have
+ * rebooted. Trust ends, until a retest an hour later, when a lost subscription cannot be
+ * replaced, when a change this node made brings no NOTIFY within 10 s, or when the caller
+ * finds the table changed without one (`distrust`).
  */
 
 import { Clock, TimerId } from "../consensus/clock";
-import { RouterEvent, RouterEvents, Subscription } from "./routerEvents";
+import { RouterEvents, RouterSubscription } from "./routerEvents";
 
 export type EventWatchState = "idle" | "testing" | "trusted";
 
@@ -19,10 +20,6 @@ const INITIAL_WAIT_MS = 5_000;
 const CHANGE_WAIT_MS = 5_000;
 const CANARY_MS = 10_000;
 const RETRY_MS = 3_600_000;
-const RENEW_FRACTION = 0.5;
-const MIN_RENEW_MS = 30_000;
-/** Renewed as if granted this when the router grants "infinite": a reboot forgets it anyway. */
-const INFINITE_RENEW_SECONDS = 1800;
 
 export interface EventWatchDeps {
   events: RouterEvents;
@@ -41,15 +38,11 @@ export class EventWatch {
   private readonly clock: Clock;
   private readonly deps: EventWatchDeps;
   private current: EventWatchState = "idle";
-  private listening = false;
-  private sub: Subscription | null = null;
-  // NOTIFYs that arrive while a SUBSCRIBE is in flight carry a SID not known yet.
-  private subscribing = false;
-  private early: RouterEvent[] = [];
-  // Bumped whenever the subscription is dropped, so an in-flight test or renewal stops.
+  private stopped = false;
+  private sub: RouterSubscription | null = null;
+  // Bumped whenever the subscription is dropped, so in-flight work stops.
   private generation = 0;
   private notBefore = 0;
-  private renewTimer: TimerId | null = null;
   private canaryTimer: TimerId | null = null;
   private canaryMark = 0;
   private waiters: Array<{ mark: number; resolve: (ok: boolean) => void; timer: TimerId }> = [];
@@ -74,21 +67,15 @@ export class EventWatch {
     return this.count;
   }
 
-  /** Start the listener. Rejects when it cannot listen; the watch then never engages. */
-  async start(): Promise<void> {
-    await this.events.listen((e) => this.onEvent(e));
-    this.listening = true;
-  }
-
+  /** Close the subscription; the watch never engages again. */
   stop(): void {
+    this.stopped = true;
     this.drop();
-    this.listening = false;
-    this.events.close();
   }
 
   /** This node is the one to watch the router. */
   engage(): void {
-    if (!this.listening || this.current !== "idle" || this.clock.now() < this.notBefore) return;
+    if (this.stopped || this.current !== "idle" || this.clock.now() < this.notBefore) return;
     void this.test();
   }
 
@@ -142,68 +129,38 @@ export class EventWatch {
       return;
     }
     if (gen !== this.generation) return;
-    this.armRenew();
     this.setState("trusted", "the router's events passed the test");
     this.deps.onChange();
   }
 
   private async subscribeAndHear(gen: number): Promise<{ heard: boolean; reason: string }> {
     const mark = this.count;
-    this.sub = null; // a NOTIFY arriving before the answer belongs to the new subscription
-    this.subscribing = true;
-    this.early = [];
+    let sub: RouterSubscription;
     try {
-      this.sub = await this.events.subscribe();
+      sub = await this.events.subscribe();
     } catch (err) {
       return { heard: false, reason: `subscribe failed: ${String(err)}` };
-    } finally {
-      this.subscribing = false;
     }
-    const early = this.early;
-    this.early = [];
-    if (gen !== this.generation) return { heard: false, reason: "dropped" };
-    for (const e of early) this.onEvent(e);
+    if (gen !== this.generation) {
+      void sub.close();
+      return { heard: false, reason: "dropped" };
+    }
+    this.sub = sub;
+    sub.on("event", () => this.onEvent());
+    sub.once("lost", (reason) => void this.onLost(gen, reason));
     const heard = await this.eventAfter(mark, INITIAL_WAIT_MS);
     return { heard, reason: "no event on subscribing" };
   }
 
-  private armRenew(): void {
-    if (this.renewTimer != null) this.clock.clearTimer(this.renewTimer);
-    const lifetime = this.sub?.timeoutSeconds ?? INFINITE_RENEW_SECONDS;
-    const ms = Math.max(MIN_RENEW_MS, lifetime * 1000 * RENEW_FRACTION);
-    this.renewTimer = this.clock.setTimer(ms, () => {
-      this.renewTimer = null;
-      void this.renew();
-    });
-  }
-
-  private async renew(): Promise<void> {
-    const gen = this.generation;
-    const sid = this.sub?.sid;
-    if (!sid || this.current !== "trusted") return;
-    try {
-      const renewed = await this.events.renew(sid);
-      if (gen !== this.generation) return;
-      this.sub = { sid, timeoutSeconds: renewed.timeoutSeconds };
-      this.armRenew();
-      return;
-    } catch {
-      // The router forgot the subscription (a reboot): its table may have changed too,
-      // and the new subscription's initial NOTIFY asks for a read.
-    }
-    if (gen !== this.generation) return;
+  private async onLost(gen: number, reason: Error): Promise<void> {
+    this.sub = null;
+    if (this.current !== "trusted") return this.fail(`the subscription was lost: ${reason.message}`);
     const ok = await this.subscribeAndHear(gen);
     if (gen !== this.generation) return;
-    if (!ok.heard) return this.fail(`resubscribing: ${ok.reason}`);
-    this.armRenew();
+    if (!ok.heard) this.fail(`resubscribing: ${ok.reason}`);
   }
 
-  private onEvent(e: RouterEvent): void {
-    if (this.subscribing && this.sub === null) {
-      this.early.push(e);
-      return;
-    }
-    if (this.sub === null || e.sid !== this.sub.sid) return;
+  private onEvent(): void {
     this.count += 1;
     for (const w of this.waiters.filter((w) => this.count > w.mark)) {
       this.clock.clearTimer(w.timer);
@@ -238,18 +195,16 @@ export class EventWatch {
   /** In-flight work sees the new generation and stops. */
   private drop(): void {
     this.generation += 1;
-    if (this.renewTimer != null) this.clock.clearTimer(this.renewTimer);
     if (this.canaryTimer != null) this.clock.clearTimer(this.canaryTimer);
-    this.renewTimer = null;
     this.canaryTimer = null;
     for (const w of this.waiters) {
       this.clock.clearTimer(w.timer);
       w.resolve(false);
     }
     this.waiters = [];
-    const sid = this.sub?.sid;
+    const sub = this.sub;
     this.sub = null;
-    if (sid) this.events.unsubscribe(sid).catch(() => {});
+    void sub?.close();
   }
 
   private setState(state: EventWatchState, reason: string): void {
