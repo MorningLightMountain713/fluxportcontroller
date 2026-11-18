@@ -3,5 +3,4 @@ node_modules
 build
 dev
 test
-package-lock.json
 *.log
