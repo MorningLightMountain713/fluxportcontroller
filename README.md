@@ -1,32 +1,63 @@
 # fluxport-controller
 
-Auto-assigns each Fluxnode a **unique UPnP port** with no router lock and no
-FluxOS coupling. Nodes on the same LAN discover each other over multicast and
-agree on a conflict-free port assignment via a Totem-style token-ring
-atomic-broadcast consensus.
+Coordinates the Fluxnodes behind one router, with no router lock and no FluxOS
+coupling. Nodes on the same LAN discover each other over multicast and run a
+Totem-style token-ring consensus (reliable, totally ordered broadcast with
+virtual-synchrony membership). Two features run on it:
+
+- **Port assignment** — each node gets a unique Fluxport.
+- **UPnP coordination** — each node keeps its own mappings on the shared router,
+  paced so the nodes take turns and one node reads the router's table for all.
 
 ## How it works
 
-`FluxPortManager` wires the real world onto a consensus stack:
+`FluxNodeAgent` is the entry point. It owns one multicast socket and one
+`Consensus`, on which two named groups run:
 
-- **UPnP discovery** (nat-upnp 2.x) finds the LAN interface to bind multicast on,
-  and the router IP (emitted for observability).
-- The **Flux deterministic node list** supplies this node's previously-confirmed
-  port (sticky reuse) and its `confirmed_height`, used as the conflict priority —
-  globally known and stable across restarts, so no local state is persisted.
-- A **multicast transport** (link-local, TTL 1) carries the consensus, feeding a
-  deterministic port allocator.
+- **`ports`** — a deterministic allocator over the totally ordered CLAIM/RELEASE
+  log. This node's previously confirmed port (sticky reuse) and its
+  `confirmed_height` (the conflict priority) come from the Flux deterministic node
+  list, so nothing is persisted locally.
+- **`upnp`** — the UPnP coordinator, on a slow cadence.
 
-**Identity split:** the consensus ring is addressed by the node's **LAN IP**,
-while port ownership is keyed by the node's **outpoint** (`txhash:outidx`). A node
-therefore keeps its port across a LAN-IP change.
+**Discovery:** UPnP gateway discovery (`@runonflux/nat-upnp`) finds the LAN
+interface the multicast socket binds to, and the router address.
 
-**Self-heal:** the multicast socket binds to the discovered LAN IP. If that IP
-changes, or the group membership is lost at an unchanged IP (an interface
-recreated under the node), the transport rebuilds and the node rejoins under the
-same outpoint and reclaims its port — emitting `rebound`. Detection is
-event-driven (a transport error, or the consensus collapsing to a lone ring); no
-polling.
+**Identity:** the ring is addressed by the node's **LAN IP**; port ownership is
+keyed by its **outpoint** (`txhash:outidx`), so a node keeps its port across a
+LAN-IP change.
+
+**Self-heal:** the socket is bound to the discovered LAN IP. If that IP changes,
+or multicast membership is lost at the same IP (an interface recreated under the
+node), the socket is rebuilt, every group rejoins, and the node reclaims its port —
+emitting `rebound`. Detection is event-driven (a transport error, or the ring
+collapsing to this node alone); there is no polling.
+
+### UPnP coordination
+
+Each node keeps only its **own** desired ports mapped to its own LAN address; no
+node maps or deletes on another's behalf.
+
+- **Read before write.** A node writes a mapping only when the router's entry is
+  missing, points elsewhere, has a lease running low, or is permanent while the
+  router is known to renew leases. In steady state a node only reads.
+- **One reader.** While the ring is healthy, its representative (the leader) walks
+  the router's whole table and broadcasts it; the other nodes skip their own read
+  for any port that table already shows healthy. When the ring is not healthy, each
+  node checks its own ports in a slot of a fixed wall-clock cycle.
+- **Paced writes.** Every write spends a token from a rate limiter shared by the
+  group. When the leader's table read fails, it lowers the group's rate; clean
+  reads raise it back.
+- **Orphans.** A node deletes its own Flux mappings for ports it no longer wants,
+  after a short grace and within the same rate budget.
+- **Lookups.** A lookup is trusted only when it answers "no such entry" or an entry
+  for the port asked about. A router whose lookups fault, answer with another entry
+  or answer an empty success is read through a walk of its table instead.
+- **Leases.** Mappings are permanent unless the router is known to renew a lease
+  when a mapping is added again. A node with a `leaseTestPort` tests that once: it
+  maps the port with a 60 s lease, adds it again at +30 s and looks it up at +70 s.
+  The leader shares the answer with the ring. A router that refuses a leased
+  mapping gets permanent ones.
 
 ## Installation
 
@@ -37,77 +68,105 @@ npm i @megachips/fluxport-controller
 ## Usage
 
 ```javascript
-import { FluxPortManager, logController } from "@megachips/fluxport-controller";
+import { FluxNodeAgent, logController } from "@megachips/fluxport-controller";
 
 // optional: the logger is silent by default
 logController.addLoggerTransport("console");
 
-const manager = new FluxPortManager(
-  // this node's collateral/confirmation outpoint
+const agent = new FluxNodeAgent(
+  // this node's collateral outpoint
   { txhash: "334896be9aacb757de3e01633eba12b30198612513289223ca355d52137ba221", outidx: "0" },
-  // options are optional; these are the defaults
-  { multicastGroup: "239.112.233.123", port: 16137 }
+  { upnpTuning: { leaseTestPort: apiPort + 3 } }
 );
 
-manager.on("routerIpConfirmed", (ip) => console.log(`router: ${ip}`));
-manager.on("portConfirmed", (port) => console.log(`assigned UPnP port: ${port}`));
-manager.on("rebound", ({ from, to }) => console.log(`rebound ${from} -> ${to}`));
-manager.on("noPortAvailable", () => console.warn("no free port (capacity)"));
-manager.on("startError", () => setTimeout(() => manager.start(), 5000));
+agent.on("portConfirmed", (port) => console.log(`assigned port: ${port}`));
+agent.on("rebound", ({ from, to }) => console.log(`rebound ${from} -> ${to}`));
+agent.on("mappingFailed", (port, reason) => console.warn(`UPnP ${port}: ${reason}`));
+agent.on("noPortAvailable", () => console.warn("no free port (capacity)"));
+agent.on("startError", () => setTimeout(() => agent.start(), 5000));
 
-await manager.start();
+await agent.start();
+
+// the UPnP ports this node keeps mapped (its own assigned port is always added)
+agent.setDesiredUpnpPorts([16127, 16126, 16128, 16129]);
+// an app was just installed: map its port now rather than on the next pass
+await agent.requestMap(31000, "Flux_App_example");
 ```
 
 CommonJS:
 
 ```javascript
-const { FluxPortManager } = require("@megachips/fluxport-controller");
+const { FluxNodeAgent } = require("@megachips/fluxport-controller");
 ```
 
 ### Constructor
 
 ```typescript
-new FluxPortManager(outPoint: OutPoint, options?: FluxPortManagerOptions)
+new FluxNodeAgent(outPoint: OutPoint, options?: FluxNodeAgentOptions)
 ```
 
-`OutPoint` is `{ txhash: string; outidx: string }` — the Fluxnode's collateral
-confirmation outpoint, used as the stable port-ownership identity.
+`OutPoint` is `{ txhash: string; outidx: string }` — the node's collateral
+outpoint, the stable port-ownership identity.
 
 ### Options
 
 | Option | Default | Meaning |
 |---|---|---|
 | `multicastGroup` | `"239.112.233.123"` | Multicast group the consensus runs on |
-| `port` | `16137` | UDP port the consensus protocol communicates on (not the assigned port) |
-| `ports` | `ALL_FLUXPORTS` | The set of assignable Fluxports (`[16197, 16187, …, 16127]`, exported) |
+| `port` | `16137` | UDP port the consensus uses (not the assigned port) |
+| `ports` | `ALL_FLUXPORTS` | The assignable Fluxports (`[16197, 16187, …, 16127]`, exported) |
 | `addressApis` | `ifconfig.me`, `checkip.amazonaws.com`, `api.ipify.org` | Public-IP lookup endpoints |
+| `enableUpnp` | `true` | Run the `upnp` group |
+| `upnpTiming` | `DEFAULT_UPNP_TIMING` | Consensus timing of the `upnp` group |
+| `upnpTuning` | see below | The UPnP coordinator's settings |
 
-By default the manager reaches the internet to resolve this node's public IP and
-its entry in the Flux deterministic list. Every external dependency
-(`upnpClient`, `getPublicIp`, `resolveNodeInfo`, `resolveLocalAddress`,
-`createTransport`, `clock`) plus the consensus timing is injectable via
-`options` — used by the test suite to run the whole flow over an in-memory
-network with no sockets, UPnP, or HTTP.
+`upnpTuning`:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `leaseTestPort` | none | A port of this node's own that no app uses, for the lease test. It must differ from every other node's behind the same router (FluxOS: api port + 3). Without it, mappings stay permanent. |
+| `rate`, `capacity` | `0.5`/s, `4` | The group's write budget |
+| `selfCheckCycleMs` | `300000` | The cycle a node checks its own ports on when the ring is not healthy |
+| `tokenStallMs` | `240000` | No turn for this long means the ring is not healthy |
+
+Every external dependency (`upnpClient`, `getPublicIp`, `resolveNodeInfo`,
+`resolveLocalAddress`, `createTransport`, `clock`) and the consensus timing are
+injectable through `options`; the test suite runs the whole flow over an
+in-memory network with no sockets, UPnP or HTTP.
 
 ### Events
 
 | Event | Payload | When |
 |---|---|---|
-| `portConfirmed` | `(port: number)` | This node has won/holds a port |
-| `routerIpConfirmed` | `(routerIp: string)` | The router IP was resolved (observability) |
-| `noPortAvailable` | — | More nodes than ports on this segment (capacity) |
-| `startError` | — | Startup failed (e.g. UPnP discovery); safe to retry `start()` |
-| `rebound` | `({ from, to }: { from: string \| null; to: string })` | The transport self-healed; the port is re-confirmed |
+| `portConfirmed` | `(port: number)` | This node holds a port |
+| `routerIpConfirmed` | `(routerIp: string)` | The router's address was resolved |
+| `noPortAvailable` | — | More nodes than ports on this segment |
+| `startError` | — | Startup failed (e.g. UPnP discovery); `start()` can be called again |
+| `rebound` | `({ from, to }: { from: string \| null; to: string })` | The socket was rebuilt; the port is confirmed again |
+| `mappingFailed` | `(port: number, reason: string)` | A mapping write, delete or read failed; `port` is `-1` for a failed read of the whole table |
 
-### Methods & properties
+### Methods and properties
 
-- `start(): Promise<boolean>` — resolves `true` once started, `false` on a start
-  error (also emits `startError`).
-- `stop(): void` — tear down the transport and consensus.
-- `nid: string` — the ownership identity (`txhash:outidx`).
-- `assignedPort: number | null` — the currently owned port.
-- `members: string[]` — the current consensus view.
-- `viewId: string | null` — the current ring id.
+- `start(): Promise<boolean>` — `true` once started, `false` on a start error
+  (also emits `startError`).
+- `stop(): void` — stops both groups and closes the socket.
+- `setDesiredUpnpPorts(ports: number[])` — the full set of UPnP ports this node
+  keeps mapped; each call replaces the last. Ports dropped from it are deleted.
+- `requestMap(port, description?)` — add a port and map it now, still within the
+  write budget.
+- `getUpnpMappings()` — the router's table, read through the node's client.
+- `nid`, `assignedPort`, `members`, `viewId` — the node's identity, its port and the
+  `ports` view.
+- `desiredUpnpPorts`, `upnpMode` (`LEADER_CHECK` / `SELF_CHECK`), `upnpIsLeader`,
+  `upnpRate` — the UPnP coordinator's state.
+
+### Consensus as a library
+
+`Consensus` and `Group` are exported for other features that need ordered
+agreement between the nodes on a LAN: `consensus.join(name, { config, hooks })`
+returns a `Group` whose `broadcast(payload)` is delivered to every member's
+`onDeliver` in the same order, with `onViewChange` on membership changes and
+`onTokenGranted` on this node's turn.
 
 ## Performance
 
@@ -146,9 +205,10 @@ consensus itself, not the transport. Numbers are indicative (default timing,
 
 ```bash
 npm run build          # tsc -> build/ (also runs on `prepare`, i.e. on publish)
-npm run unittest       # unit + property tests (node:test/tsx)
-npm run inttest        # integration tests (requires Docker)
-npm run inttest:chaos  # chaos scenarios only (requires Docker)
+npm run unittest       # unit and property tests (node:test/tsx)
+npm run inttest        # integration tests: real multicast and a real miniupnpd (requires Docker)
+npm run inttest:chaos  # the chaos scenarios only
+npm run inttest:upnp   # the UPnP coordination scenarios only
 ```
 
 The compiled `build/` output is produced on publish and is not committed.
